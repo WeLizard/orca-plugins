@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.3.0"
+# version = "0.4.0"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -141,18 +141,22 @@ def discover_orca_printers():
     return found
 
 
-def merged_printers():
-    # Discovered (Orca) first, then manual entries whose URL is not already present.
-    result = discover_orca_printers()
-    seen = {p["url"] for p in result if p.get("url")}
+def dashboard_printers():
+    # Only the printers the user chose to add (manual entries + printers adopted
+    # from OrcaSlicer). Discovery never auto-populates the dashboard.
+    result = []
     for p in load_manual_printers():
-        url = normalize_url(p.get("url"))
-        if url and url not in seen:
-            p["url"] = url
-            p["source"] = "manual"
-            result.append(p)
-            seen.add(url)
+        p["url"] = normalize_url(p.get("url"))
+        p.setdefault("source", "manual")
+        result.append(p)
     return result
+
+
+def available_orca_printers():
+    # OrcaSlicer-configured printers not yet added to the dashboard, offered for
+    # the user to adopt one by one.
+    added = {normalize_url(p.get("url")) for p in load_manual_printers()}
+    return [p for p in discover_orca_printers() if p["url"] not in added]
 
 
 # --------------------------------------------------------------------------- #
@@ -240,7 +244,9 @@ def poll_moonraker(base, ctx):
         "target_bed": bed.get("target"),
         "progress": round((display.get("progress") or 0.0) * 100),
         "filename": filename,
-        "thumbnail": moonraker_thumbnail(base, ctx, filename) if state == "printing" else "",
+        # Show the loaded file's thumbnail whenever one is loaded (printing,
+        # paused or just finished) — not only while actively printing.
+        "thumbnail": moonraker_thumbnail(base, ctx, filename) if filename else "",
     }
 
 
@@ -367,6 +373,7 @@ PAGE = r"""<!DOCTYPE html>
     <h1>Printers</h1>
     <span id="status"></span>
     <button id="send" class="ghost" disabled>Send G-code to selected…</button>
+    <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
     <input id="f-name" placeholder="Name" size="8">
     <input id="f-url" placeholder="192.168.0.42" size="14">
     <select id="f-type">
@@ -438,13 +445,14 @@ function render(printers){
       '<span>Bed <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
       fname + prog + '</div></div>' +
       '<div class="row"><label><input type="checkbox" class="sel"' + (selected[p.url] ? ' checked' : '') + '> select</label>' +
+      '<button class="print ghost">Print…</button>' +
       '<button class="open ghost">Open</button>' +
-      (p.source === 'manual' ? '<button class="remove ghost">Remove</button>' : '') + '</div>';
+      '<button class="remove ghost">Remove</button></div>';
     tile.querySelector('.sel').addEventListener('change', function(e){
       selected[p.url] = e.target.checked; updateSendBtn(); });
+    tile.querySelector('.print').addEventListener('click', function(){ pickAndSend([p.url]); });
     tile.querySelector('.open').addEventListener('click', function(){ openPrinter(p); });
-    var rm = tile.querySelector('.remove');
-    if (rm) rm.addEventListener('click', function(){ orca.postMessage({ type:'remove', id:p.id }); });
+    tile.querySelector('.remove').addEventListener('click', function(){ orca.postMessage({ type:'remove', id:p.id }); });
     grid.appendChild(tile);
   });
   updateSendBtn();
@@ -470,18 +478,25 @@ document.getElementById('add').addEventListener('click', function(){
 });
 document.getElementById('refresh').addEventListener('click', function(){ orca.postMessage({ type:'refresh' }); });
 
-// Batch print: pick a file → confirm (start on N physical printers is not
-// reversible) → hand it to Python with the selected printer urls.
-var pending = null;   // { file, urls }
-sendBtn.addEventListener('click', function(){ fileInput.click(); });
+// Print flow (per-printer or batch): pick a file → confirm (starting a physical
+// print is not reversible) → hand it to Python with the target printer urls.
+var pending = null;      // { file, urls }
+var pendingUrls = null;  // urls chosen before opening the file dialog
+function pickAndSend(urls){
+  if (!urls || !urls.length) return;
+  pendingUrls = urls;
+  fileInput.click();
+}
+sendBtn.addEventListener('click', function(){
+  pickAndSend(Object.keys(selected).filter(function(k){ return selected[k]; }));
+});
 fileInput.addEventListener('change', function(){
   var file = fileInput.files && fileInput.files[0];
   fileInput.value = '';
-  if (!file) return;
-  var urls = Object.keys(selected).filter(function(k){ return selected[k]; });
-  if (!urls.length) return;
+  var urls = pendingUrls; pendingUrls = null;
+  if (!file || !urls || !urls.length) return;
   pending = { file:file, urls:urls };
-  var names = current.filter(function(p){ return selected[p.url]; }).map(function(p){ return esc(p.name || p.url); });
+  var names = current.filter(function(p){ return urls.indexOf(p.url) >= 0; }).map(function(p){ return esc(p.name || p.url); });
   document.getElementById('confirm-body').innerHTML =
     'Upload <b>' + esc(file.name) + '</b> to ' + urls.length + ' printer(s):<br>' + names.join(', ');
   document.getElementById('confirm').style.display = 'flex';
@@ -502,9 +517,29 @@ document.getElementById('confirm-ok').addEventListener('click', function(){
   reader.readAsDataURL(file);
 });
 
+// "Add from OrcaSlicer": populate a picker with printers Orca knows about that
+// are not on the dashboard yet; choosing one adopts it (user decides, no auto-add).
+function renderAvailable(available){
+  var sel = document.getElementById('f-adopt');
+  if (!available || !available.length){ sel.style.display = 'none'; sel.innerHTML = ''; return; }
+  var opts = '<option value="">Add from OrcaSlicer…</option>';
+  available.forEach(function(p, i){ opts += '<option value="' + i + '">' + esc(p.name || p.url) + '</option>'; });
+  sel.innerHTML = opts;
+  sel.style.display = '';
+  sel._items = available;
+}
+document.getElementById('f-adopt').addEventListener('change', function(e){
+  var i = e.target.value;
+  if (i === '') return;
+  var p = (e.target._items || [])[i];
+  e.target.value = '';
+  if (p) orca.postMessage({ type:'adopt', printer:p });
+});
+
 orca.onMessage(function(data){
   if (!data) return;
   if (data.printers) render(data.printers);
+  if (data.available) renderAvailable(data.available);
   if (data.status !== undefined) document.getElementById('status').textContent = data.status;
 });
 orca.postMessage({ type:'ready' });
@@ -553,37 +588,50 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     def on_close(self):
         self.win = None
 
+    def _add_manual(self, entry):
+        manual = load_manual_printers()
+        new_id = max([p.get("id", 0) for p in manual if isinstance(p.get("id"), int)], default=0) + 1
+        entry["id"] = new_id
+        manual.append(entry)
+        save_manual_printers(manual)
+
     # on_message runs on the UI thread — host reads happen here, network/disk on workers.
     def on_message(self, msg):
         msg = msg or {}
         kind = msg.get("type")
         if kind in ("ready", "refresh"):
-            self._refresh_async()  # merged_printers() reads host state on the UI thread
+            self._refresh_async()  # host reads run on the UI thread
         elif kind == "add":
-            manual = load_manual_printers()
-            new_id = max([p.get("id", 0) for p in manual if isinstance(p.get("id"), int)], default=0) + 1
-            manual.append({"id": new_id, "name": msg.get("name") or msg.get("url"),
-                           "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
-                           "insecure": bool(msg.get("insecure"))})
-            save_manual_printers(manual)
+            self._add_manual({"name": msg.get("name") or msg.get("url"),
+                              "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
+                              "insecure": bool(msg.get("insecure")), "source": "manual"})
+            self._refresh_async()
+        elif kind == "adopt":
+            # User chose an OrcaSlicer-configured printer to put on the dashboard.
+            p = msg.get("printer") or {}
+            if p.get("url"):
+                self._add_manual({"name": p.get("name") or p.get("url"), "url": normalize_url(p.get("url")),
+                                  "type": p.get("type") or "moonraker", "apikey": p.get("apikey", ""),
+                                  "insecure": bool(p.get("insecure")), "source": "orca"})
             self._refresh_async()
         elif kind == "remove":
             manual = [p for p in load_manual_printers() if p.get("id") != msg.get("id")]
             save_manual_printers(manual)
             self._refresh_async()
         elif kind == "mass-print":
-            printers = merged_printers()  # host read on the UI thread
+            printers = dashboard_printers()  # host read on the UI thread
             threading.Thread(target=self._do_mass_print, args=(msg, printers), daemon=True).start()
 
     def _refresh_async(self):
-        printers = merged_printers()  # UI thread
-        threading.Thread(target=self._push_status, args=(printers,), daemon=True).start()
+        printers = dashboard_printers()       # UI thread: dashboard = user-chosen
+        available = available_orca_printers()  # UI thread: Orca printers not yet added
+        threading.Thread(target=self._push_status, args=(printers, available), daemon=True).start()
 
-    def _push_status(self, printers):
+    def _push_status(self, printers, available):
         for p in printers:
             p["status"] = poll_printer(p)
         if self.win is not None and self.win.is_open():
-            self.win.post({"printers": printers})
+            self.win.post({"printers": printers, "available": available})
 
     def _do_mass_print(self, msg, printers):
         try:
