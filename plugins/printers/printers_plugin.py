@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.2.0"
+# version = "0.3.0"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -54,9 +54,19 @@ PRINTERS_FILE = os.path.join(PLUGIN_DIR, "printers.json")
 ICON_PATH = os.path.join(PLUGIN_DIR, "printers.svg")
 HTTP_TIMEOUT = 6
 UPLOAD_TIMEOUT = 120
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE  # LAN printers routinely use self-signed / plain HTTP
+
+# TLS is verified by default. A printer may opt out ("insecure": true) for a
+# self-signed LAN certificate — an explicit, per-printer choice, not a blanket
+# disable. Plain-HTTP LAN hosts (the common Moonraker/OctoPrint case) don't reach
+# this code path at all. Two contexts, picked per request by the printer's flag.
+_SSL_VERIFY = ssl.create_default_context()
+_SSL_INSECURE = ssl.create_default_context()
+_SSL_INSECURE.check_hostname = False
+_SSL_INSECURE.verify_mode = ssl.CERT_NONE
+
+
+def ssl_ctx_for(printer):
+    return _SSL_INSECURE if (printer or {}).get("insecure") else _SSL_VERIFY
 
 
 # --------------------------------------------------------------------------- #
@@ -72,11 +82,17 @@ def load_manual_printers():
 
 
 def save_manual_printers(printers):
+    # Atomic write: a crash mid-write must not corrupt the store.
+    tmp = PRINTERS_FILE + ".tmp"
     try:
-        with open(PRINTERS_FILE, "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(printers, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, PRINTERS_FILE)
     except OSError:
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def normalize_url(url):
@@ -142,19 +158,19 @@ def merged_printers():
 # --------------------------------------------------------------------------- #
 # HTTP helpers (stdlib only).
 # --------------------------------------------------------------------------- #
-def _get_json(url, headers=None, timeout=HTTP_TIMEOUT):
+def _get_json(url, ctx, headers=None, timeout=HTTP_TIMEOUT):
     req = urllib.request.Request(url, headers=headers or {"Accept": "application/json"}, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
-def _get_bytes(url, headers=None, timeout=HTTP_TIMEOUT):
+def _get_bytes(url, ctx, headers=None, timeout=HTTP_TIMEOUT):
     req = urllib.request.Request(url, headers=headers or {}, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
         return resp.read()
 
 
-def _multipart_upload(url, headers, filename, file_bytes, extra_fields=None):
+def _multipart_upload(url, ctx, headers, filename, file_bytes, extra_fields=None):
     boundary = "----OrcaPrintersBoundary7MA4YWxkTrZu0gW"
     parts = []
     for key, value in (extra_fields or {}).items():
@@ -168,7 +184,7 @@ def _multipart_upload(url, headers, filename, file_bytes, extra_fields=None):
     hdrs = dict(headers or {})
     hdrs["Content-Type"] = "multipart/form-data; boundary=" + boundary
     req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT, context=_SSL_CTX) as resp:
+    with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT, context=ctx) as resp:
         return resp.getcode()
 
 
@@ -176,27 +192,38 @@ def _multipart_upload(url, headers, filename, file_bytes, extra_fields=None):
 # Per-backend status polling. Common shape:
 # {online, state, nozzle, target_nozzle, bed, target_bed, progress, filename, thumbnail}
 # --------------------------------------------------------------------------- #
-def moonraker_thumbnail(base, filename):
+# Thumbnails are cached by (base, filename): they don't change during a print,
+# so we fetch a print's thumbnail once instead of on every status poll.
+_thumb_cache = {}
+
+
+def moonraker_thumbnail(base, ctx, filename):
     if not filename:
         return ""
+    key = base + "|" + filename
+    if key in _thumb_cache:
+        return _thumb_cache[key]
+    result = ""
     try:
-        meta = _get_json(base + "/server/files/metadata?filename=" + urllib.parse.quote(filename))
+        meta = _get_json(base + "/server/files/metadata?filename=" + urllib.parse.quote(filename), ctx)
         thumbs = meta.get("result", {}).get("thumbnails", [])
-        if not thumbs:
-            return ""
-        best = max(thumbs, key=lambda t: t.get("size", 0))
-        rel = best.get("relative_path") or best.get("thumbnail_path")
-        if not rel:
-            return ""
-        raw = _get_bytes(base + "/server/files/gcodes/" + urllib.parse.quote(rel))
-        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+        if thumbs:
+            best = max(thumbs, key=lambda t: t.get("size", 0))
+            rel = best.get("relative_path") or best.get("thumbnail_path")
+            if rel:
+                raw = _get_bytes(base + "/server/files/gcodes/" + urllib.parse.quote(rel), ctx)
+                result = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
     except Exception:
-        return ""
+        result = ""
+    _thumb_cache[key] = result
+    if len(_thumb_cache) > 64:  # bound the cache
+        _thumb_cache.pop(next(iter(_thumb_cache)))
+    return result
 
 
-def poll_moonraker(base):
+def poll_moonraker(base, ctx):
     query = "/printer/objects/query?extruder&heater_bed&print_stats&display_status"
-    data = _get_json(base + query)
+    data = _get_json(base + query, ctx)
     status = data.get("result", {}).get("status", {})
     extruder = status.get("extruder", {})
     bed = status.get("heater_bed", {})
@@ -213,22 +240,22 @@ def poll_moonraker(base):
         "target_bed": bed.get("target"),
         "progress": round((display.get("progress") or 0.0) * 100),
         "filename": filename,
-        "thumbnail": moonraker_thumbnail(base, filename) if state == "printing" else "",
+        "thumbnail": moonraker_thumbnail(base, ctx, filename) if state == "printing" else "",
     }
 
 
-def poll_octoprint(base, apikey):
+def poll_octoprint(base, ctx, apikey):
     headers = {"Accept": "application/json"}
     if apikey:
         headers["X-Api-Key"] = apikey
-    printer = _get_json(base + "/api/printer", headers=headers)
+    printer = _get_json(base + "/api/printer", ctx, headers=headers)
     temps = printer.get("temperature", {})
     tool0 = temps.get("tool0", {})
     bed = temps.get("bed", {})
     state = printer.get("state", {}).get("text", "Operational")
     progress, filename = 0, ""
     try:
-        job = _get_json(base + "/api/job", headers=headers)
+        job = _get_json(base + "/api/job", ctx, headers=headers)
         progress = round(job.get("progress", {}).get("completion") or 0)
         filename = job.get("job", {}).get("file", {}).get("name", "") or ""
     except Exception:
@@ -241,9 +268,9 @@ def poll_octoprint(base, apikey):
     }
 
 
-def poll_generic(base):
+def poll_generic(base, ctx):
     req = urllib.request.Request(base, method="GET")
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX):
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx):
         return {"online": True, "state": "reachable", "nozzle": None, "target_nozzle": None,
                 "bed": None, "target_bed": None, "progress": None, "filename": "", "thumbnail": ""}
 
@@ -251,12 +278,13 @@ def poll_generic(base):
 def poll_printer(printer):
     base = normalize_url(printer.get("url"))
     kind = (printer.get("type") or "moonraker").lower()
+    ctx = ssl_ctx_for(printer)
     try:
         if kind == "moonraker":
-            return poll_moonraker(base)
+            return poll_moonraker(base, ctx)
         if kind == "octoprint":
-            return poll_octoprint(base, printer.get("apikey", ""))
-        return poll_generic(base)
+            return poll_octoprint(base, ctx, printer.get("apikey", ""))
+        return poll_generic(base, ctx)
     except Exception as exc:
         return {"online": False, "state": "offline", "error": str(exc), "nozzle": None,
                 "target_nozzle": None, "bed": None, "target_bed": None, "progress": None,
@@ -266,16 +294,17 @@ def poll_printer(printer):
 def send_gcode(printer, filename, file_bytes, start):
     base = normalize_url(printer.get("url"))
     kind = (printer.get("type") or "moonraker").lower()
+    ctx = ssl_ctx_for(printer)
     try:
         if kind == "moonraker":
             fields = {"print": "true"} if start else {}
-            _multipart_upload(base + "/server/files/upload", {}, filename, file_bytes, fields)
+            _multipart_upload(base + "/server/files/upload", ctx, {}, filename, file_bytes, fields)
         elif kind == "octoprint":
             headers = {}
             if printer.get("apikey"):
                 headers["X-Api-Key"] = printer["apikey"]
             fields = {"select": "true", "print": "true"} if start else {}
-            _multipart_upload(base + "/api/files/local", headers, filename, file_bytes, fields)
+            _multipart_upload(base + "/api/files/local", ctx, headers, filename, file_bytes, fields)
         else:
             return {"ok": False, "error": "unsupported backend"}
         return {"ok": True}
@@ -345,9 +374,25 @@ PAGE = r"""<!DOCTYPE html>
       <option value="octoprint">OctoPrint</option>
       <option value="generic">Other</option>
     </select>
+    <label style="font-size:11px;display:flex;align-items:center;gap:4px">
+      <input id="f-insecure" type="checkbox"> self-signed</label>
     <button id="add">Add</button>
     <button id="refresh" class="ghost">Refresh</button>
     <input id="file" type="file" accept=".gcode,.gco,.g,.gz" style="display:none">
+  </div>
+  <div id="confirm" style="display:none;position:absolute;inset:0;background:rgba(0,0,0,.55);
+       align-items:center;justify-content:center;z-index:20">
+    <div style="background:var(--orca-bg,#1e1e2e);border:1px solid var(--orca-border,#3c3c4c);
+         border-radius:10px;padding:18px;max-width:420px;width:90%">
+      <div style="font-weight:600;margin-bottom:8px">Start print on multiple printers?</div>
+      <div id="confirm-body" style="font-size:12px;color:var(--orca-muted,#a0a0a0);margin-bottom:12px"></div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:12px">
+        <input id="confirm-start" type="checkbox" checked> Start printing immediately after upload</label>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="confirm-cancel" class="ghost">Cancel</button>
+        <button id="confirm-ok">Send</button>
+      </div>
+    </div>
   </div>
   <div id="grid"><div class="empty">Loading…</div></div>
   <div id="viewer">
@@ -417,25 +462,44 @@ document.getElementById('add').addEventListener('click', function(){
   var name = document.getElementById('f-name').value.trim();
   var url = document.getElementById('f-url').value.trim();
   if (!url) return;
-  orca.postMessage({ type:'add', name:name, url:url, kind:document.getElementById('f-type').value });
+  orca.postMessage({ type:'add', name:name, url:url,
+                     kind:document.getElementById('f-type').value,
+                     insecure:document.getElementById('f-insecure').checked });
   document.getElementById('f-name').value = ''; document.getElementById('f-url').value = '';
+  document.getElementById('f-insecure').checked = false;
 });
 document.getElementById('refresh').addEventListener('click', function(){ orca.postMessage({ type:'refresh' }); });
 
-// Batch print: pick a file, then hand it to Python with the selected printer urls.
+// Batch print: pick a file → confirm (start on N physical printers is not
+// reversible) → hand it to Python with the selected printer urls.
+var pending = null;   // { file, urls }
 sendBtn.addEventListener('click', function(){ fileInput.click(); });
 fileInput.addEventListener('change', function(){
   var file = fileInput.files && fileInput.files[0];
+  fileInput.value = '';
   if (!file) return;
   var urls = Object.keys(selected).filter(function(k){ return selected[k]; });
+  if (!urls.length) return;
+  pending = { file:file, urls:urls };
+  var names = current.filter(function(p){ return selected[p.url]; }).map(function(p){ return esc(p.name || p.url); });
+  document.getElementById('confirm-body').innerHTML =
+    'Upload <b>' + esc(file.name) + '</b> to ' + urls.length + ' printer(s):<br>' + names.join(', ');
+  document.getElementById('confirm').style.display = 'flex';
+});
+document.getElementById('confirm-cancel').addEventListener('click', function(){
+  pending = null; document.getElementById('confirm').style.display = 'none'; });
+document.getElementById('confirm-ok').addEventListener('click', function(){
+  if (!pending) return;
+  var start = document.getElementById('confirm-start').checked;
+  var file = pending.file, urls = pending.urls;
+  pending = null; document.getElementById('confirm').style.display = 'none';
   var reader = new FileReader();
   reader.onload = function(){
     var b64 = String(reader.result).split(',')[1] || '';
     document.getElementById('status').textContent = 'Sending ' + file.name + ' to ' + urls.length + '…';
-    orca.postMessage({ type:'mass-print', filename:file.name, dataB64:b64, urls:urls, start:true });
+    orca.postMessage({ type:'mass-print', filename:file.name, dataB64:b64, urls:urls, start:start });
   };
   reader.readAsDataURL(file);
-  fileInput.value = '';
 });
 
 orca.onMessage(function(data){
@@ -499,7 +563,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             manual = load_manual_printers()
             new_id = max([p.get("id", 0) for p in manual if isinstance(p.get("id"), int)], default=0) + 1
             manual.append({"id": new_id, "name": msg.get("name") or msg.get("url"),
-                           "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker"})
+                           "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
+                           "insecure": bool(msg.get("insecure"))})
             save_manual_printers(manual)
             self._refresh_async()
         elif kind == "remove":
