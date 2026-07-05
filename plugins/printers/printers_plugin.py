@@ -5,43 +5,46 @@
 # [tool.orcaslicer.plugin]
 # id = "printers"
 # name = "Printers"
-# description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures and print progress, with one click to each printer's web interface."
+# description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.1.0"
+# version = "0.2.0"
 #
-# # Forward-looking: printers live on user-chosen LAN addresses that no static
-# # manifest allow-list can enumerate, so this declares intent for a future
-# # "local-network" permission class (see PR #14530 feedback). Ignored today.
+# # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
+# # so this declares intent for a future "local-network" permission class
+# # (see PR #14530 feedback). Ignored by the current host.
 # network = ["local-network"]
 # ///
 """Printers — a cross-vendor printer dashboard plugin for OrcaSlicer (PR #14530).
 
-A second, independent plugin built on the SAME extension surface as the
-FilamentHub catalog (orca.host.ui.create_panel): it docks as its own main-window
-tab. Different domain, same generic mechanism — the point being that the host's
-panel contribution works for any plugin, not one bespoke integration.
+Docks its own main-window tab (via orca.host.ui.create_panel) with a tile per
+printer: live status, nozzle/bed temperatures, print progress and the current
+print's thumbnail, plus one click to the printer's web UI. It also sends a
+G-code file to several printers at once ("send to printers" / batch print).
 
-What it does today, on stock plugin-runtime capabilities (no new host API):
-  * create_panel(...) -> a docked tab with a self-contained, host-themed page.
-  * The page lists the user's printers as tiles; the plugin polls each over HTTP
-    (Moonraker / OctoPrint / a generic reachability ping) on a worker thread and
-    pushes status + temperatures + print progress back to the page.
-  * "Open" swaps the tile view for an <iframe> of that printer's web UI
-    (Mainsail/Fluidd/OctoPrint are framable on the LAN), so the user reaches any
-    printer without leaving OrcaSlicer.
-  * Printers are added/removed in the page and stored in printers.json next to
-    the plugin (inside data_dir, the allowed write root).
+Printers come from two sources, merged and de-duplicated by URL:
+  * OrcaSlicer's own printer presets that have a network address configured
+    (read via orca.host.preset_bundle() on the UI thread) — no manual entry.
+  * Manually added entries, stored in printers.json next to the plugin.
 
-Unlike the FilamentHub catalog (which embeds our own themed site), this page is
-native HTML and deliberately uses the host --orca-* theme variables so it looks
-like part of OrcaSlicer in both light and dark mode.
+Backends: Moonraker (Klipper), OctoPrint, or a generic reachability ping.
+Everything is stdlib-only; host calls stay on the UI thread and all network /
+disk work is offloaded to worker threads.
+
+What is intentionally NOT done here, because it belongs to the host and would be
+a good plugin-capability to expose (flagged for PR #14530, not worked around):
+  * "Open" switches this tab to an iframe of the printer's web UI; a plugin
+    cannot programmatically open the native Device tab for a specific printer.
+  * Batch print uploads a file the user picks; a plugin cannot read the file the
+    slicer just produced (that is the g-code capability's territory, not script).
 """
 
+import base64
 import json
 import os
 import ssl
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import orca
@@ -50,15 +53,16 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 PRINTERS_FILE = os.path.join(PLUGIN_DIR, "printers.json")
 ICON_PATH = os.path.join(PLUGIN_DIR, "printers.svg")
 HTTP_TIMEOUT = 6
+UPLOAD_TIMEOUT = 120
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE  # LAN printers routinely use self-signed / plain HTTP
 
 
 # --------------------------------------------------------------------------- #
-# Printer store (printers.json next to the plugin)
+# Manual printer store (printers.json next to the plugin)
 # --------------------------------------------------------------------------- #
-def load_printers():
+def load_manual_printers():
     try:
         with open(PRINTERS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -67,7 +71,7 @@ def load_printers():
         return []
 
 
-def save_printers(printers):
+def save_manual_printers(printers):
     try:
         with open(PRINTERS_FILE, "w", encoding="utf-8") as fh:
             json.dump(printers, fh, ensure_ascii=False, indent=2)
@@ -82,64 +86,166 @@ def normalize_url(url):
     return url
 
 
+def kind_from_host_type(host_type):
+    host_type = (host_type or "").lower()
+    if "octo" in host_type:
+        return "octoprint"
+    if "moonraker" in host_type or "klipper" in host_type or "mainsail" in host_type or "fluidd" in host_type:
+        return "moonraker"
+    return "generic"
+
+
 # --------------------------------------------------------------------------- #
-# HTTP polling (stdlib only). Each backend maps its native status onto a common
-# shape: {online, state, nozzle, bed, target_nozzle, target_bed, progress}.
+# Discover printers from OrcaSlicer's own printer presets. MUST run on the UI
+# thread (reads host state); call it from on_message, not from a worker.
 # --------------------------------------------------------------------------- #
-def _get_json(url, timeout=HTTP_TIMEOUT):
-    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+def discover_orca_printers():
+    found = []
+    try:
+        printers = orca.host.preset_bundle().printers
+        count = printers.size()
+    except Exception:
+        return found
+    for i in range(count):
+        try:
+            preset = printers.preset(i)
+            host = preset.config_value("print_host")
+            if not host:
+                continue
+            found.append({
+                "id": "orca:" + preset.name,
+                "name": preset.name,
+                "url": normalize_url(host),
+                "type": kind_from_host_type(preset.config_value("host_type")),
+                "apikey": preset.config_value("printhost_apikey") or "",
+                "source": "orca",
+            })
+        except Exception:
+            continue
+    return found
+
+
+def merged_printers():
+    # Discovered (Orca) first, then manual entries whose URL is not already present.
+    result = discover_orca_printers()
+    seen = {p["url"] for p in result if p.get("url")}
+    for p in load_manual_printers():
+        url = normalize_url(p.get("url"))
+        if url and url not in seen:
+            p["url"] = url
+            p["source"] = "manual"
+            result.append(p)
+            seen.add(url)
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# HTTP helpers (stdlib only).
+# --------------------------------------------------------------------------- #
+def _get_json(url, headers=None, timeout=HTTP_TIMEOUT):
+    req = urllib.request.Request(url, headers=headers or {"Accept": "application/json"}, method="GET")
     with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
         return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _get_bytes(url, headers=None, timeout=HTTP_TIMEOUT):
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as resp:
+        return resp.read()
+
+
+def _multipart_upload(url, headers, filename, file_bytes, extra_fields=None):
+    boundary = "----OrcaPrintersBoundary7MA4YWxkTrZu0gW"
+    parts = []
+    for key, value in (extra_fields or {}).items():
+        parts.append(("--" + boundary + "\r\n"
+                      "Content-Disposition: form-data; name=\"" + key + "\"\r\n\r\n"
+                      + str(value) + "\r\n").encode("utf-8"))
+    parts.append(("--" + boundary + "\r\n"
+                  "Content-Disposition: form-data; name=\"file\"; filename=\"" + filename + "\"\r\n"
+                  "Content-Type: application/octet-stream\r\n\r\n").encode("utf-8"))
+    body = b"".join(parts) + file_bytes + ("\r\n--" + boundary + "--\r\n").encode("utf-8")
+    hdrs = dict(headers or {})
+    hdrs["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT, context=_SSL_CTX) as resp:
+        return resp.getcode()
+
+
+# --------------------------------------------------------------------------- #
+# Per-backend status polling. Common shape:
+# {online, state, nozzle, target_nozzle, bed, target_bed, progress, filename, thumbnail}
+# --------------------------------------------------------------------------- #
+def moonraker_thumbnail(base, filename):
+    if not filename:
+        return ""
+    try:
+        meta = _get_json(base + "/server/files/metadata?filename=" + urllib.parse.quote(filename))
+        thumbs = meta.get("result", {}).get("thumbnails", [])
+        if not thumbs:
+            return ""
+        best = max(thumbs, key=lambda t: t.get("size", 0))
+        rel = best.get("relative_path") or best.get("thumbnail_path")
+        if not rel:
+            return ""
+        raw = _get_bytes(base + "/server/files/gcodes/" + urllib.parse.quote(rel))
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        return ""
 
 
 def poll_moonraker(base):
     query = "/printer/objects/query?extruder&heater_bed&print_stats&display_status"
     data = _get_json(base + query)
-    result = data.get("result", {}).get("status", {})
-    extruder = result.get("extruder", {})
-    bed = result.get("heater_bed", {})
-    print_stats = result.get("print_stats", {})
-    display = result.get("display_status", {})
+    status = data.get("result", {}).get("status", {})
+    extruder = status.get("extruder", {})
+    bed = status.get("heater_bed", {})
+    print_stats = status.get("print_stats", {})
+    display = status.get("display_status", {})
+    state = print_stats.get("state", "standby")
+    filename = print_stats.get("filename", "")
     return {
         "online": True,
-        "state": print_stats.get("state", "standby"),
+        "state": state,
         "nozzle": extruder.get("temperature"),
         "target_nozzle": extruder.get("target"),
         "bed": bed.get("temperature"),
         "target_bed": bed.get("target"),
         "progress": round((display.get("progress") or 0.0) * 100),
+        "filename": filename,
+        "thumbnail": moonraker_thumbnail(base, filename) if state == "printing" else "",
     }
 
 
-def poll_octoprint(base):
-    printer = _get_json(base + "/api/printer")
+def poll_octoprint(base, apikey):
+    headers = {"Accept": "application/json"}
+    if apikey:
+        headers["X-Api-Key"] = apikey
+    printer = _get_json(base + "/api/printer", headers=headers)
     temps = printer.get("temperature", {})
     tool0 = temps.get("tool0", {})
     bed = temps.get("bed", {})
     state = printer.get("state", {}).get("text", "Operational")
-    progress = 0
+    progress, filename = 0, ""
     try:
-        job = _get_json(base + "/api/job")
+        job = _get_json(base + "/api/job", headers=headers)
         progress = round(job.get("progress", {}).get("completion") or 0)
+        filename = job.get("job", {}).get("file", {}).get("name", "") or ""
     except Exception:
         pass
     return {
-        "online": True,
-        "state": state,
-        "nozzle": tool0.get("actual"),
-        "target_nozzle": tool0.get("target"),
-        "bed": bed.get("actual"),
-        "target_bed": bed.get("target"),
-        "progress": progress,
+        "online": True, "state": state,
+        "nozzle": tool0.get("actual"), "target_nozzle": tool0.get("target"),
+        "bed": bed.get("actual"), "target_bed": bed.get("target"),
+        "progress": progress, "filename": filename, "thumbnail": "",
     }
 
 
 def poll_generic(base):
-    # No known API: just confirm the host answers, so the tile shows reachable.
     req = urllib.request.Request(base, method="GET")
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=_SSL_CTX):
         return {"online": True, "state": "reachable", "nozzle": None, "target_nozzle": None,
-                "bed": None, "target_bed": None, "progress": None}
+                "bed": None, "target_bed": None, "progress": None, "filename": "", "thumbnail": ""}
 
 
 def poll_printer(printer):
@@ -149,17 +255,37 @@ def poll_printer(printer):
         if kind == "moonraker":
             return poll_moonraker(base)
         if kind == "octoprint":
-            return poll_octoprint(base)
+            return poll_octoprint(base, printer.get("apikey", ""))
         return poll_generic(base)
     except Exception as exc:
-        return {"online": False, "state": "offline", "error": str(exc),
-                "nozzle": None, "target_nozzle": None, "bed": None, "target_bed": None,
-                "progress": None}
+        return {"online": False, "state": "offline", "error": str(exc), "nozzle": None,
+                "target_nozzle": None, "bed": None, "target_bed": None, "progress": None,
+                "filename": "", "thumbnail": ""}
+
+
+def send_gcode(printer, filename, file_bytes, start):
+    base = normalize_url(printer.get("url"))
+    kind = (printer.get("type") or "moonraker").lower()
+    try:
+        if kind == "moonraker":
+            fields = {"print": "true"} if start else {}
+            _multipart_upload(base + "/server/files/upload", {}, filename, file_bytes, fields)
+        elif kind == "octoprint":
+            headers = {}
+            if printer.get("apikey"):
+                headers["X-Api-Key"] = printer["apikey"]
+            fields = {"select": "true", "print": "true"} if start else {}
+            _multipart_upload(base + "/api/files/local", headers, filename, file_bytes, fields)
+        else:
+            return {"ok": False, "error": "unsupported backend"}
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 # --------------------------------------------------------------------------- #
-# The page — native, host-themed. Renders tiles from data the plugin pushes and
-# lets the user add/remove printers and open a printer's web UI in an iframe.
+# The page — native, host-themed. Tiles, thumbnail preview, per-tile select for
+# batch print, and a "Send G-code to selected" action.
 # --------------------------------------------------------------------------- #
 PAGE = r"""<!DOCTYPE html>
 <html>
@@ -169,45 +295,51 @@ PAGE = r"""<!DOCTYPE html>
   body { display:flex; flex-direction:column; background:var(--orca-bg,#1e1e2e);
          color:var(--orca-fg,#e0e0e0); font-family:var(--orca-font,sans-serif); }
   #bar { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 12px;
-         border-bottom:1px solid var(--orca-border,#3c3c4c); }
+         border-bottom:1px solid var(--orca-border,#3c3c4c); flex-wrap:wrap; }
   #bar h1 { margin:0; margin-right:auto; font-size:14px; font-weight:600; }
-  #bar input { font:inherit; font-size:12px; padding:4px 8px;
-               background:var(--orca-bg,#1e1e2e); color:var(--orca-fg,#e0e0e0);
-               border:1px solid var(--orca-border,#3c3c4c); border-radius:4px; }
-  #bar select { font:inherit; font-size:12px; padding:4px 6px;
-                background:var(--orca-bg,#1e1e2e); color:var(--orca-fg,#e0e0e0);
-                border:1px solid var(--orca-border,#3c3c4c); border-radius:4px; }
+  #bar input, #bar select { font:inherit; font-size:12px; padding:4px 8px;
+         background:var(--orca-bg,#1e1e2e); color:var(--orca-fg,#e0e0e0);
+         border:1px solid var(--orca-border,#3c3c4c); border-radius:4px; }
   button { font:inherit; font-size:12px; cursor:pointer; padding:4px 12px; border-radius:4px;
            background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff);
            border:1px solid var(--orca-accent,#009688); }
-  button.ghost { background:transparent; color:var(--orca-fg,#e0e0e0);
-                 border-color:var(--orca-border,#3c3c4c); }
+  button.ghost { background:transparent; color:var(--orca-fg,#e0e0e0); border-color:var(--orca-border,#3c3c4c); }
+  button:disabled { opacity:.5; cursor:default; }
   #grid { flex:1 1 auto; overflow:auto; padding:12px;
-          display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px;
-          align-content:start; }
+          display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:12px; align-content:start; }
   .tile { border:1px solid var(--orca-border,#3c3c4c); border-radius:8px; padding:12px;
           display:flex; flex-direction:column; gap:8px; }
   .tile .top { display:flex; align-items:center; gap:8px; }
   .dot { width:9px; height:9px; border-radius:50%; background:#888; flex:0 0 auto; }
   .dot.on { background:#3fbf6f; } .dot.off { background:#c0504d; }
   .tile .name { font-weight:600; margin-right:auto; }
+  .src { font-size:10px; padding:1px 5px; border-radius:3px; border:1px solid var(--orca-border,#3c3c4c);
+         color:var(--orca-muted,#a0a0a0); }
   .tile .state { font-size:11px; color:var(--orca-muted,#a0a0a0); text-transform:capitalize; }
-  .temps { display:flex; gap:14px; font-size:12px; }
-  .temps b { font-weight:600; }
+  .body { display:flex; gap:10px; }
+  .thumb { width:64px; height:64px; flex:0 0 auto; border:1px solid var(--orca-border,#3c3c4c);
+           border-radius:6px; object-fit:contain; background:rgba(255,255,255,.04); display:none; }
+  .thumb.show { display:block; }
+  .meta { flex:1 1 auto; display:flex; flex-direction:column; gap:6px; min-width:0; }
+  .temps { display:flex; gap:14px; font-size:12px; } .temps b { font-weight:600; }
+  .fname { font-size:11px; color:var(--orca-muted,#a0a0a0); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .bar { height:6px; border-radius:3px; background:var(--orca-border,#3c3c4c); overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--orca-accent,#009688); }
-  .row { display:flex; gap:6px; }
+  .row { display:flex; gap:6px; align-items:center; }
+  .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
   .empty { color:var(--orca-muted,#a0a0a0); padding:24px; text-align:center; }
   #viewer { flex:1 1 auto; display:none; flex-direction:column; }
-  #viewer .vbar { display:flex; align-items:center; gap:8px; padding:6px 12px;
-                  border-bottom:1px solid var(--orca-border,#3c3c4c); }
+  #viewer .vbar { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--orca-border,#3c3c4c); }
   #viewer iframe { flex:1 1 auto; border:0; width:100%; }
+  #status { font-size:11px; color:var(--orca-muted,#a0a0a0); }
 </style></head>
 <body>
   <div id="bar">
     <h1>Printers</h1>
-    <input id="f-name" placeholder="Name" size="10">
-    <input id="f-url" placeholder="192.168.0.42" size="16">
+    <span id="status"></span>
+    <button id="send" class="ghost" disabled>Send G-code to selected…</button>
+    <input id="f-name" placeholder="Name" size="8">
+    <input id="f-url" placeholder="192.168.0.42" size="14">
     <select id="f-type">
       <option value="moonraker">Moonraker</option>
       <option value="octoprint">OctoPrint</option>
@@ -215,6 +347,7 @@ PAGE = r"""<!DOCTYPE html>
     </select>
     <button id="add">Add</button>
     <button id="refresh" class="ghost">Refresh</button>
+    <input id="file" type="file" accept=".gcode,.gco,.g,.gz" style="display:none">
   </div>
   <div id="grid"><div class="empty">Loading…</div></div>
   <div id="viewer">
@@ -225,34 +358,51 @@ PAGE = r"""<!DOCTYPE html>
 'use strict';
 var grid = document.getElementById('grid');
 var viewer = document.getElementById('viewer');
+var sendBtn = document.getElementById('send');
+var fileInput = document.getElementById('file');
+var current = [];
+var selected = {};   // url -> true
 
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function temp(v){ return v == null ? '—' : Math.round(v) + '°'; }
 
+function updateSendBtn(){
+  var n = Object.keys(selected).filter(function(k){ return selected[k]; }).length;
+  sendBtn.disabled = n === 0;
+  sendBtn.textContent = n ? ('Send G-code to ' + n + ' selected…') : 'Send G-code to selected…';
+}
+
 function render(printers){
+  current = printers;
   grid.innerHTML = '';
-  if (!printers.length){ grid.innerHTML = '<div class="empty">No printers yet. Add one above.</div>'; return; }
+  if (!printers.length){ grid.innerHTML = '<div class="empty">No printers found. Configure a printer host in OrcaSlicer, or add one above.</div>'; return; }
   printers.forEach(function(p){
     var s = p.status || {};
     var tile = document.createElement('div'); tile.className = 'tile';
-    var prog = (s.progress == null) ? '' :
-      '<div class="bar"><i style="width:' + s.progress + '%"></i></div>';
+    var prog = (s.progress == null) ? '' : '<div class="bar"><i style="width:' + s.progress + '%"></i></div>';
+    var thumb = s.thumbnail ? '<img class="thumb show" src="' + s.thumbnail + '">' : '<div class="thumb"></div>';
+    var fname = s.filename ? '<div class="fname" title="' + esc(s.filename) + '">' + esc(s.filename) + '</div>' : '';
     tile.innerHTML =
       '<div class="top"><span class="dot ' + (s.online ? 'on' : 'off') + '"></span>' +
       '<span class="name">' + esc(p.name || p.url) + '</span>' +
+      '<span class="src">' + (p.source === 'orca' ? 'Orca' : 'manual') + '</span>' +
       '<span class="state">' + esc(s.state || (s.online ? 'online' : 'offline')) + '</span></div>' +
-      '<div class="temps"><span>Nozzle <b>' + temp(s.nozzle) + '</b>' +
-      (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
-      '<span>Bed <b>' + temp(s.bed) + '</b>' +
-      (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' + prog +
-      '<div class="row"><button class="open ghost">Open</button>' +
-      '<button class="remove ghost">Remove</button></div>';
+      '<div class="body">' + thumb + '<div class="meta">' +
+      '<div class="temps"><span>Nozzle <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
+      '<span>Bed <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
+      fname + prog + '</div></div>' +
+      '<div class="row"><label><input type="checkbox" class="sel"' + (selected[p.url] ? ' checked' : '') + '> select</label>' +
+      '<button class="open ghost">Open</button>' +
+      (p.source === 'manual' ? '<button class="remove ghost">Remove</button>' : '') + '</div>';
+    tile.querySelector('.sel').addEventListener('change', function(e){
+      selected[p.url] = e.target.checked; updateSendBtn(); });
     tile.querySelector('.open').addEventListener('click', function(){ openPrinter(p); });
-    tile.querySelector('.remove').addEventListener('click', function(){
-      orca.postMessage({ type:'remove', id:p.id }); });
+    var rm = tile.querySelector('.remove');
+    if (rm) rm.addEventListener('click', function(){ orca.postMessage({ type:'remove', id:p.id }); });
     grid.appendChild(tile);
   });
+  updateSendBtn();
 }
 
 function openPrinter(p){
@@ -266,16 +416,33 @@ document.getElementById('back').addEventListener('click', function(){
 document.getElementById('add').addEventListener('click', function(){
   var name = document.getElementById('f-name').value.trim();
   var url = document.getElementById('f-url').value.trim();
-  var type = document.getElementById('f-type').value;
   if (!url) return;
-  orca.postMessage({ type:'add', name:name, url:url, kind:type });
+  orca.postMessage({ type:'add', name:name, url:url, kind:document.getElementById('f-type').value });
   document.getElementById('f-name').value = ''; document.getElementById('f-url').value = '';
 });
-document.getElementById('refresh').addEventListener('click', function(){
-  orca.postMessage({ type:'refresh' }); });
+document.getElementById('refresh').addEventListener('click', function(){ orca.postMessage({ type:'refresh' }); });
 
-// Plugin -> page: full printer list with fresh status.
-orca.onMessage(function(data){ if (data && data.printers) render(data.printers); });
+// Batch print: pick a file, then hand it to Python with the selected printer urls.
+sendBtn.addEventListener('click', function(){ fileInput.click(); });
+fileInput.addEventListener('change', function(){
+  var file = fileInput.files && fileInput.files[0];
+  if (!file) return;
+  var urls = Object.keys(selected).filter(function(k){ return selected[k]; });
+  var reader = new FileReader();
+  reader.onload = function(){
+    var b64 = String(reader.result).split(',')[1] || '';
+    document.getElementById('status').textContent = 'Sending ' + file.name + ' to ' + urls.length + '…';
+    orca.postMessage({ type:'mass-print', filename:file.name, dataB64:b64, urls:urls, start:true });
+  };
+  reader.readAsDataURL(file);
+  fileInput.value = '';
+});
+
+orca.onMessage(function(data){
+  if (!data) return;
+  if (data.printers) render(data.printers);
+  if (data.status !== undefined) document.getElementById('status').textContent = data.status;
+});
 orca.postMessage({ type:'ready' });
 </script>
 </body>
@@ -298,13 +465,12 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         create_panel = self._supports_panel()
         if create_panel is not None:
             self.win = create_panel(
-                title="Printers", html=PAGE,
-                on_message=self.on_message, on_close=self.on_close,
+                title="Printers", html=PAGE, on_message=self.on_message, on_close=self.on_close,
                 icon=ICON_PATH if os.path.exists(ICON_PATH) else "",
             )
         else:
             self.win = orca.host.ui.create_window(
-                title="Printers", html=PAGE, width=980, height=680,
+                title="Printers", html=PAGE, width=1000, height=700,
                 on_message=self.on_message, on_close=self.on_close,
             )
         return True
@@ -323,34 +489,59 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     def on_close(self):
         self.win = None
 
-    # on_message runs on the UI thread — push work to a worker and post results back.
+    # on_message runs on the UI thread — host reads happen here, network/disk on workers.
     def on_message(self, msg):
         msg = msg or {}
         kind = msg.get("type")
-        if kind == "ready" or kind == "refresh":
-            threading.Thread(target=self._push_status, daemon=True).start()
+        if kind in ("ready", "refresh"):
+            self._refresh_async()  # merged_printers() reads host state on the UI thread
         elif kind == "add":
-            printers = load_printers()
-            new_id = (max([p.get("id", 0) for p in printers], default=0) + 1)
-            printers.append({
-                "id": new_id,
-                "name": msg.get("name") or msg.get("url"),
-                "url": normalize_url(msg.get("url")),
-                "type": msg.get("kind") or "moonraker",
-            })
-            save_printers(printers)
-            threading.Thread(target=self._push_status, daemon=True).start()
+            manual = load_manual_printers()
+            new_id = max([p.get("id", 0) for p in manual if isinstance(p.get("id"), int)], default=0) + 1
+            manual.append({"id": new_id, "name": msg.get("name") or msg.get("url"),
+                           "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker"})
+            save_manual_printers(manual)
+            self._refresh_async()
         elif kind == "remove":
-            printers = [p for p in load_printers() if p.get("id") != msg.get("id")]
-            save_printers(printers)
-            threading.Thread(target=self._push_status, daemon=True).start()
+            manual = [p for p in load_manual_printers() if p.get("id") != msg.get("id")]
+            save_manual_printers(manual)
+            self._refresh_async()
+        elif kind == "mass-print":
+            printers = merged_printers()  # host read on the UI thread
+            threading.Thread(target=self._do_mass_print, args=(msg, printers), daemon=True).start()
 
-    def _push_status(self):
-        printers = load_printers()
+    def _refresh_async(self):
+        printers = merged_printers()  # UI thread
+        threading.Thread(target=self._push_status, args=(printers,), daemon=True).start()
+
+    def _push_status(self, printers):
         for p in printers:
             p["status"] = poll_printer(p)
         if self.win is not None and self.win.is_open():
             self.win.post({"printers": printers})
+
+    def _do_mass_print(self, msg, printers):
+        try:
+            file_bytes = base64.b64decode(msg.get("dataB64") or "")
+        except Exception:
+            self._post_status("Send failed: could not read the file.")
+            return
+        filename = msg.get("filename") or "print.gcode"
+        start = bool(msg.get("start"))
+        targets = {normalize_url(u) for u in (msg.get("urls") or [])}
+        selected = [p for p in printers if normalize_url(p.get("url")) in targets]
+        ok, fail = 0, 0
+        for p in selected:
+            if send_gcode(p, filename, file_bytes, start).get("ok"):
+                ok += 1
+            else:
+                fail += 1
+        self._post_status("Sent to %d printer(s)%s." % (ok, (", %d failed" % fail) if fail else ""))
+        self._refresh_async()
+
+    def _post_status(self, text):
+        if self.win is not None and self.win.is_open():
+            self.win.post({"status": text})
 
 
 @orca.plugin
