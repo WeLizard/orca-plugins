@@ -23,6 +23,13 @@ To load a plugin into OrcaSlicer:
 2. Copy the plugin's folder (e.g. `plugins/printers/`) into that directory.
 3. Restart OrcaSlicer so the built-in Plugin Manager discovers the manifest.
 
+## Publishing
+
+The Plugin Hub accepts manifest versions only as three numeric components in
+`X.Y.Z` form (for example, `0.1.0`). Pre-release or build suffixes such as
+`0.1.0-alpha.1`, `0.1.0-rc1`, and `0.1.0+build.4` are rejected. Mark alpha or
+beta maturity in the listing text instead of the version field.
+
 ## License
 
 Open-source under the **AGPL v3** license.
