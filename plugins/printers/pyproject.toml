@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "printers"
+version = "0.0.1"
+description = "Cross-vendor dashboard of networked 3D printers with live status, controls, multi-send and an OrcaSlicer output history."
+requires-python = ">=3.12"
+authors = [{ name = "FilamentHub" }]
+
+[tool.setuptools]
+py-modules = ["printers_plugin"]

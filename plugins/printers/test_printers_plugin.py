@@ -1,9 +1,12 @@
 import importlib.util
 import pathlib
+import re
 import sys
 import tempfile
+import tomllib
 import types
 import unittest
+from unittest import mock
 
 
 PLUGIN_PATH = pathlib.Path(__file__).with_name("printers_plugin.py")
@@ -33,7 +36,7 @@ def _load_plugin():
     fake_orca.script = types.SimpleNamespace(ScriptPluginCapabilityBase=object)
     fake_orca.slicing = types.SimpleNamespace(
         SlicingPipelineCapabilityBase=object,
-        psGCodePostProcess="post-process",
+        Step=types.SimpleNamespace(psGCodePostProcess="post-process"),
     )
     sys.modules["orca"] = fake_orca
 
@@ -77,7 +80,9 @@ class PrintersOutboxTest(unittest.TestCase):
         result = self.execute("File")
 
         self.assertEqual(result[0], "success")
-        self.assertEqual(len(self.plugin.load_outbox_index()), 1)
+        record = self.plugin.load_outbox_index()[0]
+        self.assertFalse(record["host_handled"])
+        self.assertEqual(record["host"], "File")
 
     def test_file_target_is_case_insensitive(self):
         result = self.execute(" file ")
@@ -95,21 +100,36 @@ class PrintersOutboxTest(unittest.TestCase):
         result = self.execute("OctoPrint")
 
         self.assertEqual(result[0], "success")
-        self.assertEqual(len(self.plugin.load_outbox_index()), 1)
+        record = self.plugin.load_outbox_index()[0]
+        self.assertTrue(record["host_handled"])
+        self.assertEqual(record["host"], "OctoPrint")
 
-    def test_bulk_toggle_state_comes_from_process_presets(self):
-        self.plugin.DATA_DIR = self.temp_dir.name
-        process_dir = pathlib.Path(self.temp_dir.name) / "user" / "account" / "process"
-        process_dir.mkdir(parents=True)
-        (process_dir / "bound.json").write_text(
-            '{"slicing_pipeline_plugin": ["Printers Outbox"]}', encoding="utf-8")
-        (process_dir / "free.json").write_text('{}', encoding="utf-8")
+    def test_hub_version_matches_wheel_project(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        match = re.search(r'^# version = "([0-9]+\.[0-9]+\.[0-9]+)"$', source, re.MULTILINE)
+        self.assertIsNotNone(match)
+        project = tomllib.loads(PLUGIN_PATH.with_name("pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(match.group(1), project["project"]["version"])
 
-        self.assertEqual(self.plugin.outbox_binding_status(), (1, 2))
-        self.assertEqual(self.plugin.set_outbox_binding(True), 2)
-        self.assertEqual(self.plugin.outbox_binding_status(), (2, 2))
-        self.assertEqual(self.plugin.set_outbox_binding(False), 2)
-        self.assertEqual(self.plugin.outbox_binding_status(), (0, 2))
+    def test_plugin_does_not_forge_host_owned_process_manifest_refs(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("OUTBOX_REF", source)
+        self.assertNotIn("outbox-toggle", source)
+        self.assertNotIn("set_outbox_binding", source)
+
+    def test_curl_fallback_keeps_temp_file_inside_plugin_data(self):
+        temp_file = types.SimpleNamespace(
+            name=str(pathlib.Path(self.temp_dir.name) / "upload.gcode"),
+            write=mock.Mock(),
+            close=mock.Mock(),
+        )
+        with mock.patch.object(self.plugin.shutil, "which", return_value="curl"), \
+             mock.patch.object(self.plugin.tempfile, "NamedTemporaryFile", return_value=temp_file) as make_temp, \
+             mock.patch.object(self.plugin.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stderr="")), \
+             mock.patch.object(self.plugin.os, "remove"):
+            self.assertEqual(self.plugin._curl_stor("printer", "code", "job.gcode", b"G28"), "")
+
+        make_temp.assert_called_once_with(delete=False, suffix=".gcode", dir=self.plugin.PLUGIN_DIR)
 
 
 if __name__ == "__main__":
