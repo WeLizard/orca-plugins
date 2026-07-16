@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.4.0"
+# version = "0.0.4"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -26,9 +26,12 @@ Printers come from two sources, merged and de-duplicated by URL:
     (read via orca.host.preset_bundle() on the UI thread) — no manual entry.
   * Manually added entries, stored in printers.json next to the plugin.
 
-Backends: Moonraker (Klipper), OctoPrint, or a generic reachability ping.
-Everything is stdlib-only; host calls stay on the UI thread and all network /
-disk work is offloaded to worker threads.
+Backends: Moonraker (Klipper), OctoPrint, Bambu Lab in LAN mode, or a generic
+reachability ping. Bambu talks MQTT over TLS on its LAN port (user "bblp", the
+printer's access code); a self-contained stdlib MQTT client reads one status
+report, so no third-party dependency and no cloud round-trip. Everything is
+stdlib-only; host calls stay on the UI thread and all network / disk work is
+offloaded to worker threads.
 
 What is intentionally NOT done here, because it belongs to the host and would be
 a good plugin-capability to expose (flagged for PR #14530, not worked around):
@@ -39,21 +42,70 @@ a good plugin-capability to expose (flagged for PR #14530, not worked around):
 """
 
 import base64
+import ftplib
+import io
 import json
 import os
+import shutil
+import socket
 import ssl
+import struct
+import subprocess
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 import orca
 
-PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+BAMBU_MQTT_PORT = 8883
+
+def resolve_plugin_dir():
+    """The plugin's install dir (orca_plugins/<name>), stable across package
+    formats. A wheel runs from __whl_extracted__/<pkg>/ INSIDE the install dir
+    and that cache is wiped on update — sidecar state (the printers store, the
+    icon) must live in the install dir, not wherever __file__ happens to be."""
+    here = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+    parts = here.split("/")
+    if "__whl_extracted__" in parts:
+        return "/".join(parts[: parts.index("__whl_extracted__")])
+    return here
+
+
+PLUGIN_DIR = resolve_plugin_dir()
 PRINTERS_FILE = os.path.join(PLUGIN_DIR, "printers.json")
+# Tab icon. Embedded here rather than shipped as a sibling file so it survives a
+# single-file install: OrcaSlicer copies only the .py, not adjacent assets. It is
+# materialized next to the plugin on first use and handed to create_panel by path.
 ICON_PATH = os.path.join(PLUGIN_DIR, "printers.svg")
+ICON_SVG = r'''<?xml version="1.0" encoding="UTF-8"?><svg id="a" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"><line x1="4.5" y1="14.5" x2="10.5" y2="14.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><polyline points="8.5 10.5 7.5 11.5 6.5 10.5" style="fill:none; stroke:#fff; stroke-linecap:round; stroke-linejoin:round;"/><line x1="4.5" y1="9.5" x2="6" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><line x1="9.5" y1="9.5" x2="10.5" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><rect x="6.5" y="8.5" width="2" height="2" rx=".27" ry=".27" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><rect x="1.5" y="6.5" width="12" height="11" rx="1" ry="1" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><path d="M5.5,5v-1.5c0-.55.45-1,1-1h10c.55,0,1,.45,1,1v9c0,.55-.45,1-1,1h-1.5" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/></svg>'''
+
+
+def ensure_icon():
+    """Write the embedded tab icon next to the plugin if it's absent, and return
+    its path — or "" if it can't be written, so the host uses its default icon."""
+    try:
+        if not os.path.exists(ICON_PATH):
+            with open(ICON_PATH, "w", encoding="utf-8") as fh:
+                fh.write(ICON_SVG)
+        return ICON_PATH
+    except OSError:
+        return ""
 HTTP_TIMEOUT = 6
 UPLOAD_TIMEOUT = 120
+
+
+def resolve_data_dir():
+    here = os.path.abspath(__file__).replace("\\", "/")
+    parts = here.split("/")
+    if "orca_plugins" in parts:
+        return "/".join(parts[: parts.index("orca_plugins")])
+    return os.path.dirname(os.path.dirname(here))
+
+
+DATA_DIR = resolve_data_dir()
 
 # TLS is verified by default. A printer may opt out ("insecure": true) for a
 # self-signed LAN certificate — an explicit, per-printer choice, not a blanket
@@ -102,12 +154,29 @@ def normalize_url(url):
     return url
 
 
-def kind_from_host_type(host_type):
-    host_type = (host_type or "").lower()
-    if "octo" in host_type:
-        return "octoprint"
-    if "moonraker" in host_type or "klipper" in host_type or "mainsail" in host_type or "fluidd" in host_type:
+# OrcaSlicer exposes many print_host types. We keep the real type for display and
+# map it to the status backend we actually implement. OctoPrint-compatible hosts
+# (PrusaLink, Repetier) speak the OctoPrint API; Klipper stacks speak Moonraker.
+# Everything else falls back to a reachability ping (still shows online/offline and
+# opens its web UI). Cloud-only hosts (obico, simplyprint, prusaconnect,
+# 3dprinteros) can't be polled over the LAN and stay generic.
+_MOONRAKER_COMPATIBLE = {"moonraker", "klipper", "mainsail", "fluidd"}
+_OCTOPRINT_COMPATIBLE = {"octoprint", "prusalink", "repetier"}
+
+
+def normalize_host_type(host_type):
+    # Keep OrcaSlicer's real host_type for the tile badge; default empty to generic.
+    return (host_type or "").strip().lower() or "generic"
+
+
+def backend_for_type(host_type):
+    t = (host_type or "").lower()
+    if t in _MOONRAKER_COMPATIBLE:
         return "moonraker"
+    if t in _OCTOPRINT_COMPATIBLE:
+        return "octoprint"
+    if t == "bambu":
+        return "bambu"
     return "generic"
 
 
@@ -132,12 +201,46 @@ def discover_orca_printers():
                 "id": "orca:" + preset.name,
                 "name": preset.name,
                 "url": normalize_url(host),
-                "type": kind_from_host_type(preset.config_value("host_type")),
+                "type": normalize_host_type(preset.config_value("host_type")),
                 "apikey": preset.config_value("printhost_apikey") or "",
                 "source": "orca",
             })
         except Exception:
             continue
+    return found
+
+
+def discover_bambu_printers():
+    # Bambu printers don't expose a print_host, so preset discovery misses them.
+    # OrcaSlicer records the ones you've connected to in OrcaSlicer.conf: a
+    # local_machines entry keyed by serial (not "ip:port"), with the LAN access
+    # code in user_access_code/access_code. Surface those for one-click adopt with
+    # IP + serial + access code pre-filled. The file has a trailing MD5 line, so
+    # decode just the JSON prefix.
+    conf = os.path.join(DATA_DIR, "OrcaSlicer.conf")
+    try:
+        with open(conf, "r", encoding="utf-8-sig") as fh:
+            obj, _ = json.JSONDecoder().raw_decode(fh.read().lstrip())
+    except (OSError, ValueError):
+        return []
+    machines = obj.get("local_machines") or {}
+    codes = obj.get("user_access_code") or {}
+    codes_fallback = obj.get("access_code") or {}
+    found = []
+    for key, m in machines.items():
+        ip = (m or {}).get("dev_ip") or ""
+        # Bambu entries are serial-keyed; Moonraker/OctoPrint use "ip:port" == dev_ip.
+        if not key or ":" in key or not ip or key == ip:
+            continue
+        found.append({
+            "id": "bambu:" + key,
+            "name": (m or {}).get("dev_name") or key,
+            "url": normalize_url(ip),
+            "type": "bambu",
+            "serial": key,
+            "access_code": codes.get(key) or codes_fallback.get(key) or "",
+            "source": "orca",
+        })
     return found
 
 
@@ -154,9 +257,19 @@ def dashboard_printers():
 
 def available_orca_printers():
     # OrcaSlicer-configured printers not yet added to the dashboard, offered for
-    # the user to adopt one by one.
-    added = {normalize_url(p.get("url")) for p in load_manual_printers()}
-    return [p for p in discover_orca_printers() if p["url"] not in added]
+    # the user to adopt one by one — network presets (Moonraker/OctoPrint) plus
+    # Bambu machines pulled from OrcaSlicer.conf.
+    manual = load_manual_printers()
+    added_urls = {normalize_url(p.get("url")) for p in manual}
+    added_serials = {p.get("serial") for p in manual if p.get("serial")}
+    out = []
+    for p in discover_orca_printers() + discover_bambu_printers():
+        if p.get("url") in added_urls:
+            continue
+        if p.get("serial") and p["serial"] in added_serials:
+            continue
+        out.append(p)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -250,6 +363,29 @@ def poll_moonraker(base, ctx):
     }
 
 
+def octoprint_thumbnail(base, headers, ctx, filepath):
+    # OctoPrint's thumbnail plugins (PrusaSlicer/UFP) attach a "thumbnail" URL to
+    # the file resource; fetch it once and inline it. Absent if no such plugin.
+    if not filepath:
+        return ""
+    key = base + "|" + filepath
+    if key in _thumb_cache:
+        return _thumb_cache[key]
+    result = ""
+    try:
+        meta = _get_json(base + "/api/files/local/" + urllib.parse.quote(filepath), ctx, headers=headers)
+        rel = meta.get("thumbnail")
+        if rel:
+            raw = _get_bytes(base + "/" + rel.lstrip("/"), ctx, headers=headers)
+            result = "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    except Exception:
+        result = ""
+    _thumb_cache[key] = result
+    if len(_thumb_cache) > 64:
+        _thumb_cache.pop(next(iter(_thumb_cache)))
+    return result
+
+
 def poll_octoprint(base, ctx, apikey):
     headers = {"Accept": "application/json"}
     if apikey:
@@ -259,18 +395,21 @@ def poll_octoprint(base, ctx, apikey):
     tool0 = temps.get("tool0", {})
     bed = temps.get("bed", {})
     state = printer.get("state", {}).get("text", "Operational")
-    progress, filename = 0, ""
+    progress, filename, filepath = 0, "", ""
     try:
         job = _get_json(base + "/api/job", ctx, headers=headers)
         progress = round(job.get("progress", {}).get("completion") or 0)
-        filename = job.get("job", {}).get("file", {}).get("name", "") or ""
+        job_file = job.get("job", {}).get("file", {})
+        filename = job_file.get("name", "") or ""
+        filepath = job_file.get("path", "") or filename
     except Exception:
         pass
     return {
         "online": True, "state": state,
         "nozzle": tool0.get("actual"), "target_nozzle": tool0.get("target"),
         "bed": bed.get("actual"), "target_bed": bed.get("target"),
-        "progress": progress, "filename": filename, "thumbnail": "",
+        "progress": progress, "filename": filename,
+        "thumbnail": octoprint_thumbnail(base, headers, ctx, filepath) if filepath else "",
     }
 
 
@@ -281,25 +420,500 @@ def poll_generic(base, ctx):
                 "bed": None, "target_bed": None, "progress": None, "filename": "", "thumbnail": ""}
 
 
+# --------------------------------------------------------------------------- #
+# Bambu Lab (LAN mode): a self-contained MQTT-over-TLS client. Bambu printers do
+# not speak Moonraker/OctoPrint — in LAN mode they expose an MQTT broker on 8883
+# (username "bblp", password = the printer's LAN access code, self-signed cert).
+# We connect, subscribe to device/<serial>/report, ask for a full push, read one
+# status report and disconnect. Just enough MQTT 3.1.1 to avoid a paho dependency.
+# --------------------------------------------------------------------------- #
+_BAMBU_STATES = {
+    "RUNNING": "printing", "PAUSE": "paused", "IDLE": "idle", "FINISH": "finished",
+    "FAILED": "failed", "PREPARE": "preparing", "SLICING": "slicing",
+}
+
+
+def _mqtt_len(n):
+    # MQTT "remaining length": 7 bits per byte, high bit = continuation.
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            return bytes(out)
+
+
+def _mqtt_field(data):
+    return struct.pack("!H", len(data)) + data
+
+
+def _recv_exact(sock, n, deadline):
+    buf = b""
+    while len(buf) < n:
+        sock.settimeout(max(0.1, deadline - time.monotonic()))
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise IOError("connection closed")
+        buf += chunk
+    return buf
+
+
+def _mqtt_read_packet(sock, deadline):
+    header = _recv_exact(sock, 1, deadline)[0]
+    length, mult = 0, 1
+    while True:
+        b = _recv_exact(sock, 1, deadline)[0]
+        length += (b & 0x7F) * mult
+        if not (b & 0x80):
+            break
+        mult *= 128
+    body = _recv_exact(sock, length, deadline) if length else b""
+    return header, body
+
+
+def _bambu_offline(state):
+    return {"online": False, "state": state, "nozzle": None, "target_nozzle": None,
+            "bed": None, "target_bed": None, "progress": None, "filename": "", "thumbnail": ""}
+
+
+def poll_bambu(printer, timeout=8):
+    host = urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname or ""
+    serial = (printer.get("serial") or "").strip()
+    code = (printer.get("access_code") or printer.get("apikey") or "").strip()
+    if not host:
+        return _bambu_offline("no address")
+    if not code:
+        return _bambu_offline("needs access code")
+
+    deadline = time.monotonic() + timeout
+    try:
+        raw = socket.create_connection((host, BAMBU_MQTT_PORT), timeout=timeout)
+    except Exception as exc:
+        return _bambu_offline(str(exc))
+    sock = None
+    try:
+        # Bambu presents a self-signed cert on the LAN broker.
+        sock = _SSL_INSECURE.wrap_socket(raw, server_hostname=host)
+        # CONNECT: protocol "MQTT" v4, flags user+pass+clean-session, 60s keepalive.
+        var = _mqtt_field(b"MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
+        payload = _mqtt_field(b"orca-printers") + _mqtt_field(b"bblp") + _mqtt_field(code.encode("utf-8"))
+        body = var + payload
+        sock.sendall(b"\x10" + _mqtt_len(len(body)) + body)
+        header, _ = _mqtt_read_packet(sock, deadline)
+        if (header & 0xF0) != 0x20:
+            return _bambu_offline("connect rejected")
+
+        # Without a serial, subscribe to the wildcard: the broker allows it, and
+        # the first report's topic (device/<serial>/report) reveals the serial —
+        # so IP + access code are enough and nobody retypes 15-char serials.
+        report = ("device/%s/report" % serial if serial else "device/+/report").encode("utf-8")
+        # SUBSCRIBE (packet id 1) to the report topic at QoS 0.
+        sub = struct.pack("!H", 1) + _mqtt_field(report) + b"\x00"
+        sock.sendall(b"\x82" + _mqtt_len(len(sub)) + sub)
+        _mqtt_read_packet(sock, deadline)  # SUBACK
+
+        def send_pushall(target_serial):
+            # PUBLISH a "pushall" so the printer sends a full snapshot immediately.
+            request = ("device/%s/request" % target_serial).encode("utf-8")
+            push = json.dumps({"pushing": {"sequence_id": "0", "command": "pushall"}}).encode("utf-8")
+            pub = _mqtt_field(request) + push
+            sock.sendall(b"\x30" + _mqtt_len(len(pub)) + pub)
+
+        if serial:
+            send_pushall(serial)
+
+        while time.monotonic() < deadline:
+            header, packet = _mqtt_read_packet(sock, deadline)
+            if (header & 0xF0) != 0x30 or len(packet) < 2:
+                continue
+            topic_len = struct.unpack("!H", packet[:2])[0]
+            if not serial:
+                parts = packet[2:2 + topic_len].decode("utf-8", "replace").split("/")
+                if len(parts) == 3 and parts[0] == "device" and parts[1]:
+                    serial = parts[1]
+                    printer["serial"] = serial  # caller persists the discovery
+                    send_pushall(serial)
+            try:
+                msg = json.loads(packet[2 + topic_len:].decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            info = msg.get("print")
+            if not isinstance(info, dict) or ("nozzle_temper" not in info and "gcode_state" not in info):
+                continue
+            gstate = info.get("gcode_state", "")
+            pct = info.get("mc_percent")
+            return {
+                "online": True,
+                "state": _BAMBU_STATES.get(gstate, (gstate or "idle").lower()),
+                "nozzle": info.get("nozzle_temper"), "target_nozzle": info.get("nozzle_target_temper"),
+                "bed": info.get("bed_temper"), "target_bed": info.get("bed_target_temper"),
+                "progress": pct if pct is not None else None,
+                "filename": info.get("subtask_name") or info.get("gcode_file") or "",
+                "thumbnail": "",
+            }
+        return {"online": True, "state": "connected", "nozzle": None, "target_nozzle": None,
+                "bed": None, "target_bed": None, "progress": None, "filename": "", "thumbnail": ""}
+    except Exception as exc:
+        return _bambu_offline(str(exc))
+    finally:
+        try:
+            (sock or raw).sendall(b"\xe0\x00")  # DISCONNECT
+        except Exception:
+            pass
+        try:
+            (sock or raw).close()
+        except Exception:
+            pass
+
+
+_STORE_LOCK = threading.Lock()
+
+
+def persist_discovered_serial(printer):
+    """Write a wildcard-learned Bambu serial back into the stored record, so the
+    next poll subscribes to the exact topic and serial-based dedup keeps working.
+    Poll threads run concurrently — the store write is serialized."""
+    serial = (printer.get("serial") or "").strip()
+    url = normalize_url(printer.get("url"))
+    if not serial or not url:
+        return
+    with _STORE_LOCK:
+        manual = load_manual_printers()
+        changed = False
+        for entry in manual:
+            if normalize_url(entry.get("url")) == url and not (entry.get("serial") or "").strip():
+                entry["serial"] = serial
+                changed = True
+        if changed:
+            save_manual_printers(manual)
+
+
+# --------------------------------------------------------------------------- #
+# Bambu Lab (LAN mode): sending a print. Upload goes over implicit FTPS on 990
+# (same bblp / access-code credentials as MQTT); the print is then started with
+# an MQTT command. Plain .gcode uses the firmware's gcode_file command; sliced
+# .3mf projects use project_file, which is what Bambu's own clients send.
+# --------------------------------------------------------------------------- #
+class _ImplicitFTPS(ftplib.FTP_TLS):
+    # Bambu's FTP server is implicit TLS (the socket is TLS from byte one), which
+    # ftplib doesn't speak natively — wrap the control socket before the welcome.
+    def connect(self, host="", port=990, timeout=UPLOAD_TIMEOUT):
+        self.host = host or self.host
+        self.port = port or self.port
+        self.timeout = timeout
+        raw = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock = self.context.wrap_socket(raw, server_hostname=self.host)
+        self.af = self.sock.family
+        self.file = self.sock.makefile("r", encoding=self.encoding)
+        self.welcome = self.getresp()
+        return self.welcome
+
+
+def _ftps_stor(host, access_code, remote, file_bytes):
+    """One STOR attempt over ftplib. Returns "" on success or an error string."""
+    ftp = _ImplicitFTPS(context=_SSL_INSECURE)
+    try:
+        ftp.connect(host, 990, timeout=UPLOAD_TIMEOUT)
+        ftp.login("bblp", access_code)
+        ftp.prot_p()
+        ftp.storbinary("STOR " + remote, io.BytesIO(file_bytes))
+        return ""
+    except Exception as exc:
+        return str(exc) or type(exc).__name__
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+
+def _curl_stor(host, access_code, remote, file_bytes):
+    """Fallback STOR via the system curl (ships with Windows 10+/macOS; Bambu
+    Studio itself uses curl). Unlike ftplib, curl handles vsftpd's mandatory TLS
+    session reuse on the data channel. Returns "" on success or an error."""
+    curl = shutil.which("curl")
+    if not curl:
+        return "curl not available"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".gcode")
+    try:
+        tmp.write(file_bytes)
+        tmp.close()
+        cmd = [curl, "--insecure", "--ftp-pasv", "--silent", "--show-error",
+               "--connect-timeout", "15", "--max-time", str(UPLOAD_TIMEOUT),
+               "-u", "bblp:" + access_code, "-T", tmp.name,
+               "ftps://%s:990/%s" % (host, remote)]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=UPLOAD_TIMEOUT + 30, creationflags=flags)
+        if proc.returncode == 0:
+            return ""
+        return (proc.stderr or "curl exit %d" % proc.returncode).strip()
+    except Exception as exc:
+        return str(exc)
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+
+def bambu_upload(host, access_code, filename, file_bytes):
+    """Upload to the printer's sdcard; returns the sdcard-relative path the file
+    landed at (root or cache/). Tries ftplib first, then curl — vsftpd on the
+    printer demands TLS session reuse on the data channel, which ftplib can't
+    always deliver. Raises with an actionable message when the firmware refuses
+    writes altogether (LAN lockdown: Developer Mode off)."""
+    errors = []
+    refused = 0
+    for remote in (filename, "cache/" + filename):
+        for stor in (_ftps_stor, _curl_stor):
+            err = stor(host, access_code, remote, file_bytes)
+            if not err:
+                return remote
+            errors.append("%s %s: %s" % (stor.__name__.lstrip("_"), remote, err))
+            if "553" in err or "550" in err:
+                refused += 1
+                break  # permission problem — retrying the other transport won't help
+    if refused >= 2:
+        raise RuntimeError("printer refused the upload — enable Developer Mode (LAN) in the printer settings")
+    raise RuntimeError("; ".join(errors[-2:]))
+
+
+def _bambu_publish(host, code, topic, payload, timeout=10):
+    """Connect to the printer's MQTT broker, publish one message, disconnect.
+    Returns "" on success or an error string."""
+    deadline = time.monotonic() + timeout
+    try:
+        raw = socket.create_connection((host, BAMBU_MQTT_PORT), timeout=timeout)
+    except Exception as exc:
+        return str(exc)
+    sock = None
+    try:
+        sock = _SSL_INSECURE.wrap_socket(raw, server_hostname=host)
+        var = _mqtt_field(b"MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
+        creds = _mqtt_field(b"orca-printers-pub") + _mqtt_field(b"bblp") + _mqtt_field(code.encode("utf-8"))
+        body = var + creds
+        sock.sendall(b"\x10" + _mqtt_len(len(body)) + body)
+        header, _ = _mqtt_read_packet(sock, deadline)
+        if (header & 0xF0) != 0x20:
+            return "connect rejected"
+        pub = _mqtt_field(topic.encode("utf-8")) + json.dumps(payload).encode("utf-8")
+        sock.sendall(b"\x30" + _mqtt_len(len(pub)) + pub)
+        return ""
+    except Exception as exc:
+        return str(exc)
+    finally:
+        try:
+            (sock or raw).sendall(b"\xe0\x00")  # DISCONNECT
+        except Exception:
+            pass
+        try:
+            (sock or raw).close()
+        except Exception:
+            pass
+
+
+def bambu_start_print(host, code, serial, remote_path, use_ams):
+    filename = remote_path.rsplit("/", 1)[-1]
+    if remote_path.lower().endswith(".3mf"):
+        payload = {"print": {
+            "sequence_id": "0", "command": "project_file",
+            "param": "Metadata/plate_1.gcode",
+            "url": "file:///sdcard/" + remote_path,
+            "subtask_name": filename,
+            "use_ams": bool(use_ams),
+            "timelapse": False, "bed_leveling": True,
+            "flow_cali": False, "vibration_cali": False, "layer_inspect": False,
+            "project_id": "0", "profile_id": "0", "task_id": "0", "subtask_id": "0",
+        }}
+    else:
+        payload = {"print": {"sequence_id": "0", "command": "gcode_file",
+                             "param": "/sdcard/" + remote_path}}
+    return _bambu_publish(host, code, "device/%s/request" % serial, payload)
+
+
+def bambu_send(printer, filename, file_bytes, start, use_ams):
+    host = urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname or ""
+    code = (printer.get("access_code") or printer.get("apikey") or "").strip()
+    if not host:
+        return {"ok": False, "error": "no address"}
+    if not code:
+        return {"ok": False, "error": "needs access code"}
+    try:
+        remote_path = bambu_upload(host, code, filename, file_bytes)
+    except Exception as exc:
+        return {"ok": False, "error": "upload: %s" % exc}
+    if not start:
+        return {"ok": True}
+    serial = (printer.get("serial") or "").strip()
+    if not serial:
+        poll_bambu(printer)  # the wildcard subscription learns the serial
+        serial = (printer.get("serial") or "").strip()
+        if serial:
+            persist_discovered_serial(printer)
+    if not serial:
+        return {"ok": False, "error": "uploaded, but the serial is still unknown — start it from the printer"}
+    err = bambu_start_print(host, code, serial, remote_path, use_ams)
+    if err:
+        return {"ok": False, "error": "print command: %s" % err}
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Auto-naming: nobody should stare at bare IPs. Bambu printers announce
+# themselves over SSDP (UDP 2021) with a DevName header; Moonraker exposes the
+# Klipper host name. Placeholder names get replaced once and persisted.
+# --------------------------------------------------------------------------- #
+def ssdp_bambu_names(duration=3.0):
+    """Passively collect Bambu SSDP announcements: ip -> {name, serial}.
+    Printers NOTIFY every few seconds, so a short listen window is enough."""
+    names = {}
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # OrcaSlicer's own Bambu discovery may hold the port; share it.
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 2021))
+    except OSError:
+        return names
+    try:
+        sock.settimeout(0.5)
+        end = time.monotonic() + duration
+        while time.monotonic() < end:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            info = {}
+            for line in data.decode("utf-8", "replace").splitlines():
+                key, _, value = line.partition(":")
+                info[key.strip().lower()] = value.strip()
+            name = info.get("devname.bambu.com")
+            if name:
+                ip = info.get("location") or addr[0]
+                names[ip] = {"name": name, "serial": info.get("usn") or ""}
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return names
+
+
+_hostname_cache = {}
+
+
+def moonraker_hostname(base, ctx):
+    if base in _hostname_cache:
+        return _hostname_cache[base]
+    name = ""
+    try:
+        info = _get_json(base + "/printer/info", ctx)
+        name = (info.get("result") or {}).get("hostname") or ""
+    except Exception:
+        name = ""
+    _hostname_cache[base] = name
+    return name
+
+
+def _needs_name(printer):
+    name = (printer.get("name") or "").strip()
+    if not name:
+        return True
+    url = normalize_url(printer.get("url"))
+    host = urllib.parse.urlparse(url).hostname or ""
+    return name in (host, url, (printer.get("url") or "").strip())
+
+
+def autoname_printers(printers):
+    """Give placeholder-named printers their real names. Runs on a worker thread
+    after a poll; touches the store under the lock. Returns True if anything
+    changed so the caller can re-push the list."""
+    need = [p for p in printers if _needs_name(p)]
+    if not need:
+        return False
+    ssdp = None
+    updates = {}
+    for p in need:
+        kind = backend_for_type(p.get("type"))
+        name = ""
+        if kind == "bambu":
+            if ssdp is None:
+                ssdp = ssdp_bambu_names()
+            host = urllib.parse.urlparse(normalize_url(p.get("url"))).hostname or ""
+            hit = ssdp.get(host)
+            if not hit and p.get("serial"):
+                hit = next((v for v in ssdp.values() if v.get("serial") == p["serial"]), None)
+            name = (hit or {}).get("name") or ""
+        elif kind == "moonraker":
+            status = p.get("status") or {}
+            if status.get("online"):
+                name = moonraker_hostname(normalize_url(p.get("url")), ssl_ctx_for(p))
+        if name and name != p.get("name"):
+            p["name"] = name
+            updates[p.get("id")] = name
+    if not updates:
+        return False
+    with _STORE_LOCK:
+        manual = load_manual_printers()
+        changed = False
+        for entry in manual:
+            if entry.get("id") in updates and entry.get("name") != updates[entry.get("id")]:
+                entry["name"] = updates[entry.get("id")]
+                changed = True
+        if changed:
+            save_manual_printers(manual)
+    return True
+
+
+def _poll_backend(kind, printer, base, ctx):
+    if kind == "moonraker":
+        return poll_moonraker(base, ctx)
+    if kind == "octoprint":
+        return poll_octoprint(base, ctx, printer.get("apikey", ""))
+    return poll_generic(base, ctx)
+
+
 def poll_printer(printer):
     base = normalize_url(printer.get("url"))
     kind = (printer.get("type") or "moonraker").lower()
     ctx = ssl_ctx_for(printer)
-    try:
-        if kind == "moonraker":
-            return poll_moonraker(base, ctx)
-        if kind == "octoprint":
-            return poll_octoprint(base, ctx, printer.get("apikey", ""))
-        return poll_generic(base, ctx)
-    except Exception as exc:
-        return {"online": False, "state": "offline", "error": str(exc), "nozzle": None,
-                "target_nozzle": None, "bed": None, "target_bed": None, "progress": None,
-                "filename": "", "thumbnail": ""}
+    backend = backend_for_type(kind)
+    if backend == "bambu":
+        had_serial = bool((printer.get("serial") or "").strip())
+        status = poll_bambu(printer)
+        status["backend"] = "bambu"
+        if not had_serial and (printer.get("serial") or "").strip():
+            persist_discovered_serial(printer)
+        return status
+    # Don't fully trust the declared type: OrcaSlicer often reports a Klipper host
+    # as "octoprint". Try the mapped backend first, then the other HTTP one, so a
+    # mislabeled printer still shows real status.
+    order = ["octoprint", "moonraker"] if backend == "octoprint" else \
+            ["moonraker", "octoprint"] if backend == "moonraker" else ["generic"]
+    last_exc = ""
+    for k in order:
+        try:
+            status = _poll_backend(k, printer, base, ctx)
+            status["backend"] = k
+            return status
+        except Exception as exc:
+            last_exc = str(exc)
+    return {"online": False, "state": "offline", "error": last_exc, "backend": kind, "nozzle": None,
+            "target_nozzle": None, "bed": None, "target_bed": None, "progress": None,
+            "filename": "", "thumbnail": ""}
 
 
-def send_gcode(printer, filename, file_bytes, start):
+def send_gcode(printer, filename, file_bytes, start, use_ams=True):
     base = normalize_url(printer.get("url"))
-    kind = (printer.get("type") or "moonraker").lower()
+    kind = backend_for_type(printer.get("type") or "moonraker")
     ctx = ssl_ctx_for(printer)
     try:
         if kind == "moonraker":
@@ -311,6 +925,8 @@ def send_gcode(printer, filename, file_bytes, start):
                 headers["X-Api-Key"] = printer["apikey"]
             fields = {"select": "true", "print": "true"} if start else {}
             _multipart_upload(base + "/api/files/local", ctx, headers, filename, file_bytes, fields)
+        elif kind == "bambu":
+            return bambu_send(printer, filename, file_bytes, start, use_ams)
         else:
             return {"ok": False, "error": "unsupported backend"}
         return {"ok": True}
@@ -341,7 +957,7 @@ PAGE = r"""<!DOCTYPE html>
   button.ghost { background:transparent; color:var(--orca-fg,#e0e0e0); border-color:var(--orca-border,#3c3c4c); }
   button:disabled { opacity:.5; cursor:default; }
   #grid { flex:1 1 auto; overflow:auto; padding:12px;
-          display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:12px; align-content:start; }
+          display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:12px; align-content:start; }
   .tile { border:1px solid var(--orca-border,#3c3c4c); border-radius:8px; padding:12px;
           display:flex; flex-direction:column; gap:8px; }
   .tile .top { display:flex; align-items:center; gap:8px; }
@@ -360,32 +976,45 @@ PAGE = r"""<!DOCTYPE html>
   .fname { font-size:11px; color:var(--orca-muted,#a0a0a0); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .bar { height:6px; border-radius:3px; background:var(--orca-border,#3c3c4c); overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--orca-accent,#009688); }
-  .row { display:flex; gap:6px; align-items:center; }
+  /* Pin the action row to the bottom so it lines up across cards regardless of
+     how much status (thumbnail, filename, progress) each one has above it. */
+  .row { display:flex; gap:6px; align-items:center; margin-top:auto; }
   .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
+  .row button { white-space:nowrap; }
   .empty { color:var(--orca-muted,#a0a0a0); padding:24px; text-align:center; }
-  #viewer { flex:1 1 auto; display:none; flex-direction:column; }
-  #viewer .vbar { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--orca-border,#3c3c4c); }
-  #viewer iframe { flex:1 1 auto; border:0; width:100%; }
   #status { font-size:11px; color:var(--orca-muted,#a0a0a0); }
 </style></head>
 <body>
   <div id="bar">
-    <h1>Printers</h1>
+    <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> all</label>
     <span id="status"></span>
     <button id="send" class="ghost" disabled>Send G-code to selected…</button>
     <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
     <input id="f-name" placeholder="Name" size="8">
     <input id="f-url" placeholder="192.168.0.42" size="14">
-    <select id="f-type">
-      <option value="moonraker">Moonraker</option>
+    <select id="f-type" title="Connection type. Klipper/Moonraker, OctoPrint and Bambu LAN report full status; PrusaLink/Repetier use the OctoPrint API; the rest show reachability and open their web UI.">
+      <option value="moonraker">Moonraker / Klipper</option>
       <option value="octoprint">OctoPrint</option>
+      <option value="bambu">Bambu (LAN)</option>
+      <option value="prusalink">PrusaLink</option>
+      <option value="repetier">Repetier</option>
+      <option value="duet">Duet</option>
+      <option value="mks">MKS</option>
+      <option value="flashair">FlashAir</option>
+      <option value="astrobox">AstroBox</option>
+      <option value="esp3d">ESP3D</option>
+      <option value="crealityprint">Creality</option>
+      <option value="flashforge">FlashForge</option>
+      <option value="elegoolink">Elegoo</option>
       <option value="generic">Other</option>
     </select>
-    <label style="font-size:11px;display:flex;align-items:center;gap:4px">
+    <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
+    <input id="f-access" placeholder="Access code" size="10" style="display:none">
+    <label id="f-insecure-l" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this." style="font-size:11px;display:flex;align-items:center;gap:4px">
       <input id="f-insecure" type="checkbox"> self-signed</label>
     <button id="add">Add</button>
     <button id="refresh" class="ghost">Refresh</button>
-    <input id="file" type="file" accept=".gcode,.gco,.g,.gz" style="display:none">
+    <input id="file" type="file" accept=".gcode,.gco,.g,.gz,.3mf" style="display:none">
   </div>
   <div id="confirm" style="display:none;position:absolute;inset:0;background:rgba(0,0,0,.55);
        align-items:center;justify-content:center;z-index:20">
@@ -395,6 +1024,8 @@ PAGE = r"""<!DOCTYPE html>
       <div id="confirm-body" style="font-size:12px;color:var(--orca-muted,#a0a0a0);margin-bottom:12px"></div>
       <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:12px">
         <input id="confirm-start" type="checkbox" checked> Start printing immediately after upload</label>
+      <label id="confirm-ams-l" style="display:none;align-items:center;gap:6px;font-size:12px;margin-bottom:12px">
+        <input id="confirm-ams" type="checkbox" checked> Use AMS (Bambu)</label>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button id="confirm-cancel" class="ghost">Cancel</button>
         <button id="confirm-ok">Send</button>
@@ -402,14 +1033,9 @@ PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div id="grid"><div class="empty">Loading…</div></div>
-  <div id="viewer">
-    <div class="vbar"><button id="back" class="ghost">&larr; Back</button><span id="vtitle"></span></div>
-    <iframe id="vframe"></iframe>
-  </div>
 <script>
 'use strict';
 var grid = document.getElementById('grid');
-var viewer = document.getElementById('viewer');
 var sendBtn = document.getElementById('send');
 var fileInput = document.getElementById('file');
 var current = [];
@@ -418,12 +1044,29 @@ var selected = {};   // url -> true
 function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
 function temp(v){ return v == null ? '—' : Math.round(v) + '°'; }
+// Friendly badge for the connection type — the ecosystem we actually detect,
+// not the transport. (OctoPrint can front any firmware, so we don't claim Marlin.)
+function typeLabel(t){
+  return { moonraker:'Klipper', klipper:'Klipper', octoprint:'OctoPrint',
+    prusalink:'PrusaLink', prusaconnect:'PrusaConnect', duet:'Duet', repetier:'Repetier',
+    mks:'MKS', flashair:'FlashAir', astrobox:'AstroBox', esp3d:'ESP3D',
+    crealityprint:'Creality', flashforge:'FlashForge', simplyprint:'SimplyPrint',
+    elegoolink:'Elegoo', '3dprinteros':'3DPrinterOS', obico:'Obico',
+    bambu:'Bambu Lab', generic:'Other' }[(t || '').toLowerCase()] || (t || 'Other');
+}
 
 function updateSendBtn(){
   var n = Object.keys(selected).filter(function(k){ return selected[k]; }).length;
   sendBtn.disabled = n === 0;
   sendBtn.textContent = n ? ('Send G-code to ' + n + ' selected…') : 'Send G-code to selected…';
+  var all = document.getElementById('sel-all');
+  all.checked = current.length > 0 && current.every(function(p){ return selected[p.url]; });
 }
+
+document.getElementById('sel-all').addEventListener('change', function(e){
+  current.forEach(function(p){ selected[p.url] = e.target.checked; });
+  render(current);
+});
 
 function render(printers){
   current = printers;
@@ -438,7 +1081,7 @@ function render(printers){
     tile.innerHTML =
       '<div class="top"><span class="dot ' + (s.online ? 'on' : 'off') + '"></span>' +
       '<span class="name">' + esc(p.name || p.url) + '</span>' +
-      '<span class="src">' + (p.source === 'orca' ? 'Orca' : 'manual') + '</span>' +
+      '<span class="src">' + esc(typeLabel(p.type)) + '</span>' +
       '<span class="state">' + esc(s.state || (s.online ? 'online' : 'offline')) + '</span></div>' +
       '<div class="body">' + thumb + '<div class="meta">' +
       '<div class="temps"><span>Nozzle <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
@@ -446,34 +1089,46 @@ function render(printers){
       fname + prog + '</div></div>' +
       '<div class="row"><label><input type="checkbox" class="sel"' + (selected[p.url] ? ' checked' : '') + '> select</label>' +
       '<button class="print ghost">Print…</button>' +
-      '<button class="open ghost">Open</button>' +
+      // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.
+      (p.type === 'bambu' ? '' : '<button class="open ghost">Open</button>') +
       '<button class="remove ghost">Remove</button></div>';
     tile.querySelector('.sel').addEventListener('change', function(e){
       selected[p.url] = e.target.checked; updateSendBtn(); });
     tile.querySelector('.print').addEventListener('click', function(){ pickAndSend([p.url]); });
-    tile.querySelector('.open').addEventListener('click', function(){ openPrinter(p); });
+    var openBtn = tile.querySelector('.open');
+    if (openBtn) openBtn.addEventListener('click', function(){
+      orca.postMessage({ type:'open', url:p.url, name:p.name || p.url }); });
     tile.querySelector('.remove').addEventListener('click', function(){ orca.postMessage({ type:'remove', id:p.id }); });
     grid.appendChild(tile);
   });
   updateSendBtn();
 }
 
-function openPrinter(p){
-  document.getElementById('vtitle').textContent = p.name || p.url;
-  document.getElementById('vframe').src = p.url;
-  viewer.style.display = 'flex';
+
+// Bambu (LAN) needs a serial + access code instead of the self-signed toggle;
+// swap the relevant fields when the backend type changes.
+var typeSel = document.getElementById('f-type');
+function syncTypeFields(){
+  var bambu = typeSel.value === 'bambu';
+  document.getElementById('f-serial').style.display = bambu ? '' : 'none';
+  document.getElementById('f-access').style.display = bambu ? '' : 'none';
+  document.getElementById('f-insecure-l').style.display = bambu ? 'none' : '';
+  document.getElementById('f-url').placeholder = bambu ? '192.168.0.42 (printer IP)' : '192.168.0.42';
 }
-document.getElementById('back').addEventListener('click', function(){
-  viewer.style.display = 'none'; document.getElementById('vframe').src = 'about:blank'; });
+typeSel.addEventListener('change', syncTypeFields);
+syncTypeFields();
 
 document.getElementById('add').addEventListener('click', function(){
   var name = document.getElementById('f-name').value.trim();
   var url = document.getElementById('f-url').value.trim();
   if (!url) return;
   orca.postMessage({ type:'add', name:name, url:url,
-                     kind:document.getElementById('f-type').value,
+                     kind:typeSel.value,
+                     serial:document.getElementById('f-serial').value.trim(),
+                     access_code:document.getElementById('f-access').value.trim(),
                      insecure:document.getElementById('f-insecure').checked });
   document.getElementById('f-name').value = ''; document.getElementById('f-url').value = '';
+  document.getElementById('f-serial').value = ''; document.getElementById('f-access').value = '';
   document.getElementById('f-insecure').checked = false;
 });
 document.getElementById('refresh').addEventListener('click', function(){ orca.postMessage({ type:'refresh' }); });
@@ -496,9 +1151,15 @@ fileInput.addEventListener('change', function(){
   var urls = pendingUrls; pendingUrls = null;
   if (!file || !urls || !urls.length) return;
   pending = { file:file, urls:urls };
-  var names = current.filter(function(p){ return urls.indexOf(p.url) >= 0; }).map(function(p){ return esc(p.name || p.url); });
+  var targets = current.filter(function(p){ return urls.indexOf(p.url) >= 0; });
+  var names = targets.map(function(p){ return esc(p.name || p.url); });
+  var hasBambu = targets.some(function(p){ return (p.type || '').toLowerCase() === 'bambu'; });
+  // .3mf project files start only on Bambu; Moonraker/OctoPrint queue G-code.
+  var warn = (/\.3mf$/i.test(file.name) && targets.some(function(p){ return (p.type || '').toLowerCase() !== 'bambu'; }))
+    ? '<br><span style="color:#c0504d">.3mf starts only on Bambu printers — the others expect G-code.</span>' : '';
+  document.getElementById('confirm-ams-l').style.display = hasBambu ? 'flex' : 'none';
   document.getElementById('confirm-body').innerHTML =
-    'Upload <b>' + esc(file.name) + '</b> to ' + urls.length + ' printer(s):<br>' + names.join(', ');
+    'Upload <b>' + esc(file.name) + '</b> to ' + urls.length + ' printer(s):<br>' + names.join(', ') + warn;
   document.getElementById('confirm').style.display = 'flex';
 });
 document.getElementById('confirm-cancel').addEventListener('click', function(){
@@ -512,7 +1173,8 @@ document.getElementById('confirm-ok').addEventListener('click', function(){
   reader.onload = function(){
     var b64 = String(reader.result).split(',')[1] || '';
     document.getElementById('status').textContent = 'Sending ' + file.name + ' to ' + urls.length + '…';
-    orca.postMessage({ type:'mass-print', filename:file.name, dataB64:b64, urls:urls, start:start });
+    orca.postMessage({ type:'mass-print', filename:file.name, dataB64:b64, urls:urls, start:start,
+                       use_ams:document.getElementById('confirm-ams').checked });
   };
   reader.readAsDataURL(file);
 });
@@ -549,6 +1211,14 @@ orca.postMessage({ type:'ready' });
 """
 
 
+# A plain full-window iframe of the printer's web UI — opened as its own host
+# window (create_window) so it stays inside OrcaSlicer without hijacking the
+# dashboard tab or launching an external browser.
+VIEWER_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%;display:block}
+</style></head><body><iframe src="__URL__" allow="fullscreen"></iframe></body></html>"""
+
+
 class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     win = None
 
@@ -565,7 +1235,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         if create_panel is not None:
             self.win = create_panel(
                 title="Printers", html=PAGE, on_message=self.on_message, on_close=self.on_close,
-                icon=ICON_PATH if os.path.exists(ICON_PATH) else "",
+                icon=ensure_icon(),
             )
         else:
             self.win = orca.host.ui.create_window(
@@ -604,6 +1274,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         elif kind == "add":
             self._add_manual({"name": msg.get("name") or msg.get("url"),
                               "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
+                              "serial": msg.get("serial") or "", "access_code": msg.get("access_code") or "",
                               "insecure": bool(msg.get("insecure")), "source": "manual"})
             self._refresh_async()
         elif kind == "adopt":
@@ -612,26 +1283,62 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             if p.get("url"):
                 self._add_manual({"name": p.get("name") or p.get("url"), "url": normalize_url(p.get("url")),
                                   "type": p.get("type") or "moonraker", "apikey": p.get("apikey", ""),
+                                  "serial": p.get("serial") or "", "access_code": p.get("access_code") or "",
                                   "insecure": bool(p.get("insecure")), "source": "orca"})
             self._refresh_async()
         elif kind == "remove":
             manual = [p for p in load_manual_printers() if p.get("id") != msg.get("id")]
             save_manual_printers(manual)
             self._refresh_async()
+        elif kind == "open":
+            url = normalize_url(msg.get("url"))
+            if url:
+                self._open_viewer(url, msg.get("name") or url)
         elif kind == "mass-print":
             printers = dashboard_printers()  # host read on the UI thread
             threading.Thread(target=self._do_mass_print, args=(msg, printers), daemon=True).start()
 
+    def _open_viewer(self, url, name):
+        # Printer web UI in its own host window — inside Orca, no external browser
+        # and without hijacking the dashboard tab. Keep a reference so it lives on.
+        try:
+            win = orca.host.ui.create_window(
+                title=(name or url)[:80], html=VIEWER_PAGE.replace("__URL__", url),
+                width=1100, height=760, on_message=lambda m: None, on_close=lambda: None)
+            if not hasattr(self, "_viewers"):
+                self._viewers = []
+            self._viewers.append(win)
+        except Exception:
+            pass
+
     def _refresh_async(self):
         printers = dashboard_printers()       # UI thread: dashboard = user-chosen
         available = available_orca_printers()  # UI thread: Orca printers not yet added
-        threading.Thread(target=self._push_status, args=(printers, available), daemon=True).start()
-
-    def _push_status(self, printers, available):
-        for p in printers:
-            p["status"] = poll_printer(p)
+        # Render the list right away so an add/remove shows instantly, then poll the
+        # printers in the background and push their status once it arrives.
         if self.win is not None and self.win.is_open():
             self.win.post({"printers": printers, "available": available})
+        threading.Thread(target=self._poll_and_push, args=(printers,), daemon=True).start()
+
+    @staticmethod
+    def _poll_into(printer):
+        printer["status"] = poll_printer(printer)
+
+    def _poll_and_push(self, printers):
+        # Poll all printers concurrently — one offline/slow host would otherwise
+        # block the rest for its full timeout, making add/remove feel sluggish.
+        threads = [threading.Thread(target=self._poll_into, args=(p,), daemon=True) for p in printers]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # Placeholder names (bare IPs) get their real names once statuses are in.
+        try:
+            autoname_printers(printers)
+        except Exception:
+            pass
+        if self.win is not None and self.win.is_open():
+            self.win.post({"printers": printers})
 
     def _do_mass_print(self, msg, printers):
         try:
@@ -641,15 +1348,21 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             return
         filename = msg.get("filename") or "print.gcode"
         start = bool(msg.get("start"))
+        use_ams = bool(msg.get("use_ams", True))
         targets = {normalize_url(u) for u in (msg.get("urls") or [])}
         selected = [p for p in printers if normalize_url(p.get("url")) in targets]
-        ok, fail = 0, 0
+        ok, fail, errors = 0, 0, []
         for p in selected:
-            if send_gcode(p, filename, file_bytes, start).get("ok"):
+            result = send_gcode(p, filename, file_bytes, start, use_ams)
+            if result.get("ok"):
                 ok += 1
             else:
                 fail += 1
-        self._post_status("Sent to %d printer(s)%s." % (ok, (", %d failed" % fail) if fail else ""))
+                errors.append("%s: %s" % (p.get("name") or p.get("url"), result.get("error") or "failed"))
+        text = "Sent to %d printer(s)%s." % (ok, (", %d failed" % fail) if fail else "")
+        if errors:
+            text += " " + "; ".join(errors[:3])
+        self._post_status(text)
         self._refresh_async()
 
     def _post_status(self, text):
