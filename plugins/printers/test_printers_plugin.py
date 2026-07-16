@@ -91,11 +91,25 @@ class PrintersOutboxTest(unittest.TestCase):
         self.assertEqual(result[0], "success")
         self.assertEqual(len(self.plugin.load_outbox_index()), 1)
 
-    def test_network_upload_is_not_queued_twice(self):
+    def test_network_upload_is_also_queued(self):
         result = self.execute("OctoPrint")
 
-        self.assertEqual(result[0], "skipped")
-        self.assertEqual(self.plugin.load_outbox_index(), [])
+        self.assertEqual(result[0], "success")
+        self.assertEqual(len(self.plugin.load_outbox_index()), 1)
+
+    def test_bulk_toggle_state_comes_from_process_presets(self):
+        self.plugin.DATA_DIR = self.temp_dir.name
+        process_dir = pathlib.Path(self.temp_dir.name) / "user" / "account" / "process"
+        process_dir.mkdir(parents=True)
+        (process_dir / "bound.json").write_text(
+            '{"slicing_pipeline_plugin": ["Printers Outbox"]}', encoding="utf-8")
+        (process_dir / "free.json").write_text('{}', encoding="utf-8")
+
+        self.assertEqual(self.plugin.outbox_binding_status(), (1, 2))
+        self.assertEqual(self.plugin.set_outbox_binding(True), 2)
+        self.assertEqual(self.plugin.outbox_binding_status(), (2, 2))
+        self.assertEqual(self.plugin.set_outbox_binding(False), 2)
+        self.assertEqual(self.plugin.outbox_binding_status(), (0, 2))
 
 
 if __name__ == "__main__":

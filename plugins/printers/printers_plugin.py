@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.11"
+# version = "0.0.12"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -885,32 +885,9 @@ def autoname_printers(printers):
 # --------------------------------------------------------------------------- #
 OUTBOX_DIR = os.path.join(PLUGIN_DIR, "outbox")
 OUTBOX_INDEX = os.path.join(PLUGIN_DIR, "outbox_index.json")
-OUTBOX_SETTINGS = os.path.join(PLUGIN_DIR, "outbox.json")
 OUTBOX_CAP = "Printers Outbox"
 OUTBOX_REF = "printers;;" + OUTBOX_CAP
 _OUTBOX_LOCK = threading.Lock()
-
-
-def load_outbox_settings():
-    try:
-        with open(OUTBOX_SETTINGS, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_outbox_settings(settings):
-    tmp = OUTBOX_SETTINGS + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(settings, fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, OUTBOX_SETTINGS)
-    except OSError:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
 
 
 def load_outbox_index():
@@ -1012,6 +989,28 @@ def set_outbox_binding(enable):
     return changed
 
 
+def outbox_binding_status():
+    """Return (bound, total) from the process presets Orca actually reads.
+
+    The dashboard switch is only a bulk editor for slicing_pipeline_plugin;
+    keeping a second enabled flag would let the two controls disagree.
+    """
+    bound = 0
+    total = 0
+    for path in _iter_user_process_presets():
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        total += 1
+        if OUTBOX_CAP in _as_str_list(data.get("slicing_pipeline_plugin")):
+            bound += 1
+    return bound, total
+
+
 def parse_gcode_printer(path):
     """Read the machine identity Orca writes into the G-code config block
     (at the file's tail): printer_settings_id and printer_model."""
@@ -1102,13 +1101,6 @@ class PrintersOutbox(orca.slicing.SlicingPipelineCapabilityBase):
         path = getattr(ctx, "gcode_path", "") or ""
         if not path or not os.path.exists(path):
             return orca.ExecutionResult.skipped("G-code file not ready")
-        # Orca uses the literal "File" for a normal local export (and for the
-        # Bambu post-process seam fired after slicing). Other non-empty values
-        # name an actual print host. Only those are already being uploaded;
-        # treating every non-empty host as an upload drops every local result.
-        host = str(getattr(ctx, "host", "") or "").strip()
-        if host and host.casefold() != "file":
-            return orca.ExecutionResult.skipped("Already being uploaded to %s" % host)
         try:
             record = outbox_add(path, getattr(ctx, "output_name", "") or "")
         except Exception as exc:
@@ -1290,7 +1282,7 @@ PAGE = r"""<!DOCTYPE html>
 <body>
   <div id="bar">
     <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> all</label>
-    <label id="outbox-l" title="Queue every sliced G-code on its printer's tile. Binds the plugin to your process presets (reversible); restart OrcaSlicer after switching."><input id="outbox" type="checkbox"> outbox</label>
+    <label id="outbox-l" title="Bulk-bind Printers Outbox to every saved user process preset. You can instead bind it per preset in Slicing pipeline plugin."><input id="outbox" type="checkbox"> outbox (all processes)</label>
     <span id="status"></span>
     <button id="send" class="ghost" disabled>Send G-code to selected…</button>
     <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
@@ -1595,7 +1587,14 @@ orca.onMessage(function(data){
   if (data.available) { lastAvailable = data.available; renderAvailable(); }
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
   if (data.outbox) {
-    document.getElementById('outbox').checked = !!data.outbox.enabled;
+    var outbox = document.getElementById('outbox');
+    outbox.checked = !!data.outbox.enabled;
+    outbox.indeterminate = !!data.outbox.partial;
+    document.getElementById('outbox-l').title = data.outbox.partial
+      ? ('Printers Outbox is bound to ' + data.outbox.bound + ' of ' + data.outbox.total +
+         ' process presets. Click to bind all of them.')
+      : ('Printers Outbox is bound to ' + data.outbox.bound + ' of ' + data.outbox.total +
+         ' process presets. This switch applies to all; Slicing pipeline plugin applies per preset.');
     if (data.outbox.unmatched)
       document.getElementById('status').textContent =
         data.outbox.unmatched + ' queued file(s) match no printer on the dashboard';
@@ -1693,7 +1692,14 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             enabled = bool(msg.get("enabled"))
             def apply_toggle():
                 changed = set_outbox_binding(enabled)
-                save_outbox_settings({"enabled": enabled})
+                bound, total = outbox_binding_status()
+                if self.win is not None and self.win.is_open():
+                    self.win.post({"outbox": {
+                        "enabled": bool(total and bound == total),
+                        "partial": bool(bound and bound < total),
+                        "bound": bound,
+                        "total": total,
+                    }})
                 if enabled:
                     self._post_status(
                         "Outbox bound to %d process preset(s). Restart OrcaSlicer so slicing picks it up." % changed)
@@ -1754,9 +1760,12 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         # Render the list right away so an add/remove shows instantly, then poll the
         # printers in the background and push their status once it arrives.
         unmatched = attach_outbox(printers)
+        bound, total = outbox_binding_status()
         if self.win is not None and self.win.is_open():
             self.win.post({"printers": printers, "available": available,
-                           "outbox": {"enabled": bool(load_outbox_settings().get("enabled")),
+                           "outbox": {"enabled": bool(total and bound == total),
+                                      "partial": bool(bound and bound < total),
+                                      "bound": bound, "total": total,
                                       "unmatched": unmatched}})
         threading.Thread(target=self._poll_and_push, args=(printers, True), daemon=True).start()
 
