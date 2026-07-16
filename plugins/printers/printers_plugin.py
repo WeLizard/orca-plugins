@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.4"
+# version = "0.0.5"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -911,6 +911,53 @@ def poll_printer(printer):
             "filename": "", "thumbnail": ""}
 
 
+def _post_json(url, ctx, headers=None, payload=None, timeout=HTTP_TIMEOUT):
+    body = json.dumps(payload if payload is not None else {}).encode("utf-8")
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(headers or {})
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        return resp.getcode()
+
+
+# Bambu names the cancel command "stop"; the two HTTP backends call it cancel.
+_BAMBU_CONTROL = {"pause": "pause", "resume": "resume", "cancel": "stop"}
+
+
+def printer_command(printer, action):
+    """Pause/resume/cancel the current print on whichever backend the printer
+    speaks. Returns {ok} or {ok: False, error}."""
+    if action not in _BAMBU_CONTROL:
+        return {"ok": False, "error": "unknown action"}
+    base = normalize_url(printer.get("url"))
+    ctx = ssl_ctx_for(printer)
+    kind = backend_for_type(printer.get("type") or "moonraker")
+    try:
+        if kind == "moonraker":
+            _post_json(base + "/printer/print/" + ("cancel" if action == "cancel" else action), ctx)
+        elif kind == "octoprint":
+            headers = {}
+            if printer.get("apikey"):
+                headers["X-Api-Key"] = printer["apikey"]
+            payload = {"command": "cancel"} if action == "cancel" else {"command": "pause", "action": action}
+            _post_json(base + "/api/job", ctx, headers, payload)
+        elif kind == "bambu":
+            host = urllib.parse.urlparse(base).hostname or ""
+            code = (printer.get("access_code") or printer.get("apikey") or "").strip()
+            serial = (printer.get("serial") or "").strip()
+            if not host or not code or not serial:
+                return {"ok": False, "error": "needs IP, access code and serial"}
+            err = _bambu_publish(host, code, "device/%s/request" % serial,
+                                 {"print": {"sequence_id": "0", "command": _BAMBU_CONTROL[action]}})
+            if err:
+                return {"ok": False, "error": err}
+        else:
+            return {"ok": False, "error": "unsupported backend"}
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 def send_gcode(printer, filename, file_bytes, start, use_ams=True):
     base = normalize_url(printer.get("url"))
     kind = backend_for_type(printer.get("type") or "moonraker")
@@ -955,6 +1002,7 @@ PAGE = r"""<!DOCTYPE html>
            background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff);
            border:1px solid var(--orca-accent,#009688); }
   button.ghost { background:transparent; color:var(--orca-fg,#e0e0e0); border-color:var(--orca-border,#3c3c4c); }
+  button.danger { background:transparent; color:#c0504d; border-color:#c0504d; }
   button:disabled { opacity:.5; cursor:default; }
   #grid { flex:1 1 auto; overflow:auto; padding:12px;
           display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:12px; align-content:start; }
@@ -1055,6 +1103,15 @@ function typeLabel(t){
     bambu:'Bambu Lab', generic:'Other' }[(t || '').toLowerCase()] || (t || 'Other');
 }
 
+// Normalize backend state strings ("printing", "RUNNING", "Printing from SD"…)
+// into the three kinds the control buttons care about.
+function stateKind(s){
+  var t = String((s && s.state) || '').toLowerCase();
+  if (t.indexOf('paus') >= 0) return 'paused';
+  if (t.indexOf('print') >= 0 || t === 'running') return 'printing';
+  return 'idle';
+}
+
 function updateSendBtn(){
   var n = Object.keys(selected).filter(function(k){ return selected[k]; }).length;
   sendBtn.disabled = n === 0;
@@ -1086,14 +1143,36 @@ function render(printers){
       '<div class="body">' + thumb + '<div class="meta">' +
       '<div class="temps"><span>Nozzle <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
       '<span>Bed <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
-      fname + prog + '</div></div>' +
+      fname + prog + '</div></div>';
+    var kind = stateKind(s);
+    var ctl = '';
+    if (s.online && kind === 'printing')
+      ctl = '<button class="ctl ghost" data-a="pause">Pause</button><button class="ctl danger" data-a="cancel">Stop</button>';
+    else if (s.online && kind === 'paused')
+      ctl = '<button class="ctl ghost" data-a="resume">Resume</button><button class="ctl danger" data-a="cancel">Stop</button>';
+    tile.innerHTML +=
       '<div class="row"><label><input type="checkbox" class="sel"' + (selected[p.url] ? ' checked' : '') + '> select</label>' +
+      ctl +
       '<button class="print ghost">Print…</button>' +
       // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.
       (p.type === 'bambu' ? '' : '<button class="open ghost">Open</button>') +
       '<button class="remove ghost">Remove</button></div>';
     tile.querySelector('.sel').addEventListener('change', function(e){
       selected[p.url] = e.target.checked; updateSendBtn(); });
+    // Stopping a print is destructive — the button arms on the first click and
+    // fires only when confirmed within 3 seconds.
+    Array.prototype.forEach.call(tile.querySelectorAll('.ctl'), function(btn){
+      btn.addEventListener('click', function(){
+        var a = btn.getAttribute('data-a');
+        if (a === 'cancel' && !btn._armed) {
+          btn._armed = true; btn.textContent = 'Sure?';
+          setTimeout(function(){ btn._armed = false; btn.textContent = 'Stop'; }, 3000);
+          return;
+        }
+        btn.disabled = true;
+        orca.postMessage({ type:'printer-cmd', url:p.url, action:a });
+      });
+    });
     tile.querySelector('.print').addEventListener('click', function(){ pickAndSend([p.url]); });
     var openBtn = tile.querySelector('.open');
     if (openBtn) openBtn.addEventListener('click', function(){
@@ -1181,30 +1260,54 @@ document.getElementById('confirm-ok').addEventListener('click', function(){
 
 // "Add from OrcaSlicer": populate a picker with printers Orca knows about that
 // are not on the dashboard yet; choosing one adopts it (user decides, no auto-add).
-function renderAvailable(available){
+var lastAvailable = [];
+var lastDiscovered = [];
+function renderAvailable(){
   var sel = document.getElementById('f-adopt');
-  if (!available || !available.length){ sel.style.display = 'none'; sel.innerHTML = ''; return; }
-  var opts = '<option value="">Add from OrcaSlicer…</option>';
-  available.forEach(function(p, i){ opts += '<option value="' + i + '">' + esc(p.name || p.url) + '</option>'; });
+  var items = lastAvailable.concat(lastDiscovered);
+  if (!items.length){ sel.style.display = 'none'; sel.innerHTML = ''; return; }
+  var opts = '<option value="">Add a printer…</option>';
+  items.forEach(function(p, i){
+    var label = (p.source === 'network') ? (p.name + ' — found on network') : (p.name || p.url);
+    opts += '<option value="' + i + '">' + esc(label) + '</option>';
+  });
   sel.innerHTML = opts;
   sel.style.display = '';
-  sel._items = available;
+  sel._items = items;
 }
 document.getElementById('f-adopt').addEventListener('change', function(e){
   var i = e.target.value;
   if (i === '') return;
   var p = (e.target._items || [])[i];
   e.target.value = '';
-  if (p) orca.postMessage({ type:'adopt', printer:p });
+  if (!p) return;
+  if (p.source === 'network') {
+    // SSDP finds the printer but not its access code — prefill the form and
+    // let the user finish the add with the code from the printer's screen.
+    document.getElementById('f-name').value = p.name || '';
+    document.getElementById('f-url').value = p.url || '';
+    document.getElementById('f-type').value = 'bambu';
+    syncTypeFields();
+    document.getElementById('f-serial').value = p.serial || '';
+    document.getElementById('f-access').focus();
+    return;
+  }
+  orca.postMessage({ type:'adopt', printer:p });
 });
 
 orca.onMessage(function(data){
   if (!data) return;
   if (data.printers) render(data.printers);
-  if (data.available) renderAvailable(data.available);
+  if (data.available) { lastAvailable = data.available; renderAvailable(); }
+  if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
   if (data.status !== undefined) document.getElementById('status').textContent = data.status;
 });
 orca.postMessage({ type:'ready' });
+// Live dashboard: refresh statuses while the tab is open. Status-only tick —
+// the store and the picker are rebuilt only on explicit Refresh/actions.
+setInterval(function(){
+  try { orca.postMessage({ type:'poll' }); } catch (e) { /* bridge not ready */ }
+}, 15000);
 </script>
 </body>
 </html>
@@ -1271,6 +1374,21 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         kind = msg.get("type")
         if kind in ("ready", "refresh"):
             self._refresh_async()  # host reads run on the UI thread
+        elif kind == "poll":
+            # Periodic status tick from the page: statuses only, no store/picker
+            # rebuild, and never more than one poll in flight.
+            if not getattr(self, "_polling", False):
+                self._polling = True
+                printers = dashboard_printers()
+                def run():
+                    try:
+                        self._poll_and_push(printers)
+                    finally:
+                        self._polling = False
+                threading.Thread(target=run, daemon=True).start()
+        elif kind == "printer-cmd":
+            printers = dashboard_printers()
+            threading.Thread(target=self._do_printer_cmd, args=(msg, printers), daemon=True).start()
         elif kind == "add":
             self._add_manual({"name": msg.get("name") or msg.get("url"),
                               "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
@@ -1318,13 +1436,13 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         # printers in the background and push their status once it arrives.
         if self.win is not None and self.win.is_open():
             self.win.post({"printers": printers, "available": available})
-        threading.Thread(target=self._poll_and_push, args=(printers,), daemon=True).start()
+        threading.Thread(target=self._poll_and_push, args=(printers, True), daemon=True).start()
 
     @staticmethod
     def _poll_into(printer):
         printer["status"] = poll_printer(printer)
 
-    def _poll_and_push(self, printers):
+    def _poll_and_push(self, printers, discover=False):
         # Poll all printers concurrently — one offline/slow host would otherwise
         # block the rest for its full timeout, making add/remove feel sluggish.
         threads = [threading.Thread(target=self._poll_into, args=(p,), daemon=True) for p in printers]
@@ -1339,6 +1457,37 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             pass
         if self.win is not None and self.win.is_open():
             self.win.post({"printers": printers})
+        if not discover:
+            return
+        # Bambu printers announce themselves over SSDP — offer ones that aren't
+        # on the dashboard yet (full refresh only, not every status tick).
+        try:
+            known_hosts = {urllib.parse.urlparse(normalize_url(p.get("url"))).hostname for p in printers}
+            known_serials = {(p.get("serial") or "").strip() for p in printers if (p.get("serial") or "").strip()}
+            found = []
+            for ip, info in ssdp_bambu_names(2.0).items():
+                if ip in known_hosts or (info.get("serial") and info["serial"] in known_serials):
+                    continue
+                found.append({"name": info.get("name") or ip, "url": ip,
+                              "serial": info.get("serial") or "", "type": "bambu", "source": "network"})
+            if found and self.win is not None and self.win.is_open():
+                self.win.post({"discovered": found})
+        except Exception:
+            pass
+
+    def _do_printer_cmd(self, msg, printers):
+        target = normalize_url(msg.get("url") or "")
+        action = msg.get("action") or ""
+        printer = next((p for p in printers if normalize_url(p.get("url")) == target), None)
+        if printer is None:
+            return
+        result = printer_command(printer, action)
+        label = printer.get("name") or target
+        if result.get("ok"):
+            self._post_status("%s: %s sent." % (label, action))
+        else:
+            self._post_status("%s: %s failed — %s" % (label, action, result.get("error") or "error"))
+        self._poll_and_push(printers)
 
     def _do_mass_print(self, msg, printers):
         try:
