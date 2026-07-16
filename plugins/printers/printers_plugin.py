@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.8"
+# version = "0.0.9"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -1432,7 +1432,13 @@ function render(printers){
         var row = document.createElement('div');
         row.className = 'qrow';
         row.innerHTML = '<span class="qname" title="' + esc(r.name) + '">' + esc(r.name) + '</span>' +
+          '<button class="qsend ghost" title="Upload to the printer without starting">Send</button>' +
           '<button class="qprint">Print</button><button class="qdrop ghost" title="Remove from queue">&times;</button>';
+        var sb = row.querySelector('.qsend');
+        sb.addEventListener('click', function(){
+          sb.disabled = true;
+          orca.postMessage({ type:'outbox-send', file:r.file, url:p.url, start:false });
+        });
         var pb = row.querySelector('.qprint');
         pb.addEventListener('click', function(){
           if (!pb._armed) {
@@ -1441,7 +1447,7 @@ function render(printers){
             return;
           }
           pb.disabled = true;
-          orca.postMessage({ type:'outbox-send', file:r.file, url:p.url });
+          orca.postMessage({ type:'outbox-send', file:r.file, url:p.url, start:true });
         });
         row.querySelector('.qdrop').addEventListener('click', function(){
           orca.postMessage({ type:'outbox-drop', file:r.file });
@@ -1802,12 +1808,14 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             outbox_remove(stored)  # file vanished — drop the dangling record
             self._refresh_async()
             return
+        start = bool(msg.get("start", True))
         result = send_gcode(printer, record.get("name") or stored, file_bytes,
-                            start=True, use_ams=bool(msg.get("use_ams", True)))
+                            start=start, use_ams=bool(msg.get("use_ams", True)))
         label = printer.get("name") or target
         if result.get("ok"):
             outbox_remove(stored)
-            self._post_status("%s: %s sent to print." % (label, record.get("name") or stored))
+            done = "sent to print" if start else "uploaded (not started)"
+            self._post_status("%s: %s %s." % (label, record.get("name") or stored, done))
         else:
             self._post_status("%s: send failed — %s" % (label, result.get("error") or "error"))
         self._refresh_async()
