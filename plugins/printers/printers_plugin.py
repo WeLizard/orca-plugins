@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.5"
+# version = "0.0.6"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -1189,7 +1189,8 @@ function render(printers){
 var typeSel = document.getElementById('f-type');
 function syncTypeFields(){
   var bambu = typeSel.value === 'bambu';
-  document.getElementById('f-serial').style.display = bambu ? '' : 'none';
+  // The serial is never typed: the MQTT wildcard learns it on first poll and
+  // SSDP discovery prefills it. The hidden input only carries those values.
   document.getElementById('f-access').style.display = bambu ? '' : 'none';
   document.getElementById('f-insecure-l').style.display = bambu ? 'none' : '';
   document.getElementById('f-url').placeholder = bambu ? '192.168.0.42 (printer IP)' : '192.168.0.42';
