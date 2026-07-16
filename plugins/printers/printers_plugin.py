@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.7"
+# version = "0.0.8"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -1160,6 +1160,10 @@ def _post_json(url, ctx, headers=None, payload=None, timeout=HTTP_TIMEOUT):
 
 # Bambu names the cancel command "stop"; the two HTTP backends call it cancel.
 _BAMBU_CONTROL = {"pause": "pause", "resume": "resume", "cancel": "stop"}
+# Moonraker holds the HTTP response until the PAUSE/CANCEL macro finishes, and
+# Klipper macros (Happy Hare parks and may home first) easily outlive a normal
+# request timeout — don't report a command failed while it is still running.
+CONTROL_TIMEOUT = 60
 
 
 def printer_command(printer, action):
@@ -1172,13 +1176,14 @@ def printer_command(printer, action):
     kind = backend_for_type(printer.get("type") or "moonraker")
     try:
         if kind == "moonraker":
-            _post_json(base + "/printer/print/" + ("cancel" if action == "cancel" else action), ctx)
+            _post_json(base + "/printer/print/" + ("cancel" if action == "cancel" else action), ctx,
+                       timeout=CONTROL_TIMEOUT)
         elif kind == "octoprint":
             headers = {}
             if printer.get("apikey"):
                 headers["X-Api-Key"] = printer["apikey"]
             payload = {"command": "cancel"} if action == "cancel" else {"command": "pause", "action": action}
-            _post_json(base + "/api/job", ctx, headers, payload)
+            _post_json(base + "/api/job", ctx, headers, payload, timeout=CONTROL_TIMEOUT)
         elif kind == "bambu":
             host = urllib.parse.urlparse(base).hostname or ""
             code = (printer.get("access_code") or printer.get("apikey") or "").strip()
