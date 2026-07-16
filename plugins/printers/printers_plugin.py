@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.6"
+# version = "0.0.7"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -873,6 +873,244 @@ def autoname_printers(printers):
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Outbox: every sliced G-code lands next to its printer on the dashboard.
+# A SlicingPipeline capability (psGCodePostProcess) copies the produced file
+# into the plugin's outbox and records which machine preset it was sliced for;
+# the dashboard shows each file on the matching printer's tile with one-click
+# send. The pipeline hook only fires for process presets that reference the
+# capability in their metadata, so the toggle injects/removes that reference
+# across the user's process presets — reversible, and done only when the user
+# flips the switch (interim until the host grows host-side triggers).
+# --------------------------------------------------------------------------- #
+OUTBOX_DIR = os.path.join(PLUGIN_DIR, "outbox")
+OUTBOX_INDEX = os.path.join(PLUGIN_DIR, "outbox_index.json")
+OUTBOX_SETTINGS = os.path.join(PLUGIN_DIR, "outbox.json")
+OUTBOX_CAP = "Printers Outbox"
+OUTBOX_REF = "printers;;" + OUTBOX_CAP
+_OUTBOX_LOCK = threading.Lock()
+
+
+def load_outbox_settings():
+    try:
+        with open(OUTBOX_SETTINGS, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_outbox_settings(settings):
+    tmp = OUTBOX_SETTINGS + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, OUTBOX_SETTINGS)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def load_outbox_index():
+    try:
+        with open(OUTBOX_INDEX, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_outbox_index(index):
+    tmp = OUTBOX_INDEX + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(index, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, OUTBOX_INDEX)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _as_str_list(value):
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def _iter_user_process_presets():
+    user_root = os.path.join(DATA_DIR, "user")
+    try:
+        subs = os.listdir(user_root)
+    except OSError:
+        return
+    for sub in subs:
+        proc_dir = os.path.join(user_root, sub, "process")
+        try:
+            names = os.listdir(proc_dir)
+        except OSError:
+            continue
+        for fn in names:
+            if fn.endswith(".json"):
+                yield os.path.join(proc_dir, fn)
+
+
+def set_outbox_binding(enable):
+    """Add/remove the pipeline binding in the user's process presets. Returns
+    the number of presets changed. Only our own entries are ever touched."""
+    changed = 0
+    for path in _iter_user_process_presets():
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        plugins = _as_str_list(data.get("plugins"))
+        pipeline = _as_str_list(data.get("slicing_pipeline_plugin"))
+        modified = False
+        if enable:
+            if OUTBOX_REF not in plugins:
+                plugins.append(OUTBOX_REF)
+                modified = True
+            if OUTBOX_CAP not in pipeline:
+                pipeline.append(OUTBOX_CAP)
+                modified = True
+            if modified:
+                data["plugins"] = plugins
+                data["slicing_pipeline_plugin"] = pipeline
+        else:
+            if OUTBOX_REF in plugins:
+                plugins.remove(OUTBOX_REF)
+                modified = True
+            if OUTBOX_CAP in pipeline:
+                pipeline.remove(OUTBOX_CAP)
+                modified = True
+            if modified:
+                if plugins:
+                    data["plugins"] = plugins
+                else:
+                    data.pop("plugins", None)
+                if pipeline:
+                    data["slicing_pipeline_plugin"] = pipeline
+                else:
+                    data.pop("slicing_pipeline_plugin", None)
+        if not modified:
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=4)
+            changed += 1
+        except OSError:
+            pass
+    return changed
+
+
+def parse_gcode_printer(path):
+    """Read the machine identity Orca writes into the G-code config block
+    (at the file's tail): printer_settings_id and printer_model."""
+    sid = model = ""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(max(0, size - 200000))
+            for line in fh:
+                s = line.strip()
+                if not s.startswith(";"):
+                    continue
+                if "printer_settings_id =" in s:
+                    sid = s.split("=", 1)[1].strip().strip('"')
+                elif "printer_model =" in s:
+                    model = s.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return sid, model
+
+
+def outbox_add(gcode_path, output_name=""):
+    """Copy a produced G-code into the outbox and index it. Returns the record."""
+    original = os.path.basename(output_name or gcode_path) or "print.gcode"
+    sid, model = parse_gcode_printer(gcode_path)
+    with _OUTBOX_LOCK:
+        os.makedirs(OUTBOX_DIR, exist_ok=True)
+        stored = "%d__%s" % (int(time.time() * 1000), original)
+        target = os.path.join(OUTBOX_DIR, stored)
+        shutil.copyfile(gcode_path, target)
+        record = {"file": stored, "name": original,
+                  "printer_settings_id": sid, "printer_model": model,
+                  "size": os.path.getsize(target), "ts": int(time.time())}
+        index = load_outbox_index()
+        index.append(record)
+        save_outbox_index(index)
+    return record
+
+
+def outbox_remove(stored_name):
+    with _OUTBOX_LOCK:
+        index = [r for r in load_outbox_index() if r.get("file") != stored_name]
+        save_outbox_index(index)
+        try:
+            os.remove(os.path.join(OUTBOX_DIR, stored_name))
+        except OSError:
+            pass
+
+
+def attach_outbox(printers):
+    """Group queued files onto their printers (by the machine preset name the
+    file was sliced for). Returns the count that matched no printer."""
+    index = load_outbox_index()
+    for p in printers:
+        p["queued"] = []
+    unmatched = 0
+    for record in index:
+        sid = (record.get("printer_settings_id") or "").strip()
+        model = (record.get("printer_model") or "").strip()
+        target = None
+        for p in printers:
+            name = (p.get("name") or "").strip()
+            if sid and name and (name == sid or name in sid or sid in name):
+                target = p
+                break
+        if target is None and model:
+            for p in printers:
+                name = (p.get("name") or "").strip()
+                if name and (model in name or name in model):
+                    target = p
+                    break
+        if target is not None:
+            target["queued"].append(record)
+        else:
+            unmatched += 1
+    return unmatched
+
+
+class PrintersOutbox(orca.slicing.SlicingPipelineCapabilityBase):
+    def get_name(self):
+        return OUTBOX_CAP
+
+    def execute(self, ctx):
+        step = getattr(ctx, "step", None)
+        post = getattr(orca.slicing, "psGCodePostProcess", None)
+        if step is not None and post is not None and step != post:
+            return orca.ExecutionResult.skipped("Not the G-code post-process step")
+        path = getattr(ctx, "gcode_path", "") or ""
+        if not path or not os.path.exists(path):
+            return orca.ExecutionResult.skipped("G-code file not ready")
+        try:
+            record = outbox_add(path, getattr(ctx, "output_name", "") or "")
+        except Exception as exc:
+            return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError,
+                                                "Outbox copy failed: %s" % exc)
+        return orca.ExecutionResult.success("Queued %s for %s" % (
+            record["name"], record.get("printer_settings_id") or "unknown printer"))
+
+
 def _poll_backend(kind, printer, base, ctx):
     if kind == "moonraker":
         return poll_moonraker(base, ctx)
@@ -1031,10 +1269,16 @@ PAGE = r"""<!DOCTYPE html>
   .row button { white-space:nowrap; }
   .empty { color:var(--orca-muted,#a0a0a0); padding:24px; text-align:center; }
   #status { font-size:11px; color:var(--orca-muted,#a0a0a0); }
+  .queue { display:flex; flex-direction:column; gap:4px; }
+  .qrow { display:flex; align-items:center; gap:6px; font-size:11px;
+          border:1px dashed var(--orca-border,#3c3c4c); border-radius:5px; padding:3px 6px; }
+  .qrow .qname { margin-right:auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .qrow button { padding:1px 8px; font-size:11px; }
 </style></head>
 <body>
   <div id="bar">
     <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> all</label>
+    <label id="outbox-l" title="Queue every sliced G-code on its printer's tile. Binds the plugin to your process presets (reversible); restart OrcaSlicer after switching."><input id="outbox" type="checkbox"> outbox</label>
     <span id="status"></span>
     <button id="send" class="ghost" disabled>Send G-code to selected…</button>
     <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
@@ -1174,6 +1418,33 @@ function render(printers){
       });
     });
     tile.querySelector('.print').addEventListener('click', function(){ pickAndSend([p.url]); });
+    // Outbox queue: sliced files waiting on this printer. Print arms on first
+    // click (it starts a physical print); × drops the file from the queue.
+    if (p.queued && p.queued.length) {
+      var q = document.createElement('div');
+      q.className = 'queue';
+      p.queued.forEach(function(r){
+        var row = document.createElement('div');
+        row.className = 'qrow';
+        row.innerHTML = '<span class="qname" title="' + esc(r.name) + '">' + esc(r.name) + '</span>' +
+          '<button class="qprint">Print</button><button class="qdrop ghost" title="Remove from queue">&times;</button>';
+        var pb = row.querySelector('.qprint');
+        pb.addEventListener('click', function(){
+          if (!pb._armed) {
+            pb._armed = true; pb.textContent = 'Sure?';
+            setTimeout(function(){ pb._armed = false; pb.textContent = 'Print'; }, 3000);
+            return;
+          }
+          pb.disabled = true;
+          orca.postMessage({ type:'outbox-send', file:r.file, url:p.url });
+        });
+        row.querySelector('.qdrop').addEventListener('click', function(){
+          orca.postMessage({ type:'outbox-drop', file:r.file });
+        });
+        q.appendChild(row);
+      });
+      tile.appendChild(q);
+    }
     var openBtn = tile.querySelector('.open');
     if (openBtn) openBtn.addEventListener('click', function(){
       orca.postMessage({ type:'open', url:p.url, name:p.name || p.url }); });
@@ -1296,11 +1567,21 @@ document.getElementById('f-adopt').addEventListener('change', function(e){
   orca.postMessage({ type:'adopt', printer:p });
 });
 
+document.getElementById('outbox').addEventListener('change', function(e){
+  orca.postMessage({ type:'outbox-toggle', enabled: e.target.checked });
+});
+
 orca.onMessage(function(data){
   if (!data) return;
   if (data.printers) render(data.printers);
   if (data.available) { lastAvailable = data.available; renderAvailable(); }
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
+  if (data.outbox) {
+    document.getElementById('outbox').checked = !!data.outbox.enabled;
+    if (data.outbox.unmatched)
+      document.getElementById('status').textContent =
+        data.outbox.unmatched + ' queued file(s) match no printer on the dashboard';
+  }
   if (data.status !== undefined) document.getElementById('status').textContent = data.status;
 });
 orca.postMessage({ type:'ready' });
@@ -1390,6 +1671,25 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         elif kind == "printer-cmd":
             printers = dashboard_printers()
             threading.Thread(target=self._do_printer_cmd, args=(msg, printers), daemon=True).start()
+        elif kind == "outbox-toggle":
+            enabled = bool(msg.get("enabled"))
+            def apply_toggle():
+                changed = set_outbox_binding(enabled)
+                save_outbox_settings({"enabled": enabled})
+                if enabled:
+                    self._post_status(
+                        "Outbox bound to %d process preset(s). Restart OrcaSlicer so slicing picks it up." % changed)
+                else:
+                    self._post_status("Outbox unbound from %d process preset(s)." % changed)
+            threading.Thread(target=apply_toggle, daemon=True).start()
+        elif kind == "outbox-send":
+            printers = dashboard_printers()
+            threading.Thread(target=self._do_outbox_send, args=(msg, printers), daemon=True).start()
+        elif kind == "outbox-drop":
+            stored = msg.get("file") or ""
+            if stored:
+                outbox_remove(stored)
+            self._refresh_async()
         elif kind == "add":
             self._add_manual({"name": msg.get("name") or msg.get("url"),
                               "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
@@ -1435,8 +1735,11 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         available = available_orca_printers()  # UI thread: Orca printers not yet added
         # Render the list right away so an add/remove shows instantly, then poll the
         # printers in the background and push their status once it arrives.
+        unmatched = attach_outbox(printers)
         if self.win is not None and self.win.is_open():
-            self.win.post({"printers": printers, "available": available})
+            self.win.post({"printers": printers, "available": available,
+                           "outbox": {"enabled": bool(load_outbox_settings().get("enabled")),
+                                      "unmatched": unmatched}})
         threading.Thread(target=self._poll_and_push, args=(printers, True), daemon=True).start()
 
     @staticmethod
@@ -1454,6 +1757,10 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         # Placeholder names (bare IPs) get their real names once statuses are in.
         try:
             autoname_printers(printers)
+        except Exception:
+            pass
+        try:
+            attach_outbox(printers)
         except Exception:
             pass
         if self.win is not None and self.win.is_open():
@@ -1475,6 +1782,30 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 self.win.post({"discovered": found})
         except Exception:
             pass
+
+    def _do_outbox_send(self, msg, printers):
+        stored = msg.get("file") or ""
+        target = normalize_url(msg.get("url") or "")
+        record = next((r for r in load_outbox_index() if r.get("file") == stored), None)
+        printer = next((p for p in printers if normalize_url(p.get("url")) == target), None)
+        if record is None or printer is None:
+            return
+        try:
+            with open(os.path.join(OUTBOX_DIR, stored), "rb") as fh:
+                file_bytes = fh.read()
+        except OSError:
+            outbox_remove(stored)  # file vanished — drop the dangling record
+            self._refresh_async()
+            return
+        result = send_gcode(printer, record.get("name") or stored, file_bytes,
+                            start=True, use_ams=bool(msg.get("use_ams", True)))
+        label = printer.get("name") or target
+        if result.get("ok"):
+            outbox_remove(stored)
+            self._post_status("%s: %s sent to print." % (label, record.get("name") or stored))
+        else:
+            self._post_status("%s: send failed — %s" % (label, result.get("error") or "error"))
+        self._refresh_async()
 
     def _do_printer_cmd(self, msg, printers):
         target = normalize_url(msg.get("url") or "")
@@ -1524,3 +1855,4 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
 class PrintersPlugin(orca.base):
     def register_capabilities(self):
         orca.register_capability(PrintersDashboard)
+        orca.register_capability(PrintersOutbox)
