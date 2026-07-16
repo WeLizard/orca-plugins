@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.9"
+# version = "0.0.10"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -1102,6 +1102,11 @@ class PrintersOutbox(orca.slicing.SlicingPipelineCapabilityBase):
         path = getattr(ctx, "gcode_path", "") or ""
         if not path or not os.path.exists(path):
             return orca.ExecutionResult.skipped("G-code file not ready")
+        # The user is already sending this file to a printer through Orca's own
+        # upload flow — queueing it as well would just show a stale duplicate.
+        host = str(getattr(ctx, "host", "") or "").strip()
+        if host:
+            return orca.ExecutionResult.skipped("Already being uploaded to %s" % host)
         try:
             record = outbox_add(path, getattr(ctx, "output_name", "") or "")
         except Exception as exc:
