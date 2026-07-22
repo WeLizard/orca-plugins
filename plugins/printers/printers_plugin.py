@@ -7,7 +7,7 @@
 # name = "Printers"
 # description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.1"
+# version = "0.0.3"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class
@@ -61,6 +61,12 @@ import urllib.parse
 import urllib.request
 
 import orca
+
+# Single source of truth for the version. pyproject.toml derives the wheel
+# version from this (dynamic version), and build_package.py validates that the
+# PEP 723 `# version` comment matches it — so the manifest and the wheel can't
+# drift.
+PLUGIN_VERSION = "0.0.3"
 
 BAMBU_MQTT_PORT = 8883
 
@@ -212,40 +218,6 @@ def discover_orca_printers():
     return found
 
 
-def discover_bambu_printers():
-    # Bambu printers don't expose a print_host, so preset discovery misses them.
-    # OrcaSlicer records the ones you've connected to in OrcaSlicer.conf: a
-    # local_machines entry keyed by serial (not "ip:port"), with the LAN access
-    # code in user_access_code/access_code. Surface those for one-click adopt with
-    # IP + serial + access code pre-filled. The file has a trailing MD5 line, so
-    # decode just the JSON prefix.
-    conf = os.path.join(DATA_DIR, "OrcaSlicer.conf")
-    try:
-        with open(conf, "r", encoding="utf-8-sig") as fh:
-            obj, _ = json.JSONDecoder().raw_decode(fh.read().lstrip())
-    except (OSError, ValueError):
-        return []
-    machines = obj.get("local_machines") or {}
-    codes = obj.get("user_access_code") or {}
-    codes_fallback = obj.get("access_code") or {}
-    found = []
-    for key, m in machines.items():
-        ip = (m or {}).get("dev_ip") or ""
-        # Bambu entries are serial-keyed; Moonraker/OctoPrint use "ip:port" == dev_ip.
-        if not key or ":" in key or not ip or key == ip:
-            continue
-        found.append({
-            "id": "bambu:" + key,
-            "name": (m or {}).get("dev_name") or key,
-            "url": normalize_url(ip),
-            "type": "bambu",
-            "serial": key,
-            "access_code": codes.get(key) or codes_fallback.get(key) or "",
-            "source": "orca",
-        })
-    return found
-
-
 def dashboard_printers():
     # Only the printers the user chose to add (manual entries + printers adopted
     # from OrcaSlicer). Discovery never auto-populates the dashboard.
@@ -258,14 +230,13 @@ def dashboard_printers():
 
 
 def available_orca_printers():
-    # OrcaSlicer-configured printers not yet added to the dashboard, offered for
-    # the user to adopt one by one — network presets (Moonraker/OctoPrint) plus
-    # Bambu machines pulled from OrcaSlicer.conf.
+    # OrcaSlicer network presets (Moonraker/OctoPrint) not yet on the dashboard.
+    # Bambu comes via SSDP now — the audit blocks OrcaSlicer.conf.
     manual = load_manual_printers()
     added_urls = {normalize_url(p.get("url")) for p in manual}
     added_serials = {p.get("serial") for p in manual if p.get("serial")}
     out = []
-    for p in discover_orca_printers() + discover_bambu_printers():
+    for p in discover_orca_printers():
         if p.get("url") in added_urls:
             continue
         if p.get("serial") and p["serial"] in added_serials:
@@ -1340,22 +1311,22 @@ function render(printers){
     if (p.queued && p.queued.length) {
       var q = document.createElement('div');
       q.className = 'queue';
+      // The plugin can't know whether Orca (or anything else) already sent a
+      // file to a printer — the pipeline "host" signal is inconsistent across
+      // vendors — so we don't pretend to. The queue is just sliced files you
+      // can push to a dashboard printer: one Print action, gated on the
+      // printer's current state. No "Send"/"sent by Orca" state claims.
+      var busy = s.online && (stateKind(s) === 'printing' || stateKind(s) === 'paused');
       p.queued.forEach(function(r){
         var row = document.createElement('div');
         row.className = 'qrow';
-        var actions = r.host_handled
-          ? '<span class="qstatus" title="Handled by ' + esc(r.host || 'OrcaSlicer') + '">sent by Orca</span>'
-          : '<button class="qsend ghost" title="Upload to the printer without starting">Send</button>' +
-            '<button class="qprint">Print</button>';
+        var printBtn = busy
+          ? '<button class="qprint" disabled title="Printer is ' + esc(stateKind(s)) + '">Print</button>'
+          : '<button class="qprint" title="Send to this printer and start printing">Print</button>';
         row.innerHTML = '<span class="qname" title="' + esc(r.name) + '">' + esc(r.name) + '</span>' +
-          actions + '<button class="qdrop ghost" title="Remove retained copy">&times;</button>';
-        if (!r.host_handled) {
-          var sb = row.querySelector('.qsend');
-          sb.addEventListener('click', function(){
-            sb.disabled = true;
-            orca.postMessage({ type:'outbox-send', file:r.file, url:p.url, start:false });
-          });
-          var pb = row.querySelector('.qprint');
+          printBtn + '<button class="qdrop ghost" title="Remove retained copy">&times;</button>';
+        var pb = row.querySelector('.qprint');
+        if (!busy) {
           pb.addEventListener('click', function(){
             if (!pb._armed) {
               pb._armed = true; pb.textContent = 'Sure?';
@@ -1708,9 +1679,21 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             self._refresh_async()
             return
         start = bool(msg.get("start", True))
+        label = printer.get("name") or target
+        if start:
+            # Re-poll live before starting: the dashboard status can be up to a
+            # poll interval stale, and we must not queue a job onto a printer
+            # that is already printing or paused. Vendor-agnostic via the
+            # normalized "state" field (Moonraker/OctoPrint/Bambu).
+            live = poll_printer(printer) or {}
+            state = str(live.get("state") or "").lower()
+            if "paus" in state or "print" in state or state == "running":
+                self._post_status("%s: printer is busy (%s) — not started." % (
+                    label, live.get("state") or "printing"))
+                self._refresh_async()
+                return
         result = send_gcode(printer, record.get("name") or stored, file_bytes,
                             start=start, use_ams=bool(msg.get("use_ams", True)))
-        label = printer.get("name") or target
         if result.get("ok"):
             outbox_remove(stored)
             done = "sent to print" if start else "uploaded (not started)"
