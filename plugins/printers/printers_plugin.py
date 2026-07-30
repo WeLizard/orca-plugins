@@ -4,40 +4,41 @@
 #
 # [tool.orcaslicer.plugin]
 # id = "printers"
-# name = "Printers"
-# description = "Cross-vendor dashboard of your networked 3D printers: live status, temperatures, print progress and thumbnail, one click to each printer's web interface, and send a G-code to several printers at once."
+# name = "Print Farm"
+# description = "Cross-vendor print farm dashboard: live status, temperatures, print progress and thumbnails, one click to each printer's web interface, and G-code delivery to several printers at once."
 # author = "FilamentHub"
 # version = "0.0.3"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
-# # so this declares intent for a future "local-network" permission class
-# # (see PR #14530 feedback). Ignored by the current host.
+# # so this declares intent for a future "local-network" permission class.
+# # It is ignored by the current host.
 # network = ["local-network"]
 # ///
-"""Printers — a cross-vendor printer dashboard plugin for OrcaSlicer (PR #14530).
+"""Print Farm — a cross-vendor printer dashboard plugin for OrcaSlicer.
 
 Opens a host-managed dashboard window with a tile per printer: live status,
 nozzle/bed temperatures, print progress and the current print's thumbnail,
-plus one click to the printer's web UI. On host builds that expose the proposed
-orca.host.ui.create_panel API, the same dashboard docks as a main-window tab.
-It also sends a G-code file to several printers at once ("send to printers" /
-batch print).
+plus one click to the printer's web UI. It also sends a G-code file to several
+printers at once ("send to printers" / batch print).
 
 Printers come from two sources, merged and de-duplicated by URL:
   * OrcaSlicer's own printer presets that have a network address configured
     (read via orca.host.preset_bundle() on the UI thread) — no manual entry.
-  * Manually added entries, stored in printers.json next to the plugin.
+  * Manually added entries, stored in Orca's private plugin storage when
+    available, with the install directory as a compatibility fallback.
 
-Backends: Moonraker (Klipper), OctoPrint, Bambu Lab in LAN mode, or a generic
-reachability ping. Bambu talks MQTT over TLS on its LAN port (user "bblp", the
+Active backends: Moonraker (Klipper), OctoPrint, and Bambu Lab in LAN mode.
+Other OrcaSlicer host types remain visible as planned integrations, but are not
+treated as working until their status, control, and upload transports exist.
+Bambu talks MQTT over TLS on its LAN port (user "bblp", the
 printer's access code); a self-contained stdlib MQTT client reads one status
 report, so no third-party dependency and no cloud round-trip. Everything is
 stdlib-only; host calls stay on the UI thread and all network / disk work is
 offloaded to worker threads.
 
 What is intentionally NOT done here, because it belongs to the host and would be
-a good plugin-capability to expose (flagged for PR #14530, not worked around):
-  * "Open" switches this tab to an iframe of the printer's web UI; a plugin
+a good plugin capability to expose rather than work around:
+  * "Open" switches this window to an iframe of the printer's web UI; a plugin
     cannot programmatically open the native Device tab for a specific printer.
   * The outbox uses the slicing-pipeline G-code export seam, which currently
     runs on file export and print-host upload rather than on Slice alone.
@@ -48,12 +49,12 @@ import ftplib
 import io
 import json
 import os
+import queue
 import shutil
 import socket
 import ssl
 import struct
 import subprocess
-import tempfile
 import threading
 import time
 import urllib.error
@@ -61,6 +62,113 @@ import urllib.parse
 import urllib.request
 
 import orca
+
+
+class BackgroundJob:
+    def __init__(self):
+        self._done = threading.Event()
+        self._result = None
+        self._error = None
+
+    def finish(self, result=None, error=None):
+        self._result = result
+        self._error = error
+        self._done.set()
+
+    def wait(self, timeout=None):
+        if not self._done.wait(timeout):
+            raise TimeoutError("background job did not finish")
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class PollBatch:
+    """Run one completion callback after every printer in a poll batch finishes."""
+
+    def __init__(self, count, on_complete):
+        self._remaining = count
+        self._on_complete = on_complete
+        self._lock = threading.Lock()
+
+    def finish_one(self):
+        callback = None
+        with self._lock:
+            self._remaining -= 1
+            if self._remaining == 0:
+                callback, self._on_complete = self._on_complete, None
+        if callback is not None:
+            callback()
+
+
+class ReusableDaemonPool:
+    """A bounded pool whose daemon workers are reused while the dashboard is open."""
+
+    def __init__(self, name, max_workers, idle_timeout=45.0):
+        self._name = name
+        self._max_workers = max(1, int(max_workers))
+        self._idle_timeout = idle_timeout
+        self._jobs = queue.Queue()
+        self._lock = threading.Lock()
+        self._workers = set()
+        self._busy = 0
+        self._sequence = 0
+
+    def submit(self, function, *args, **kwargs):
+        job = BackgroundJob()
+        self._jobs.put((job, function, args, kwargs))
+        with self._lock:
+            desired = min(self._max_workers, max(1, self._busy + self._jobs.qsize()))
+            while len(self._workers) < desired:
+                self._sequence += 1
+                worker = threading.Thread(
+                    target=self._run,
+                    name="%s-%d" % (self._name, self._sequence),
+                    daemon=True,
+                )
+                self._workers.add(worker)
+                worker.start()
+        return job
+
+    def _run(self):
+        current = threading.current_thread()
+        while True:
+            try:
+                job, function, args, kwargs = self._jobs.get(timeout=self._idle_timeout)
+            except queue.Empty:
+                with self._lock:
+                    if self._jobs.empty():
+                        self._workers.discard(current)
+                        return
+                continue
+            with self._lock:
+                self._busy += 1
+            try:
+                job.finish(result=function(*args, **kwargs))
+            except Exception as exc:
+                job.finish(error=exc)
+            finally:
+                with self._lock:
+                    self._busy -= 1
+                self._jobs.task_done()
+
+
+# Host callbacks stay on the UI thread. One coordinator serializes state
+# mutations; a bounded reusable pool preserves parallel LAN polling without
+# creating a fresh set of threads on every 15-second refresh.
+ACTION_WORKER = ReusableDaemonPool("printers-action", max_workers=1)
+POLL_WORKERS = ReusableDaemonPool("printers-poll", max_workers=8)
+
+
+def post_window(window, payload):
+    try:
+        post = getattr(window, "post", None)
+        if window is None or not window.is_open() or not callable(post):
+            return False
+        post(payload)
+        return True
+    except Exception:
+        return False
 
 # Single source of truth for the version. pyproject.toml derives the wheel
 # version from this (dynamic version), and build_package.py validates that the
@@ -83,24 +191,57 @@ def resolve_plugin_dir():
 
 
 PLUGIN_DIR = resolve_plugin_dir()
+PLUGIN_STORAGE_DIR = PLUGIN_DIR
 PRINTERS_FILE = os.path.join(PLUGIN_DIR, "printers.json")
-# Tab icon. Embedded here rather than shipped as a sibling file so it survives a
-# single-file install: OrcaSlicer copies only the .py, not adjacent assets. It is
-# materialized next to the plugin on first use and handed to create_panel by path.
+# Use the adjacent source/package icon when present. Cloud wheel and single-file
+# installs fall back to Orca's default icon rather than writing an asset on load.
 ICON_PATH = os.path.join(PLUGIN_DIR, "printers.svg")
-ICON_SVG = r'''<?xml version="1.0" encoding="UTF-8"?><svg id="a" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"><line x1="4.5" y1="14.5" x2="10.5" y2="14.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><polyline points="8.5 10.5 7.5 11.5 6.5 10.5" style="fill:none; stroke:#fff; stroke-linecap:round; stroke-linejoin:round;"/><line x1="4.5" y1="9.5" x2="6" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><line x1="9.5" y1="9.5" x2="10.5" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><rect x="6.5" y="8.5" width="2" height="2" rx=".27" ry=".27" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><rect x="1.5" y="6.5" width="12" height="11" rx="1" ry="1" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><path d="M5.5,5v-1.5c0-.55.45-1,1-1h10c.55,0,1,.45,1,1v9c0,.55-.45,1-1,1h-1.5" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/></svg>'''
 
 
 def ensure_icon():
-    """Write the embedded tab icon next to the plugin if it's absent, and return
-    its path — or "" if it can't be written, so the host uses its default icon."""
+    return ICON_PATH if os.path.isfile(ICON_PATH) else ""
+
+
+def configure_plugin_storage():
+    """Move mutable state to Orca's private plugin storage when available."""
+    global PLUGIN_STORAGE_DIR, PRINTERS_FILE, OUTBOX_DIR, OUTBOX_INDEX
+
+    plugin_host = getattr(getattr(orca, "host", None), "plugin", None)
+    storage = getattr(plugin_host, "storage", None)
+    if not callable(storage):
+        return False
     try:
-        if not os.path.exists(ICON_PATH):
-            with open(ICON_PATH, "w", encoding="utf-8") as fh:
-                fh.write(ICON_SVG)
-        return ICON_PATH
-    except OSError:
-        return ""
+        target_root = os.path.abspath(storage())
+        if not target_root:
+            return False
+        os.makedirs(target_root, exist_ok=True)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+    for name in ("printers.json", "outbox_index.json"):
+        source = os.path.join(PLUGIN_DIR, name)
+        target = os.path.join(target_root, name)
+        if source != target and os.path.isfile(source) and not os.path.exists(target):
+            try:
+                shutil.copy2(source, target)
+            except OSError:
+                pass
+
+    legacy_outbox = os.path.join(PLUGIN_DIR, "outbox")
+    target_outbox = os.path.join(target_root, "outbox")
+    if legacy_outbox != target_outbox and os.path.isdir(legacy_outbox) and not os.path.exists(target_outbox):
+        try:
+            shutil.copytree(legacy_outbox, target_outbox)
+        except OSError:
+            pass
+
+    PLUGIN_STORAGE_DIR = target_root
+    PRINTERS_FILE = os.path.join(target_root, "printers.json")
+    OUTBOX_DIR = target_outbox
+    OUTBOX_INDEX = os.path.join(target_root, "outbox_index.json")
+    return True
+
+
 HTTP_TIMEOUT = 6
 UPLOAD_TIMEOUT = 120
 
@@ -133,6 +274,8 @@ def ssl_ctx_for(printer):
 # Manual printer store (printers.json next to the plugin)
 # --------------------------------------------------------------------------- #
 def load_manual_printers():
+    if not os.path.isfile(PRINTERS_FILE):
+        return []
     try:
         with open(PRINTERS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -162,14 +305,13 @@ def normalize_url(url):
     return url
 
 
-# OrcaSlicer exposes many print_host types. We keep the real type for display and
-# map it to the status backend we actually implement. OctoPrint-compatible hosts
-# (PrusaLink, Repetier) speak the OctoPrint API; Klipper stacks speak Moonraker.
-# Everything else falls back to a reachability ping (still shows online/offline and
-# opens its web UI). Cloud-only hosts (obico, simplyprint, prusaconnect,
-# 3dprinteros) can't be polled over the LAN and stay generic.
+# OrcaSlicer exposes many print_host types. Keep the real type for display, but
+# only map transports that this plugin implements end-to-end: status, controls,
+# and upload. The remaining types stay in the product target list and UI as
+# disabled choices instead of being misrepresented by a reachability-only ping.
 _MOONRAKER_COMPATIBLE = {"moonraker", "klipper", "mainsail", "fluidd"}
-_OCTOPRINT_COMPATIBLE = {"octoprint", "prusalink", "repetier"}
+_OCTOPRINT_COMPATIBLE = {"octoprint"}
+_ACTIVE_BACKENDS = {"moonraker", "octoprint", "bambu"}
 
 
 def normalize_host_type(host_type):
@@ -185,7 +327,11 @@ def backend_for_type(host_type):
         return "octoprint"
     if t == "bambu":
         return "bambu"
-    return "generic"
+    return "unavailable"
+
+
+def backend_is_active(host_type):
+    return backend_for_type(host_type) in _ACTIVE_BACKENDS
 
 
 # --------------------------------------------------------------------------- #
@@ -229,14 +375,14 @@ def dashboard_printers():
     return result
 
 
-def available_orca_printers():
+def available_orca_printers(discovered=None):
     # OrcaSlicer network presets (Moonraker/OctoPrint) not yet on the dashboard.
     # Bambu comes via SSDP now — the audit blocks OrcaSlicer.conf.
     manual = load_manual_printers()
     added_urls = {normalize_url(p.get("url")) for p in manual}
     added_serials = {p.get("serial") for p in manual if p.get("serial")}
     out = []
-    for p in discover_orca_printers():
+    for p in discovered if discovered is not None else discover_orca_printers():
         if p.get("url") in added_urls:
             continue
         if p.get("serial") and p["serial"] in added_serials:
@@ -584,6 +730,18 @@ class _ImplicitFTPS(ftplib.FTP_TLS):
         self.welcome = self.getresp()
         return self.welcome
 
+    def ntransfercmd(self, cmd, rest=None):
+        # Bambu's vsftpd requires the data connection to reuse the control
+        # channel's TLS session. FTP_TLS wraps a new session by default.
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            kwargs = {"server_hostname": self.host}
+            session = getattr(self.sock, "session", None)
+            if session is not None:
+                kwargs["session"] = session
+            conn = self.context.wrap_socket(conn, **kwargs)
+        return conn, size
+
 
 def _ftps_stor(host, access_code, remote, file_bytes):
     """One STOR attempt over ftplib. Returns "" on success or an error string."""
@@ -607,36 +765,33 @@ def _ftps_stor(host, access_code, remote, file_bytes):
 
 
 def _curl_stor(host, access_code, remote, file_bytes):
-    """Fallback STOR via the system curl (ships with Windows 10+/macOS; Bambu
-    Studio itself uses curl). Unlike ftplib, curl handles vsftpd's mandatory TLS
-    session reuse on the data channel. Returns "" on success or an error."""
+    """Last-resort STOR via system curl, streaming bytes over stdin.
+
+    The native ftplib path now reuses the control TLS session. Curl remains a
+    compatibility fallback for older firmware quirks without creating a
+    temporary file in OrcaSlicer's data directory.
+    """
     curl = shutil.which("curl")
     if not curl:
         return "curl not available"
-    # The plugin audit permits writes only below OrcaSlicer's data directory.
-    # System temp is outside that root on the supported desktop platforms, so
-    # keep curl's short-lived upload file in this plugin's allowed directory.
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".gcode", dir=PLUGIN_DIR)
     try:
-        tmp.write(file_bytes)
-        tmp.close()
         cmd = [curl, "--insecure", "--ftp-pasv", "--silent", "--show-error",
-               "--connect-timeout", "15", "--max-time", str(UPLOAD_TIMEOUT),
-               "-u", "bblp:" + access_code, "-T", tmp.name,
-               "ftps://%s:990/%s" % (host, remote)]
+                "--connect-timeout", "15", "--max-time", str(UPLOAD_TIMEOUT),
+                "-u", "bblp:" + access_code, "-T", "-",
+                "ftps://%s:990/%s" % (host, remote)]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=UPLOAD_TIMEOUT + 30, creationflags=flags)
+        proc = subprocess.run(cmd, input=file_bytes, capture_output=True,
+                               timeout=UPLOAD_TIMEOUT + 30, creationflags=flags)
         if proc.returncode == 0:
             return ""
-        return (proc.stderr or "curl exit %d" % proc.returncode).strip()
+        stderr = (
+            proc.stderr.decode("utf-8", "replace")
+            if isinstance(proc.stderr, bytes)
+            else proc.stderr
+        )
+        return (stderr or "curl exit %d" % proc.returncode).strip()
     except Exception as exc:
         return str(exc)
-    finally:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
 
 
 def bambu_upload(host, access_code, filename, file_bytes):
@@ -834,15 +989,16 @@ def autoname_printers(printers):
                 name = moonraker_hostname(normalize_url(p.get("url")), ssl_ctx_for(p))
         if name and name != p.get("name"):
             p["name"] = name
-            updates[p.get("id")] = name
+            updates[(p.get("id"), normalize_url(p.get("url")))] = name
     if not updates:
         return False
     with _STORE_LOCK:
         manual = load_manual_printers()
         changed = False
         for entry in manual:
-            if entry.get("id") in updates and entry.get("name") != updates[entry.get("id")]:
-                entry["name"] = updates[entry.get("id")]
+            key = (entry.get("id"), normalize_url(entry.get("url")))
+            if key in updates and entry.get("name") != updates[key]:
+                entry["name"] = updates[key]
                 changed = True
         if changed:
             save_manual_printers(manual)
@@ -866,6 +1022,8 @@ _OUTBOX_LOCK = threading.Lock()
 
 
 def load_outbox_index():
+    if not os.path.isfile(OUTBOX_INDEX):
+        return []
     try:
         with open(OUTBOX_INDEX, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1004,8 +1162,23 @@ def _poll_backend(kind, printer, base, ctx):
 def poll_printer(printer):
     base = normalize_url(printer.get("url"))
     kind = (printer.get("type") or "moonraker").lower()
-    ctx = ssl_ctx_for(printer)
     backend = backend_for_type(kind)
+    if backend == "unavailable":
+        return {
+            "online": None,
+            "state": "not available yet",
+            "supported": False,
+            "backend": kind,
+            "error": "Printer backend is not implemented yet",
+            "nozzle": None,
+            "target_nozzle": None,
+            "bed": None,
+            "target_bed": None,
+            "progress": None,
+            "filename": "",
+            "thumbnail": "",
+        }
+    ctx = ssl_ctx_for(printer)
     if backend == "bambu":
         had_serial = bool((printer.get("serial") or "").strip())
         status = poll_bambu(printer)
@@ -1029,6 +1202,11 @@ def poll_printer(printer):
     return {"online": False, "state": "offline", "error": last_exc, "backend": kind, "nozzle": None,
             "target_nozzle": None, "bed": None, "target_bed": None, "progress": None,
             "filename": "", "thumbnail": ""}
+
+
+def status_is_busy(status):
+    state = str((status or {}).get("state") or "").lower()
+    return "paus" in state or "print" in state or state == "running"
 
 
 def _post_json(url, ctx, headers=None, payload=None, timeout=HTTP_TIMEOUT):
@@ -1149,11 +1327,19 @@ PAGE = r"""<!DOCTYPE html>
   .fname { font-size:11px; color:var(--orca-muted,#a0a0a0); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .bar { height:6px; border-radius:3px; background:var(--orca-border,#3c3c4c); overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--orca-accent,#009688); }
-  /* Pin the action row to the bottom so it lines up across cards regardless of
-     how much status (thumbnail, filename, progress) each one has above it. */
-  .row { display:flex; gap:6px; align-items:center; margin-top:auto; }
+  /* Keep print controls and ordinary tile actions on separate fixed rows. A
+     printing tile can expose two extra controls without overflowing into the
+     next grid column or moving the ordinary actions. */
+  .tile-actions { display:flex; flex-direction:column; gap:6px; margin-top:auto; min-width:0; }
+  .ctl-row { display:flex; justify-content:flex-end; min-height:28px; }
+  .row { display:flex; gap:6px; align-items:center; min-width:0; }
   .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
-  .row button { white-space:nowrap; }
+  .row button { white-space:nowrap; padding-left:4px; padding-right:4px; }
+  .row .print, .row .open { width:60px; }
+  .row .remove { width:68px; }
+  .ctl-slot { display:flex; gap:6px; width:126px; justify-content:flex-end; }
+  .ctl-slot button { width:60px; padding-left:4px; padding-right:4px; }
+  .spacer { visibility:hidden; pointer-events:none; }
   .empty { color:var(--orca-muted,#a0a0a0); padding:24px; text-align:center; }
   #status { font-size:11px; color:var(--orca-muted,#a0a0a0); }
   .queue { display:flex; flex-direction:column; gap:4px; }
@@ -1171,21 +1357,21 @@ PAGE = r"""<!DOCTYPE html>
     <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
     <input id="f-name" placeholder="Name" size="8">
     <input id="f-url" placeholder="192.168.0.42" size="14">
-    <select id="f-type" title="Connection type. Klipper/Moonraker, OctoPrint and Bambu LAN report full status; PrusaLink/Repetier use the OctoPrint API; the rest show reachability and open their web UI.">
+    <select id="f-type" title="Connection type. Active integrations provide live status, controls and upload. Disabled entries remain planned targets.">
       <option value="moonraker">Moonraker / Klipper</option>
       <option value="octoprint">OctoPrint</option>
       <option value="bambu">Bambu (LAN)</option>
-      <option value="prusalink">PrusaLink</option>
-      <option value="repetier">Repetier</option>
-      <option value="duet">Duet</option>
-      <option value="mks">MKS</option>
-      <option value="flashair">FlashAir</option>
-      <option value="astrobox">AstroBox</option>
-      <option value="esp3d">ESP3D</option>
-      <option value="crealityprint">Creality</option>
-      <option value="flashforge">FlashForge</option>
-      <option value="elegoolink">Elegoo</option>
-      <option value="generic">Other</option>
+      <option value="prusalink" disabled>PrusaLink — coming later</option>
+      <option value="repetier" disabled>Repetier — coming later</option>
+      <option value="duet" disabled>Duet — coming later</option>
+      <option value="mks" disabled>MKS — coming later</option>
+      <option value="flashair" disabled>FlashAir — coming later</option>
+      <option value="astrobox" disabled>AstroBox — coming later</option>
+      <option value="esp3d" disabled>ESP3D — coming later</option>
+      <option value="crealityprint" disabled>Creality — coming later</option>
+      <option value="flashforge" disabled>FlashForge — coming later</option>
+      <option value="elegoolink" disabled>Elegoo — coming later</option>
+      <option value="generic" disabled>Other — coming later</option>
     </select>
     <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
     <input id="f-access" placeholder="Access code" size="10" style="display:none">
@@ -1243,16 +1429,30 @@ function stateKind(s){
   return 'idle';
 }
 
+function backendReady(t){
+  return ['moonraker','klipper','mainsail','fluidd','octoprint','bambu']
+    .indexOf(String(t || '').toLowerCase()) >= 0;
+}
+
+function printerSelectable(p){
+  var s = p.status || {};
+  var kind = stateKind(s);
+  return backendReady(p.type) && s.supported !== false && s.online === true &&
+    kind !== 'printing' && kind !== 'paused';
+}
+
 function updateSendBtn(){
-  var n = Object.keys(selected).filter(function(k){ return selected[k]; }).length;
+  var eligible = current.filter(printerSelectable);
+  var n = eligible.filter(function(p){ return selected[p.url]; }).length;
   sendBtn.disabled = n === 0;
   sendBtn.textContent = n ? ('Send G-code to ' + n + ' selected…') : 'Send G-code to selected…';
   var all = document.getElementById('sel-all');
-  all.checked = current.length > 0 && current.every(function(p){ return selected[p.url]; });
+  all.disabled = eligible.length === 0;
+  all.checked = eligible.length > 0 && eligible.every(function(p){ return selected[p.url]; });
 }
 
 document.getElementById('sel-all').addEventListener('change', function(e){
-  current.forEach(function(p){ selected[p.url] = e.target.checked; });
+  current.forEach(function(p){ selected[p.url] = printerSelectable(p) && e.target.checked; });
   render(current);
 });
 
@@ -1262,32 +1462,50 @@ function render(printers){
   if (!printers.length){ grid.innerHTML = '<div class="empty">No printers found. Configure a printer host in OrcaSlicer, or add one above.</div>'; return; }
   printers.forEach(function(p){
     var s = p.status || {};
+    var supported = backendReady(p.type) && s.supported !== false;
+    var dotClass = supported ? (s.online === true ? 'on' : (s.online === false ? 'off' : '')) : '';
+    var stateText = supported
+      ? (s.state || (s.online === true ? 'online' : (s.online === false ? 'offline' : 'checking')))
+      : 'not available yet';
     var tile = document.createElement('div'); tile.className = 'tile';
     var prog = (s.progress == null) ? '' : '<div class="bar"><i style="width:' + s.progress + '%"></i></div>';
     var thumb = s.thumbnail ? '<img class="thumb show" src="' + s.thumbnail + '">' : '<div class="thumb"></div>';
     var fname = s.filename ? '<div class="fname" title="' + esc(s.filename) + '">' + esc(s.filename) + '</div>' : '';
     tile.innerHTML =
-      '<div class="top"><span class="dot ' + (s.online ? 'on' : 'off') + '"></span>' +
+      '<div class="top"><span class="dot ' + dotClass + '"></span>' +
       '<span class="name">' + esc(p.name || p.url) + '</span>' +
       '<span class="src">' + esc(typeLabel(p.type)) + '</span>' +
-      '<span class="state">' + esc(s.state || (s.online ? 'online' : 'offline')) + '</span></div>' +
+      '<span class="state">' + esc(stateText) + '</span></div>' +
       '<div class="body">' + thumb + '<div class="meta">' +
       '<div class="temps"><span>Nozzle <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
       '<span>Bed <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
       fname + prog + '</div></div>';
     var kind = stateKind(s);
-    var ctl = '';
+    var busy = supported && s.online === true && (kind === 'printing' || kind === 'paused');
+    var selectable = printerSelectable(p);
+    if (!selectable) selected[p.url] = false;
+    var ctl = '<span class="ctl-slot">';
     if (s.online && kind === 'printing')
-      ctl = '<button class="ctl ghost" data-a="pause">Pause</button><button class="ctl danger" data-a="cancel">Stop</button>';
+      ctl += '<button class="ctl ghost" data-a="pause">Pause</button><button class="ctl danger" data-a="cancel">Stop</button>';
     else if (s.online && kind === 'paused')
-      ctl = '<button class="ctl ghost" data-a="resume">Resume</button><button class="ctl danger" data-a="cancel">Stop</button>';
+      ctl += '<button class="ctl ghost" data-a="resume">Resume</button><button class="ctl danger" data-a="cancel">Stop</button>';
+    else
+      ctl += '<button class="ctl spacer" disabled></button><button class="ctl spacer" disabled></button>';
+    ctl += '</span>';
+    var printDisabledReason = !supported
+      ? 'Printer integration is not available yet'
+      : (busy ? 'Printer is busy' : 'Printer is not online');
+    var printAttrs = selectable ? '' : ' disabled title="' + esc(printDisabledReason) + '"';
     tile.innerHTML +=
-      '<div class="row"><label><input type="checkbox" class="sel"' + (selected[p.url] ? ' checked' : '') + '> select</label>' +
-      ctl +
-      '<button class="print ghost">Print…</button>' +
+      '<div class="tile-actions"><div class="ctl-row">' + ctl + '</div>' +
+      '<div class="row"><label><input type="checkbox" class="sel"' +
+      (selected[p.url] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> select</label>' +
+      '<button class="print ghost"' + printAttrs + '>Print…</button>' +
       // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.
-      (p.type === 'bambu' ? '' : '<button class="open ghost">Open</button>') +
-      '<button class="remove ghost">Remove</button></div>';
+      (p.type === 'bambu'
+        ? '<button class="open ghost spacer" disabled></button>'
+        : '<button class="open ghost">Open</button>') +
+      '<button class="remove ghost">Remove</button></div></div>';
     tile.querySelector('.sel').addEventListener('change', function(e){
       selected[p.url] = e.target.checked; updateSendBtn(); });
     // Stopping a print is destructive — the button arms on the first click and
@@ -1316,17 +1534,16 @@ function render(printers){
       // vendors — so we don't pretend to. The queue is just sliced files you
       // can push to a dashboard printer: one Print action, gated on the
       // printer's current state. No "Send"/"sent by Orca" state claims.
-      var busy = s.online && (stateKind(s) === 'printing' || stateKind(s) === 'paused');
       p.queued.forEach(function(r){
         var row = document.createElement('div');
         row.className = 'qrow';
-        var printBtn = busy
-          ? '<button class="qprint" disabled title="Printer is ' + esc(stateKind(s)) + '">Print</button>'
+        var printBtn = !selectable
+          ? '<button class="qprint" disabled title="' + esc(printDisabledReason) + '">Print</button>'
           : '<button class="qprint" title="Send to this printer and start printing">Print</button>';
         row.innerHTML = '<span class="qname" title="' + esc(r.name) + '">' + esc(r.name) + '</span>' +
           printBtn + '<button class="qdrop ghost" title="Remove retained copy">&times;</button>';
         var pb = row.querySelector('.qprint');
-        if (!busy) {
+        if (selectable) {
           pb.addEventListener('click', function(){
             if (!pb._armed) {
               pb._armed = true; pb.textContent = 'Sure?';
@@ -1345,7 +1562,7 @@ function render(printers){
       tile.appendChild(q);
     }
     var openBtn = tile.querySelector('.open');
-    if (openBtn) openBtn.addEventListener('click', function(){
+    if (openBtn && !openBtn.disabled) openBtn.addEventListener('click', function(){
       orca.postMessage({ type:'open', url:p.url, name:p.name || p.url }); });
     tile.querySelector('.remove').addEventListener('click', function(){ orca.postMessage({ type:'remove', id:p.id }); });
     grid.appendChild(tile);
@@ -1440,7 +1657,9 @@ function renderAvailable(){
   var opts = '<option value="">Add a printer…</option>';
   items.forEach(function(p, i){
     var label = (p.source === 'network') ? (p.name + ' — found on network') : (p.name || p.url);
-    opts += '<option value="' + i + '">' + esc(label) + '</option>';
+    var ready = backendReady(p.type);
+    opts += '<option value="' + i + '"' + (ready ? '' : ' disabled') + '>' +
+      esc(label + (ready ? '' : ' — not available yet')) + '</option>';
   });
   sel.innerHTML = opts;
   sel.style.display = '';
@@ -1469,6 +1688,12 @@ document.getElementById('f-adopt').addEventListener('change', function(e){
 orca.onMessage(function(data){
   if (!data) return;
   if (data.printers) render(data.printers);
+  if (data.printerStatus) {
+    current.forEach(function(p){
+      if (p.url === data.printerStatus.url) p.status = data.printerStatus.status;
+    });
+    render(current);
+  }
   if (data.available) { lastAvailable = data.available; renderAvailable(); }
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
   if (data.unmatched !== undefined)
@@ -1500,104 +1725,134 @@ html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%;display:bl
 class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     win = None
 
-    def get_name(self):
-        return "Printers"
+    def __init__(self):
+        super().__init__()
+        self._status_cache = {}
+        self._status_lock = threading.Lock()
+        self._list_generation = 0
 
-    def _supports_panel(self):
-        return getattr(orca.host.ui, "create_panel", None)
+    def get_name(self):
+        return "Print Farm"
 
     def _open(self):
         if self.win is not None and self.win.is_open():
             return False
-        create_panel = self._supports_panel()
-        if create_panel is not None:
-            self.win = create_panel(
-                title="Printers", html=PAGE, on_message=self.on_message, on_close=self.on_close,
-                icon=ensure_icon(),
-            )
-        else:
-            self.win = orca.host.ui.create_window(
-                title="Printers", html=PAGE, width=1000, height=700,
-                on_message=self.on_message, on_close=self.on_close,
-            )
+        self.win = orca.host.ui.create_window(
+            title="Print Farm", html=PAGE, width=1000, height=700,
+            on_message=self.on_message, on_close=self.on_close,
+        )
         return True
-
-    def on_load(self):
-        if self._supports_panel() is not None:
-            try:
-                self._open()
-            except Exception:
-                pass
 
     def execute(self):
         self._open()
-        return orca.ExecutionResult.success("Printers dashboard opened.")
+        return orca.ExecutionResult.success("Print Farm dashboard opened.")
 
     def on_close(self):
         self.win = None
 
     def _add_manual(self, entry):
-        manual = load_manual_printers()
-        new_id = max([p.get("id", 0) for p in manual if isinstance(p.get("id"), int)], default=0) + 1
-        entry["id"] = new_id
-        manual.append(entry)
-        save_manual_printers(manual)
+        with _STORE_LOCK:
+            manual = load_manual_printers()
+            new_id = max(
+                [p.get("id", 0) for p in manual if isinstance(p.get("id"), int)],
+                default=0,
+            ) + 1
+            entry["id"] = new_id
+            manual.append(entry)
+            save_manual_printers(manual)
+
+    def _remove_manual(self, printer_id):
+        with _STORE_LOCK:
+            manual = [p for p in load_manual_printers() if p.get("id") != printer_id]
+            save_manual_printers(manual)
+
+    def _post(self, payload):
+        return post_window(self.win, payload)
 
     # on_message runs on the UI thread — host reads happen here, network/disk on workers.
     def on_message(self, msg):
         msg = msg or {}
         kind = msg.get("type")
-        if kind in ("ready", "refresh"):
-            self._refresh_async()  # host reads run on the UI thread
+        if kind == "ready":
+            self._refresh_async(discover_network=False)
+        elif kind == "refresh":
+            self._refresh_async(discover_network=True)
         elif kind == "poll":
             # Periodic status tick from the page: statuses only, no store/picker
             # rebuild, and never more than one poll in flight.
             if not getattr(self, "_polling", False):
                 self._polling = True
-                printers = dashboard_printers()
-                def run():
-                    try:
-                        self._poll_and_push(printers)
-                    finally:
-                        self._polling = False
-                threading.Thread(target=run, daemon=True).start()
+                ACTION_WORKER.submit(self._poll_dashboard)
         elif kind == "printer-cmd":
-            printers = dashboard_printers()
-            threading.Thread(target=self._do_printer_cmd, args=(msg, printers), daemon=True).start()
+            ACTION_WORKER.submit(self._do_printer_cmd, msg)
         elif kind == "outbox-send":
-            printers = dashboard_printers()
-            threading.Thread(target=self._do_outbox_send, args=(msg, printers), daemon=True).start()
+            ACTION_WORKER.submit(self._do_outbox_send, msg)
         elif kind == "outbox-drop":
             stored = msg.get("file") or ""
             if stored:
-                outbox_remove(stored)
-            self._refresh_async()
+                ACTION_WORKER.submit(
+                    self._drop_and_refresh,
+                    stored,
+                    discover_orca_printers(),
+                )
         elif kind == "add":
-            self._add_manual({"name": msg.get("name") or msg.get("url"),
-                              "url": normalize_url(msg.get("url")), "type": msg.get("kind") or "moonraker",
-                              "serial": msg.get("serial") or "", "access_code": msg.get("access_code") or "",
-                              "insecure": bool(msg.get("insecure")), "source": "manual"})
-            self._refresh_async()
+            entry = {
+                "name": msg.get("name") or msg.get("url"),
+                "url": normalize_url(msg.get("url")),
+                "type": msg.get("kind") or "moonraker",
+                "serial": msg.get("serial") or "",
+                "access_code": msg.get("access_code") or "",
+                "insecure": bool(msg.get("insecure")),
+                "source": "manual",
+            }
+            if not backend_is_active(entry["type"]):
+                self._post_status(
+                    "%s support is planned but not available yet."
+                    % (entry["type"] or "This printer type")
+                )
+                return
+            ACTION_WORKER.submit(
+                self._add_and_refresh,
+                entry,
+                discover_orca_printers(),
+            )
         elif kind == "adopt":
             # User chose an OrcaSlicer-configured printer to put on the dashboard.
             p = msg.get("printer") or {}
             if p.get("url"):
-                self._add_manual({"name": p.get("name") or p.get("url"), "url": normalize_url(p.get("url")),
-                                  "type": p.get("type") or "moonraker", "apikey": p.get("apikey", ""),
-                                  "serial": p.get("serial") or "", "access_code": p.get("access_code") or "",
-                                  "insecure": bool(p.get("insecure")), "source": "orca"})
-            self._refresh_async()
+                entry = {
+                    "name": p.get("name") or p.get("url"),
+                    "url": normalize_url(p.get("url")),
+                    "type": p.get("type") or "moonraker",
+                    "apikey": p.get("apikey", ""),
+                    "serial": p.get("serial") or "",
+                    "access_code": p.get("access_code") or "",
+                    "insecure": bool(p.get("insecure")),
+                    "source": "orca",
+                }
+                if not backend_is_active(entry["type"]):
+                    self._post_status(
+                        "%s support is planned but not available yet."
+                        % (entry["type"] or "This printer type")
+                    )
+                    return
+                ACTION_WORKER.submit(
+                    self._add_and_refresh,
+                    entry,
+                    discover_orca_printers(),
+                )
         elif kind == "remove":
-            manual = [p for p in load_manual_printers() if p.get("id") != msg.get("id")]
-            save_manual_printers(manual)
-            self._refresh_async()
+            ACTION_WORKER.submit(
+                self._remove_and_refresh,
+                msg.get("id"),
+                discover_orca_printers(),
+            )
         elif kind == "open":
             url = normalize_url(msg.get("url"))
             if url:
                 self._open_viewer(url, msg.get("name") or url)
         elif kind == "mass-print":
-            printers = dashboard_printers()  # host read on the UI thread
-            threading.Thread(target=self._do_mass_print, args=(msg, printers), daemon=True).start()
+            ACTION_WORKER.submit(self._do_mass_print, msg)
 
     def _open_viewer(self, url, name):
         # Printer web UI in its own host window — inside Orca, no external browser
@@ -1612,59 +1867,158 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         except Exception:
             pass
 
-    def _refresh_async(self):
-        printers = dashboard_printers()       # UI thread: dashboard = user-chosen
-        available = available_orca_printers()  # UI thread: Orca printers not yet added
-        # Render the list right away so an add/remove shows instantly, then poll the
-        # printers in the background and push their status once it arrives.
+    def _refresh_async(self, discover_network=False):
+        # Capture host-owned preset state on the UI thread. Disk and LAN work
+        # continue on the reusable coordinator.
+        discovered = discover_orca_printers()
+        ACTION_WORKER.submit(self._refresh_worker, discovered, discover_network)
+
+    def _refresh_worker(self, discovered, discover_network=False):
+        printers = dashboard_printers()
         unmatched = attach_outbox(printers)
-        if self.win is not None and self.win.is_open():
-            self.win.post({"printers": printers, "available": available,
-                           "unmatched": unmatched})
-        threading.Thread(target=self._poll_and_push, args=(printers, True), daemon=True).start()
+        active_urls = {printer.get("url") for printer in printers}
+        with self._status_lock:
+            self._list_generation += 1
+            generation = self._list_generation
+            for stale in set(self._status_cache) - active_urls:
+                self._status_cache.pop(stale, None)
+            for printer in printers:
+                cached = self._status_cache.get(printer.get("url"))
+                printer["status"] = (
+                    dict(cached)
+                    if cached is not None
+                    else {"online": None, "state": "checking"}
+                )
+        payload = {
+            "printers": printers,
+            "unmatched": unmatched,
+        }
+        if discovered is not None:
+            payload["available"] = available_orca_printers(discovered)
+        self._post(payload)
+        self._poll_and_push(printers, discover_network, generation=generation)
 
-    @staticmethod
-    def _poll_into(printer):
-        printer["status"] = poll_printer(printer)
+    def _add_and_refresh(self, entry, discovered):
+        self._add_manual(entry)
+        self._refresh_worker(discovered)
 
-    def _poll_and_push(self, printers, discover=False):
-        # Poll all printers concurrently — one offline/slow host would otherwise
-        # block the rest for its full timeout, making add/remove feel sluggish.
-        threads = [threading.Thread(target=self._poll_into, args=(p,), daemon=True) for p in printers]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        # Placeholder names (bare IPs) get their real names once statuses are in.
+    def _remove_and_refresh(self, printer_id, discovered):
+        self._remove_manual(printer_id)
+        self._refresh_worker(discovered)
+
+    def _drop_and_refresh(self, stored, discovered):
+        outbox_remove(stored)
+        self._refresh_worker(discovered)
+
+    def _poll_dashboard(self):
+        with self._status_lock:
+            generation = self._list_generation
+        self._poll_and_push(
+            dashboard_printers(),
+            on_complete=self._finish_dashboard_poll,
+            generation=generation,
+        )
+
+    def _finish_dashboard_poll(self):
+        self._polling = False
+
+    def _poll_into(self, printer, batch=None, generation=None):
         try:
-            autoname_printers(printers)
-        except Exception:
-            pass
+            status = poll_printer(printer)
+            printer["status"] = status
+            with self._status_lock:
+                if generation is not None and generation != self._list_generation:
+                    return
+                self._status_cache[printer.get("url")] = dict(status)
+            self._post({"printerStatus": {"url": printer.get("url"), "status": status}})
+        finally:
+            if batch is not None:
+                batch.finish_one()
+
+    def _finish_poll_batch(self, printers, on_complete=None, generation=None):
         try:
-            attach_outbox(printers)
-        except Exception:
-            pass
-        if self.win is not None and self.win.is_open():
-            self.win.post({"printers": printers})
-        if not discover:
-            return
+            with self._status_lock:
+                if generation is not None and generation != self._list_generation:
+                    return
+            # Placeholder names (bare IPs) get their real names once statuses are in.
+            try:
+                autoname_printers(printers)
+            except Exception:
+                pass
+            with self._status_lock:
+                if generation is not None and generation != self._list_generation:
+                    return
+            try:
+                attach_outbox(printers)
+            except Exception:
+                pass
+            self._post({"printers": printers})
+        finally:
+            if on_complete is not None:
+                on_complete()
+
+    def _discover_and_push(self, printers, generation=None):
         # Bambu printers announce themselves over SSDP — offer ones that aren't
-        # on the dashboard yet (full refresh only, not every status tick).
+        # on the dashboard yet (explicit Refresh only).
         try:
-            known_hosts = {urllib.parse.urlparse(normalize_url(p.get("url"))).hostname for p in printers}
-            known_serials = {(p.get("serial") or "").strip() for p in printers if (p.get("serial") or "").strip()}
+            known_hosts = {
+                urllib.parse.urlparse(normalize_url(p.get("url"))).hostname
+                for p in printers
+            }
+            known_serials = {
+                (p.get("serial") or "").strip()
+                for p in printers
+                if (p.get("serial") or "").strip()
+            }
             found = []
             for ip, info in ssdp_bambu_names(2.0).items():
-                if ip in known_hosts or (info.get("serial") and info["serial"] in known_serials):
+                if ip in known_hosts or (
+                    info.get("serial") and info["serial"] in known_serials
+                ):
                     continue
-                found.append({"name": info.get("name") or ip, "url": ip,
-                              "serial": info.get("serial") or "", "type": "bambu", "source": "network"})
-            if found and self.win is not None and self.win.is_open():
-                self.win.post({"discovered": found})
+                found.append({
+                    "name": info.get("name") or ip,
+                    "url": ip,
+                    "serial": info.get("serial") or "",
+                    "type": "bambu",
+                    "source": "network",
+                })
+            with self._status_lock:
+                is_current = generation is None or generation == self._list_generation
+            if found and is_current:
+                self._post({"discovered": found})
         except Exception:
             pass
 
-    def _do_outbox_send(self, msg, printers):
+    def _poll_and_push(
+        self,
+        printers,
+        discover=False,
+        on_complete=None,
+        generation=None,
+    ):
+        # Poll all printers concurrently — one offline/slow host would otherwise
+        # block additions or the rest of the dashboard. The action worker only
+        # schedules the batch; reusable poll workers push individual results.
+        if not printers:
+            self._finish_poll_batch(printers, on_complete, generation)
+        else:
+            batch = PollBatch(
+                len(printers),
+                lambda: self._finish_poll_batch(printers, on_complete, generation),
+            )
+            for printer in printers:
+                POLL_WORKERS.submit(self._poll_into, printer, batch, generation)
+        if not discover:
+            return
+        POLL_WORKERS.submit(
+            self._discover_and_push,
+            list(printers),
+            generation,
+        )
+
+    def _do_outbox_send(self, msg):
+        printers = dashboard_printers()
         stored = msg.get("file") or ""
         target = normalize_url(msg.get("url") or "")
         record = next((r for r in load_outbox_index() if r.get("file") == stored), None)
@@ -1676,7 +2030,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 file_bytes = fh.read()
         except OSError:
             outbox_remove(stored)  # file vanished — drop the dangling record
-            self._refresh_async()
+            self._refresh_worker(None)
             return
         start = bool(msg.get("start", True))
         label = printer.get("name") or target
@@ -1686,11 +2040,14 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             # that is already printing or paused. Vendor-agnostic via the
             # normalized "state" field (Moonraker/OctoPrint/Bambu).
             live = poll_printer(printer) or {}
-            state = str(live.get("state") or "").lower()
-            if "paus" in state or "print" in state or state == "running":
+            if not live.get("online"):
+                self._post_status("%s: printer is not reachable — not started." % label)
+                self._refresh_worker(None)
+                return
+            if status_is_busy(live):
                 self._post_status("%s: printer is busy (%s) — not started." % (
                     label, live.get("state") or "printing"))
-                self._refresh_async()
+                self._refresh_worker(None)
                 return
         result = send_gcode(printer, record.get("name") or stored, file_bytes,
                             start=start, use_ams=bool(msg.get("use_ams", True)))
@@ -1700,9 +2057,10 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             self._post_status("%s: %s %s." % (label, record.get("name") or stored, done))
         else:
             self._post_status("%s: send failed — %s" % (label, result.get("error") or "error"))
-        self._refresh_async()
+        self._refresh_worker(None)
 
-    def _do_printer_cmd(self, msg, printers):
+    def _do_printer_cmd(self, msg):
+        printers = dashboard_printers()
         target = normalize_url(msg.get("url") or "")
         action = msg.get("action") or ""
         printer = next((p for p in printers if normalize_url(p.get("url")) == target), None)
@@ -1716,7 +2074,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             self._post_status("%s: %s failed — %s" % (label, action, result.get("error") or "error"))
         self._poll_and_push(printers)
 
-    def _do_mass_print(self, msg, printers):
+    def _do_mass_print(self, msg):
+        printers = dashboard_printers()
         try:
             file_bytes = base64.b64decode(msg.get("dataB64") or "")
         except Exception:
@@ -1729,6 +2088,20 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         selected = [p for p in printers if normalize_url(p.get("url")) in targets]
         ok, fail, errors = 0, 0, []
         for p in selected:
+            if start:
+                live = poll_printer(p) or {}
+                if not live.get("online"):
+                    fail += 1
+                    errors.append("%s: printer is not reachable" % (
+                        p.get("name") or p.get("url")))
+                    continue
+                if status_is_busy(live):
+                    fail += 1
+                    errors.append("%s: printer is busy (%s)" % (
+                        p.get("name") or p.get("url"),
+                        live.get("state") or "printing",
+                    ))
+                    continue
             result = send_gcode(p, filename, file_bytes, start, use_ams)
             if result.get("ok"):
                 ok += 1
@@ -1739,15 +2112,15 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         if errors:
             text += " " + "; ".join(errors[:3])
         self._post_status(text)
-        self._refresh_async()
+        self._refresh_worker(None)
 
     def _post_status(self, text):
-        if self.win is not None and self.win.is_open():
-            self.win.post({"status": text})
+        self._post({"status": text})
 
 
 @orca.plugin
 class PrintersPlugin(orca.base):
     def register_capabilities(self):
+        configure_plugin_storage()
         orca.register_capability(PrintersDashboard)
         orca.register_capability(PrintersOutbox)

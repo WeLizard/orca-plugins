@@ -100,7 +100,7 @@ def build(output_root: Path) -> Path:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build the Printers OrcaSlicer plugin package")
+    parser = argparse.ArgumentParser(description="Build the Print Farm OrcaSlicer plugin package")
     parser.add_argument(
         "--output",
         type=Path,

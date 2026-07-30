@@ -1,29 +1,31 @@
-# Printers — cross-vendor printer dashboard (OrcaSlicer plugin)
+# Print Farm — cross-vendor printer dashboard (OrcaSlicer plugin)
 
-A second, **independent** plugin built on OrcaSlicer's Python plugin system
-(PR **#14530**) — deliberately unrelated to FilamentHub. It also exercises the
-proposed generic panel contribution (`orca.host.ui.create_panel`) when that API
-is available, while remaining usable through the stock host window API.
+A second, **independent** plugin built on OrcaSlicer's Python plugin system —
+deliberately unrelated to the FilamentHub catalog plugin.
 
-It opens a **Printers** dashboard that shows all your networked printers as
-tiles — live status, nozzle/bed temperatures and print progress — regardless of
-brand or firmware, and opens any printer's web interface in place. On builds
-with the proposed panel API it docks as a main-window tab. OrcaSlicer's own
-Multi-device tab is Bambu-only; this covers everyone.
+It opens a **Print Farm** dashboard that shows supported networked printers as
+tiles with live status, nozzle/bed temperatures and print progress, and can open
+a printer's web interface in place. It currently uses the stable host-managed
+window API. Native Pages from draft PR #14992 are tracked separately and are
+not treated as a production contract yet. OrcaSlicer's own Multi-device tab is
+Bambu-only.
 
-**Active testing:** this is an alpha plugin tested against OrcaSlicer PR #14530
+**Active testing:** this is an alpha plugin tested against exact OrcaSlicer PR
 artifacts. The upstream plugin API is still evolving and updates may be frequent.
 
-## What it does (on stock PR #14530 capabilities — no new host API)
+## What it does
 
-- `create_window(...)` → a host-managed, host-themed dashboard; optional
-  `create_panel(...)` support is detected at runtime for experimental builds.
+- `create_window(...)` → a host-managed, host-themed dashboard.
 - Polls each printer on a worker thread and pushes status to the page:
   - **Moonraker** (Klipper): `/printer/objects/query` (temps, `print_stats`, progress).
   - **OctoPrint**: `/api/printer` + `/api/job`.
-  - **Other**: a reachability ping.
-- **Add / remove** printers in the page; stored in `printers.json` next to the
-  plugin (inside `data_dir`, the allowed write root).
+  - **Bambu Lab LAN**: MQTT status/control plus FTPS upload.
+- Other OrcaSlicer host types remain visible as disabled planned integrations.
+  They are not presented as working until status, control, and upload are
+  implemented and can be tested.
+- **Add / remove** printers in the page; mutable state uses
+  `orca.host.plugin.storage()` when available and falls back to the install
+  directory on older hosts.
 - **Open** → swaps the grid for an `<iframe>` of the printer's web UI
   (Mainsail/Fluidd/OctoPrint are framable on the LAN).
 - Polls live status while the tab is open and exposes Pause / Resume / Stop when
@@ -35,12 +37,11 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
   to a print host are marked **sent by Orca** and cannot be uploaded a second
   time; local exports retain Send / Print actions.
 
-## Why it strengthens the PR ask
+## Upstream integration coverage
 
-- **Second surface, same slot:** demonstrates how `create_panel` can be reusable
-  across unrelated plugins without making it a runtime requirement yet.
-- **Plugin-supplied tab icon** (`printers.svg` materialized in the plugin dir)
-  exercises the optional `create_panel(icon=...)` path.
+- **Plugin page candidate:** `printers.svg` is packaged for the Pages capability
+  icon path from draft PR #14992; adopting that capability remains gated by an
+  exact artifact test and a host-owned tab/window presentation choice.
 - **Local-network access:** printers live on user-chosen LAN addresses no static
   manifest allow-list can enumerate — concrete motivation for a future
   `network = ["local-network"]` permission class (declared here, ignored today).

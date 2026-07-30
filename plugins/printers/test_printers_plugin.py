@@ -1,8 +1,10 @@
 import importlib.util
+import inspect
 import pathlib
 import re
 import sys
 import tempfile
+import threading
 import tomllib
 import types
 import unittest
@@ -34,6 +36,7 @@ def _load_plugin():
     fake_orca.ExecutionResult = _ExecutionResult
     fake_orca.PluginResult = types.SimpleNamespace(RecoverableError="recoverable")
     fake_orca.script = types.SimpleNamespace(ScriptPluginCapabilityBase=object)
+    fake_orca.host = types.SimpleNamespace(ui=types.SimpleNamespace())
     fake_orca.slicing = types.SimpleNamespace(
         SlicingPipelineCapabilityBase=object,
         Step=types.SimpleNamespace(psGCodePostProcess="post-process"),
@@ -109,7 +112,57 @@ class PrintersOutboxTest(unittest.TestCase):
         match = re.search(r'^# version = "([0-9]+\.[0-9]+\.[0-9]+)"$', source, re.MULTILINE)
         self.assertIsNotNone(match)
         project = tomllib.loads(PLUGIN_PATH.with_name("pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(match.group(1), project["project"]["version"])
+        self.assertEqual(project["project"]["dynamic"], ["version"])
+        self.assertEqual(
+            project["tool"]["setuptools"]["dynamic"]["version"],
+            {"attr": "printers_plugin.PLUGIN_VERSION"},
+        )
+        self.assertEqual(match.group(1), self.plugin.PLUGIN_VERSION)
+        self.assertIn('# name = "Print Farm"', source)
+        self.assertEqual(self.plugin.PrintersDashboard().get_name(), "Print Farm")
+
+
+class PluginStorageTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = _load_plugin()
+
+    def test_host_storage_migrates_state_without_deleting_legacy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            legacy = root / "plugin"
+            storage = root / "plugin_data" / "printers"
+            legacy.mkdir()
+            (legacy / "printers.json").write_text('[{"id":1}]', encoding="utf-8")
+            (legacy / "outbox_index.json").write_text(
+                '[{"file":"fixture.gcode"}]', encoding="utf-8"
+            )
+            (legacy / "outbox").mkdir()
+            (legacy / "outbox" / "fixture.gcode").write_text("G28", encoding="utf-8")
+
+            plugin_host = types.SimpleNamespace(storage=lambda: str(storage))
+            with mock.patch.object(self.plugin, "PLUGIN_DIR", str(legacy)), \
+                 mock.patch.object(self.plugin, "PLUGIN_STORAGE_DIR", str(legacy)), \
+                 mock.patch.object(self.plugin, "PRINTERS_FILE", str(legacy / "printers.json")), \
+                 mock.patch.object(self.plugin, "OUTBOX_DIR", str(legacy / "outbox")), \
+                 mock.patch.object(self.plugin, "OUTBOX_INDEX", str(legacy / "outbox_index.json")), \
+                 mock.patch.object(self.plugin.orca.host, "plugin", plugin_host, create=True):
+                self.plugin.PrintersPlugin().register_capabilities()
+
+                self.assertEqual(self.plugin.PLUGIN_STORAGE_DIR, str(storage))
+                self.assertEqual(self.plugin.PRINTERS_FILE, str(storage / "printers.json"))
+                self.assertEqual(self.plugin.OUTBOX_DIR, str(storage / "outbox"))
+                self.assertEqual(
+                    (storage / "printers.json").read_text(encoding="utf-8"),
+                    '[{"id":1}]',
+                )
+                self.assertEqual(
+                    (storage / "outbox" / "fixture.gcode").read_text(encoding="utf-8"),
+                    "G28",
+                )
+
+            self.assertTrue((legacy / "printers.json").exists())
+            self.assertTrue((legacy / "outbox" / "fixture.gcode").exists())
 
     def test_plugin_does_not_forge_host_owned_process_manifest_refs(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
@@ -117,19 +170,269 @@ class PrintersOutboxTest(unittest.TestCase):
         self.assertNotIn("outbox-toggle", source)
         self.assertNotIn("set_outbox_binding", source)
 
-    def test_curl_fallback_keeps_temp_file_inside_plugin_data(self):
-        temp_file = types.SimpleNamespace(
-            name=str(pathlib.Path(self.temp_dir.name) / "upload.gcode"),
-            write=mock.Mock(),
-            close=mock.Mock(),
-        )
+    def test_curl_fallback_streams_without_a_temporary_file(self):
+        run = mock.Mock(return_value=types.SimpleNamespace(returncode=0, stderr=b""))
         with mock.patch.object(self.plugin.shutil, "which", return_value="curl"), \
-             mock.patch.object(self.plugin.tempfile, "NamedTemporaryFile", return_value=temp_file) as make_temp, \
-             mock.patch.object(self.plugin.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stderr="")), \
-             mock.patch.object(self.plugin.os, "remove"):
+             mock.patch.object(self.plugin.subprocess, "run", run):
             self.assertEqual(self.plugin._curl_stor("printer", "code", "job.gcode", b"G28"), "")
 
-        make_temp.assert_called_once_with(delete=False, suffix=".gcode", dir=self.plugin.PLUGIN_DIR)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-T") + 1], "-")
+        self.assertEqual(run.call_args.kwargs["input"], b"G28")
+
+    def test_ftps_data_channel_reuses_the_control_tls_session(self):
+        ftp = object.__new__(self.plugin._ImplicitFTPS)
+        ftp._prot_p = True
+        ftp.host = "printer"
+        ftp.sock = types.SimpleNamespace(session="control-session")
+        ftp.context = mock.Mock()
+        ftp.context.wrap_socket.return_value = "tls-data"
+
+        with mock.patch.object(
+            self.plugin.ftplib.FTP,
+            "ntransfercmd",
+            return_value=("raw-data", 123),
+        ):
+            self.assertEqual(ftp.ntransfercmd("STOR job.gcode"), ("tls-data", 123))
+
+        ftp.context.wrap_socket.assert_called_once_with(
+            "raw-data",
+            server_hostname="printer",
+            session="control-session",
+        )
+
+    def test_host_push_tolerates_a_window_closing_mid_job(self):
+        posted = []
+
+        class Window:
+            def is_open(self):
+                return True
+
+            def post(self, payload):
+                posted.append(payload)
+
+        self.assertTrue(self.plugin.post_window(Window(), {"status": "ok"}))
+        self.assertEqual(posted, [{"status": "ok"}])
+        self.assertFalse(self.plugin.post_window(None, {}))
+
+    def test_reusable_pool_keeps_bursty_jobs_on_one_worker(self):
+        pool = self.plugin.ReusableDaemonPool(
+            "printers-test",
+            max_workers=1,
+            idle_timeout=0.2,
+        )
+        thread_ids = []
+        done = threading.Event()
+
+        def record():
+            thread_ids.append(threading.get_ident())
+            if len(thread_ids) == 2:
+                done.set()
+
+        pool.submit(record)
+        pool.submit(record)
+
+        self.assertTrue(done.wait(2))
+        self.assertEqual(len(set(thread_ids)), 1)
+
+    def test_dashboard_uses_reusable_workers_instead_of_per_refresh_threads(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertEqual(source.count("threading.Thread("), 1)
+        self.assertIn("POLL_WORKERS.submit", source)
+        self.assertIn("ACTION_WORKER.submit", source)
+
+    def test_network_discovery_runs_only_after_explicit_refresh(self):
+        dashboard = self.plugin.PrintersDashboard()
+        discovered = [{"name": "Configured", "url": "http://printer"}]
+
+        with mock.patch.object(
+            self.plugin,
+            "discover_orca_printers",
+            return_value=discovered,
+        ), mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
+            dashboard.on_message({"type": "ready"})
+            submit.assert_called_once_with(
+                dashboard._refresh_worker,
+                discovered,
+                False,
+            )
+
+            submit.reset_mock()
+            dashboard.on_message({"type": "refresh"})
+            submit.assert_called_once_with(
+                dashboard._refresh_worker,
+                discovered,
+                True,
+            )
+
+    def test_each_printer_status_is_pushed_without_waiting_for_slower_peers(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        printer = {"url": "http://printer"}
+        status = {"online": True, "state": "ready"}
+
+        with mock.patch.object(self.plugin, "poll_printer", return_value=status):
+            dashboard._poll_into(printer)
+
+        self.assertEqual(printer["status"], status)
+        dashboard._post.assert_called_once_with({
+            "printerStatus": {
+                "url": "http://printer",
+                "status": status,
+            },
+        })
+
+    def test_stale_poll_cannot_restore_a_removed_printer(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._list_generation = 2
+        dashboard._post = mock.Mock(return_value=True)
+        completed = []
+        stale_printers = [{"id": 4, "url": "http://removed"}]
+
+        with mock.patch.object(self.plugin, "autoname_printers") as autoname, \
+             mock.patch.object(self.plugin, "attach_outbox") as attach:
+            dashboard._finish_poll_batch(
+                stale_printers,
+                on_complete=lambda: completed.append(True),
+                generation=1,
+            )
+
+        autoname.assert_not_called()
+        attach.assert_not_called()
+        dashboard._post.assert_not_called()
+        self.assertEqual(completed, [True])
+
+    def test_stale_status_result_is_not_cached_or_pushed(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._list_generation = 2
+        dashboard._post = mock.Mock(return_value=True)
+        printer = {"url": "http://removed"}
+
+        with mock.patch.object(
+            self.plugin,
+            "poll_printer",
+            return_value={"online": True, "state": "ready"},
+        ):
+            dashboard._poll_into(printer, generation=1)
+
+        self.assertNotIn("http://removed", dashboard._status_cache)
+        dashboard._post.assert_not_called()
+
+    def test_dashboard_shows_unknown_status_as_checking(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn("data.printerStatus", source)
+        self.assertIn("s.online === true", source)
+        self.assertIn("'checking'", source)
+
+    def test_only_end_to_end_backends_are_active(self):
+        self.assertEqual(self.plugin.backend_for_type("moonraker"), "moonraker")
+        self.assertEqual(self.plugin.backend_for_type("octoprint"), "octoprint")
+        self.assertEqual(self.plugin.backend_for_type("bambu"), "bambu")
+        self.assertEqual(self.plugin.backend_for_type("prusalink"), "unavailable")
+        self.assertEqual(self.plugin.backend_for_type("repetier"), "unavailable")
+        self.assertFalse(self.plugin.backend_is_active("duet"))
+
+        status = self.plugin.poll_printer({
+            "url": "http://printer",
+            "type": "duet",
+        })
+        self.assertIsNone(status["online"])
+        self.assertFalse(status["supported"])
+        self.assertEqual(status["state"], "not available yet")
+
+    def test_planned_backends_are_visible_but_disabled(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            '<option value="prusalink" disabled>PrusaLink — coming later</option>',
+            source,
+        )
+        self.assertIn(
+            '<option value="duet" disabled>Duet — coming later</option>',
+            source,
+        )
+        self.assertIn("Printer integration is not available yet", source)
+
+    def test_refresh_preserves_known_status_while_a_new_printer_checks(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        known = {"online": True, "state": "ready"}
+        dashboard._status_cache["http://known"] = known
+        printers = [
+            {"url": "http://known", "name": "Known"},
+            {"url": "http://new", "name": "New"},
+        ]
+
+        with mock.patch.object(
+            self.plugin,
+            "dashboard_printers",
+            return_value=printers,
+        ), mock.patch.object(
+            self.plugin,
+            "attach_outbox",
+            return_value=0,
+        ), mock.patch.object(
+            dashboard,
+            "_poll_and_push",
+        ):
+            dashboard._refresh_worker([], False)
+
+        payload = dashboard._post.call_args.args[0]
+        self.assertEqual(payload["printers"][0]["status"], known)
+        self.assertEqual(payload["printers"][1]["status"]["state"], "checking")
+
+    def test_poll_batch_does_not_block_the_action_worker(self):
+        source = inspect.getsource(self.plugin.PrintersDashboard._poll_and_push)
+        self.assertNotIn(".wait(", source)
+        completed = []
+        batch = self.plugin.PollBatch(2, lambda: completed.append(True))
+        batch.finish_one()
+        self.assertEqual(completed, [])
+        batch.finish_one()
+        self.assertEqual(completed, [True])
+
+    def test_busy_main_print_action_is_disabled_and_controls_keep_their_slot(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn("var printAttrs = selectable", source)
+        self.assertIn("Printer is busy", source)
+        self.assertIn('class="tile-actions"><div class="ctl-row">', source)
+        self.assertIn('class="ctl-slot"', source)
+        self.assertIn("class=\"ctl spacer\"", source)
+
+    def test_mass_print_rechecks_busy_state_before_send(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        printer = {
+            "name": "Busy",
+            "url": "http://printer",
+            "type": "moonraker",
+        }
+        message = {
+            "dataB64": "RzI4",
+            "filename": "job.gcode",
+            "urls": ["http://printer"],
+            "start": True,
+        }
+
+        with mock.patch.object(
+            self.plugin,
+            "dashboard_printers",
+            return_value=[printer],
+        ), mock.patch.object(
+            self.plugin,
+            "poll_printer",
+            return_value={"online": True, "state": "printing"},
+        ), mock.patch.object(
+            self.plugin,
+            "send_gcode",
+        ) as send, mock.patch.object(
+            dashboard,
+            "_refresh_worker",
+        ):
+            dashboard._do_mass_print(message)
+
+        send.assert_not_called()
+        status_payload = dashboard._post.call_args.args[0]
+        self.assertIn("printer is busy", status_payload["status"])
 
 
 if __name__ == "__main__":
