@@ -12,6 +12,7 @@ from unittest import mock
 
 
 PLUGIN_PATH = pathlib.Path(__file__).with_name("printers_plugin.py")
+BUILD_PATH = pathlib.Path(__file__).with_name("build_package.py")
 
 
 class _ExecutionResult:
@@ -120,6 +121,26 @@ class PrintersOutboxTest(unittest.TestCase):
         self.assertEqual(match.group(1), self.plugin.PLUGIN_VERSION)
         self.assertIn('# name = "Print Farm"', source)
         self.assertEqual(self.plugin.PrintersDashboard().get_name(), "Print Farm")
+
+    def test_package_builder_stages_source_and_icon(self):
+        spec = importlib.util.spec_from_file_location("printers_build_under_test", BUILD_PATH)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+
+        with tempfile.TemporaryDirectory() as temp:
+            package = builder.build(pathlib.Path(temp), wheel=False)
+
+            self.assertEqual(package.name, "printers-0.0.4")
+            self.assertEqual(
+                (package / "printers_plugin.py").read_bytes(),
+                PLUGIN_PATH.read_bytes(),
+            )
+            self.assertEqual(
+                (package / "printers.svg").read_bytes(),
+                PLUGIN_PATH.with_name("printers.svg").read_bytes(),
+            )
 
 
 class PluginStorageTest(unittest.TestCase):

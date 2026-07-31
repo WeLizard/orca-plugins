@@ -5,6 +5,9 @@ import ast
 import hashlib
 import json
 import re
+import shutil
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -53,7 +56,24 @@ def extract_runtime_version(source: str) -> str:
     raise ValueError("PLUGIN_VERSION constant is missing")
 
 
-def build(output_root: Path) -> Path:
+def _build_wheel(source_bytes: bytes, version: str, output_root: Path) -> Path:
+    build_dir = output_root / "wheel-build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True)
+    (build_dir / "printers_plugin.py").write_bytes(source_bytes)
+    shutil.copy2(ROOT / "pyproject.toml", build_dir / "pyproject.toml")
+    wheels_out = output_root / "wheels"
+    wheels_out.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheels_out)],
+        cwd=build_dir,
+        check=True,
+    )
+    return wheels_out / f"printers-{version}-py3-none-any.whl"
+
+
+def build(output_root: Path, wheel: bool = True) -> Path:
     source_bytes = SOURCE.read_bytes()
     source = source_bytes.decode("utf-8")
     ast.parse(source, filename=str(SOURCE))
@@ -96,6 +116,12 @@ def build(output_root: Path) -> Path:
         encoding="utf-8",
         newline="\n",
     )
+    icon = ROOT / "printers.svg"
+    if icon.is_file():
+        shutil.copy2(icon, package_dir / icon.name)
+    if wheel:
+        wheel_path = _build_wheel(source_bytes, version, output_root)
+        print(wheel_path)
     return package_dir
 
 
@@ -107,8 +133,13 @@ def main() -> int:
         default=ROOT / "dist",
         help="Output root (default: plugins/printers/dist)",
     )
+    parser.add_argument(
+        "--no-wheel",
+        action="store_true",
+        help="Only stage the package; skip building the wheel",
+    )
     args = parser.parse_args()
-    package_dir = build(args.output.resolve())
+    package_dir = build(args.output.resolve(), wheel=not args.no_wheel)
     print(package_dir)
     return 0
 
