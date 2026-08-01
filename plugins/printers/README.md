@@ -48,5 +48,7 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
 
 ## Files
 
-- `printers_plugin.py` — the plugin (PEP 723, single file, zero deps).
+- `printers_plugin.py` — the dependency-free plugin runtime.
+- `printers_locales/` — bundled interface translations with English fallback.
 - `printers.svg` — tab icon (drop one in; absent → host default icon).
+- `validate_locales.py` / `TRANSLATING.md` — catalog validation and community workflow.

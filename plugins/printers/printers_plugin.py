@@ -176,6 +176,134 @@ def post_window(window, payload):
 # drift.
 PLUGIN_VERSION = "0.0.4"
 
+ORCA_UI_LOCALES = (
+    "ca", "cs", "de", "en", "es", "eu", "fr", "hu", "it", "ja", "ko",
+    "lt", "nl", "pl", "pt_BR", "ru", "sv", "th", "tr", "uk", "vi",
+    "zh_CN", "zh_TW",
+)
+_CANONICAL_UI_LOCALES = {locale.lower(): locale for locale in ORCA_UI_LOCALES}
+_UI_LOCALE_ALIASES = {
+    "zh": "zh_CN",
+    "zh_hans": "zh_CN",
+    "zh_hans_cn": "zh_CN",
+    "zh_hant": "zh_TW",
+    "zh_hant_tw": "zh_TW",
+}
+_LOCALE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "printers_locales",
+)
+
+
+def normalize_ui_language(language):
+    if not language:
+        return ""
+    token = str(language).strip().replace("-", "_")
+    lowered = token.lower()
+    alias = _UI_LOCALE_ALIASES.get(lowered)
+    if alias:
+        return alias
+    exact = _CANONICAL_UI_LOCALES.get(lowered)
+    if exact:
+        return exact
+    base = lowered.split("_", 1)[0]
+    return _CANONICAL_UI_LOCALES.get(base, "en")
+
+
+def host_ui_language():
+    app_language = getattr(getattr(orca, "host", None), "app_language", None)
+    if not callable(app_language):
+        return ""
+    try:
+        return normalize_ui_language(app_language())
+    except (AttributeError, RuntimeError):
+        return ""
+
+
+def load_ui_catalogs(directory=None):
+    root = directory or _LOCALE_DIR
+    catalogs = {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        locale = name[:-5]
+        if locale not in ORCA_UI_LOCALES:
+            continue
+        try:
+            with open(os.path.join(root, name), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in data.items()
+        ):
+            continue
+        catalogs[locale] = data
+    catalogs.setdefault("en", {})
+    return catalogs
+
+
+UI_COPY = load_ui_catalogs()
+_CACHED_UI_LANGUAGE = ""
+
+
+def resolved_ui_catalog(language):
+    locale = normalize_ui_language(language) or "en"
+    resolved = dict(UI_COPY.get("en", {}))
+    base = locale.split("_", 1)[0]
+    if base != "en":
+        resolved.update(UI_COPY.get(base, {}))
+    if locale not in {"en", base}:
+        resolved.update(UI_COPY.get(locale, {}))
+    return resolved
+
+
+def refresh_ui_language():
+    global _CACHED_UI_LANGUAGE
+    language = host_ui_language()
+    if language:
+        _CACHED_UI_LANGUAGE = language
+    return language
+
+
+def ui_text(key, **values):
+    template = resolved_ui_catalog(_CACHED_UI_LANGUAGE or "en").get(key, key)
+    return template.format(**values)
+
+
+def ui_state(value):
+    key = {
+        "online": "stateOnline",
+        "offline": "stateOffline",
+        "checking": "stateChecking",
+        "not available yet": "stateUnavailable",
+        "idle": "stateIdle",
+        "standby": "stateStandby",
+        "printing": "statePrinting",
+        "running": "statePrinting",
+        "paused": "statePaused",
+        "complete": "stateComplete",
+        "completed": "stateComplete",
+        "error": "stateError",
+    }.get(str(value or "").lower())
+    return ui_text(key) if key else str(value or "")
+
+
+def operation_error(key, **values):
+    return {"ok": False, "error_key": key, "error_values": values}
+
+
+def operation_error_text(result):
+    key = (result or {}).get("error_key")
+    if key:
+        return ui_text(key, **((result or {}).get("error_values") or {}))
+    return (result or {}).get("error") or ui_text("genericError")
+
 BAMBU_MQTT_PORT = 8883
 
 def resolve_plugin_dir():
@@ -873,13 +1001,13 @@ def bambu_send(printer, filename, file_bytes, start, use_ams):
     host = urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname or ""
     code = (printer.get("access_code") or printer.get("apikey") or "").strip()
     if not host:
-        return {"ok": False, "error": "no address"}
+        return operation_error("errorNoAddress")
     if not code:
-        return {"ok": False, "error": "needs access code"}
+        return operation_error("errorNeedsAccessCode")
     try:
         remote_path = bambu_upload(host, code, filename, file_bytes)
     except Exception as exc:
-        return {"ok": False, "error": "upload: %s" % exc}
+        return operation_error("errorUpload", error=exc)
     if not start:
         return {"ok": True}
     serial = (printer.get("serial") or "").strip()
@@ -889,10 +1017,10 @@ def bambu_send(printer, filename, file_bytes, start, use_ams):
         if serial:
             persist_discovered_serial(printer)
     if not serial:
-        return {"ok": False, "error": "uploaded, but the serial is still unknown — start it from the printer"}
+        return operation_error("errorUnknownSerial")
     err = bambu_start_print(host, code, serial, remote_path, use_ams)
     if err:
-        return {"ok": False, "error": "print command: %s" % err}
+        return operation_error("errorPrintCommand", error=err)
     return {"ok": True}
 
 
@@ -1137,18 +1265,21 @@ class PrintersOutbox(orca.slicing.SlicingPipelineCapabilityBase):
         if post is None:
             post = getattr(orca.slicing, "psGCodePostProcess", None)
         if step is not None and post is not None and step != post:
-            return orca.ExecutionResult.skipped("Not the G-code post-process step")
+            return orca.ExecutionResult.skipped(ui_text("outboxWrongStep"))
         path = getattr(ctx, "gcode_path", "") or ""
         if not path or not os.path.exists(path):
-            return orca.ExecutionResult.skipped("G-code file not ready")
+            return orca.ExecutionResult.skipped(ui_text("outboxNotReady"))
         try:
             record = outbox_add(path, getattr(ctx, "output_name", "") or "",
                                 getattr(ctx, "host", "") or "")
         except Exception as exc:
             return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError,
-                                                "Outbox copy failed: %s" % exc)
-        return orca.ExecutionResult.success("Queued %s for %s" % (
-            record["name"], record.get("printer_settings_id") or "unknown printer"))
+                                                "%s: %s" % (ui_text("outboxWriteFailed"), exc))
+        return orca.ExecutionResult.success(ui_text(
+            "outboxQueued",
+            name=record["name"],
+            target=record.get("printer_settings_id") or ui_text("other"),
+        ))
 
 
 def _poll_backend(kind, printer, base, ctx):
@@ -1230,7 +1361,7 @@ def printer_command(printer, action):
     """Pause/resume/cancel the current print on whichever backend the printer
     speaks. Returns {ok} or {ok: False, error}."""
     if action not in _BAMBU_CONTROL:
-        return {"ok": False, "error": "unknown action"}
+        return operation_error("errorUnknownAction")
     base = normalize_url(printer.get("url"))
     ctx = ssl_ctx_for(printer)
     kind = backend_for_type(printer.get("type") or "moonraker")
@@ -1249,13 +1380,13 @@ def printer_command(printer, action):
             code = (printer.get("access_code") or printer.get("apikey") or "").strip()
             serial = (printer.get("serial") or "").strip()
             if not host or not code or not serial:
-                return {"ok": False, "error": "needs IP, access code and serial"}
+                return operation_error("errorNeedsBambuCredentials")
             err = _bambu_publish(host, code, "device/%s/request" % serial,
                                  {"print": {"sequence_id": "0", "command": _BAMBU_CONTROL[action]}})
             if err:
                 return {"ok": False, "error": err}
         else:
-            return {"ok": False, "error": "unsupported backend"}
+            return operation_error("errorUnsupportedBackend")
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -1278,7 +1409,7 @@ def send_gcode(printer, filename, file_bytes, start, use_ams=True):
         elif kind == "bambu":
             return bambu_send(printer, filename, file_bytes, start, use_ams)
         else:
-            return {"ok": False, "error": "unsupported backend"}
+            return operation_error("errorUnsupportedBackend")
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -1351,7 +1482,7 @@ PAGE = r"""<!DOCTYPE html>
 </style></head>
 <body>
   <div id="bar">
-    <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> all</label>
+    <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> <span id="sel-all-text">all</span></label>
     <span id="status"></span>
     <button id="send" class="ghost" disabled>Send G-code to selected…</button>
     <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
@@ -1376,7 +1507,7 @@ PAGE = r"""<!DOCTYPE html>
     <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
     <input id="f-access" placeholder="Access code" size="10" style="display:none">
     <label id="f-insecure-l" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this." style="font-size:11px;display:flex;align-items:center;gap:4px">
-      <input id="f-insecure" type="checkbox"> self-signed</label>
+      <input id="f-insecure" type="checkbox"> <span id="f-insecure-text">self-signed</span></label>
     <button id="add">Add</button>
     <button id="refresh" class="ghost">Refresh</button>
     <input id="file" type="file" accept=".gcode,.gco,.g,.gz,.3mf" style="display:none">
@@ -1385,12 +1516,12 @@ PAGE = r"""<!DOCTYPE html>
        align-items:center;justify-content:center;z-index:20">
     <div style="background:var(--orca-bg,#1e1e2e);border:1px solid var(--orca-border,#3c3c4c);
          border-radius:10px;padding:18px;max-width:420px;width:90%">
-      <div style="font-weight:600;margin-bottom:8px">Start print on multiple printers?</div>
+      <div id="confirm-title" style="font-weight:600;margin-bottom:8px">Start print on multiple printers?</div>
       <div id="confirm-body" style="font-size:12px;color:var(--orca-muted,#a0a0a0);margin-bottom:12px"></div>
       <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:12px">
-        <input id="confirm-start" type="checkbox" checked> Start printing immediately after upload</label>
+        <input id="confirm-start" type="checkbox" checked> <span id="confirm-start-text">Start printing immediately after upload</span></label>
       <label id="confirm-ams-l" style="display:none;align-items:center;gap:6px;font-size:12px;margin-bottom:12px">
-        <input id="confirm-ams" type="checkbox" checked> Use AMS (Bambu)</label>
+        <input id="confirm-ams" type="checkbox" checked> <span id="confirm-ams-text">Use AMS (Bambu)</span></label>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button id="confirm-cancel" class="ghost">Cancel</button>
         <button id="confirm-ok">Send</button>
@@ -1400,6 +1531,63 @@ PAGE = r"""<!DOCTYPE html>
   <div id="grid"><div class="empty">Loading…</div></div>
 <script>
 'use strict';
+var UI_COPY = __UI_COPY__;
+var hostLanguage = '__HOST_UI_LANGUAGE__';
+function normalizeUiLocale(value) {
+  var token = String(value || '').replace(/-/g, '_');
+  var lowered = token.toLowerCase();
+  var aliases = { zh: 'zh_CN', zh_hans: 'zh_CN', zh_hans_cn: 'zh_CN',
+                  zh_hant: 'zh_TW', zh_hant_tw: 'zh_TW' };
+  if (aliases[lowered]) return aliases[lowered];
+  var exact = Object.keys(UI_COPY).find(function(key) {
+    return key.toLowerCase() === lowered;
+  });
+  if (exact) return exact;
+  var base = lowered.split('_', 1)[0];
+  return Object.prototype.hasOwnProperty.call(UI_COPY, base) ? base : 'en';
+}
+function resolveUiCopy(value) {
+  var locale = normalizeUiLocale(value);
+  var base = locale.split('_', 1)[0];
+  return Object.assign({}, UI_COPY.en || {}, UI_COPY[base] || {}, UI_COPY[locale] || {});
+}
+var uiLocale = normalizeUiLocale(hostLanguage || navigator.language || 'en');
+var uiCopy = resolveUiCopy(uiLocale);
+document.documentElement.lang = uiLocale;
+function t(key, values) {
+  var template = uiCopy[key] || (UI_COPY.en || {})[key] || key;
+  return template.replace(/\{([A-Za-z0-9_]+)\}/g, function(match, name) {
+    return values && Object.prototype.hasOwnProperty.call(values, name)
+      ? String(values[name]) : match;
+  });
+}
+function applyStaticCopy() {
+  function text(id, key) {
+    var node = document.getElementById(id); if (node) node.textContent = t(key);
+  }
+  function title(id, key) {
+    var node = document.getElementById(id); if (node) node.title = t(key);
+  }
+  text('sel-all-text', 'all'); title('sel-all-l', 'selectAllTitle');
+  text('send', 'sendSelected'); title('f-adopt', 'addConfiguredTitle');
+  document.getElementById('f-name').placeholder = t('namePlaceholder');
+  title('f-type', 'connectionTypeTitle');
+  document.getElementById('f-serial').placeholder = t('serialAuto');
+  title('f-serial', 'serialTitle');
+  document.getElementById('f-access').placeholder = t('accessCode');
+  text('f-insecure-text', 'selfSigned');
+  title('f-insecure-l', 'selfSignedTitle');
+  text('add', 'add'); text('refresh', 'refresh');
+  text('confirm-title', 'confirmTitle'); text('confirm-start-text', 'startImmediately');
+  text('confirm-ams-text', 'useAms'); text('confirm-cancel', 'cancel');
+  text('confirm-ok', 'send');
+  var empty = document.querySelector('#grid .empty'); if (empty) empty.textContent = t('loading');
+  Array.prototype.forEach.call(document.getElementById('f-type').options, function(option) {
+    if (!option.disabled) return;
+    option.textContent = option.textContent.split(' — ')[0] + ' — ' + t('comingLater');
+  });
+}
+applyStaticCopy();
 var grid = document.getElementById('grid');
 var sendBtn = document.getElementById('send');
 var fileInput = document.getElementById('file');
@@ -1417,7 +1605,7 @@ function typeLabel(t){
     mks:'MKS', flashair:'FlashAir', astrobox:'AstroBox', esp3d:'ESP3D',
     crealityprint:'Creality', flashforge:'FlashForge', simplyprint:'SimplyPrint',
     elegoolink:'Elegoo', '3dprinteros':'3DPrinterOS', obico:'Obico',
-    bambu:'Bambu Lab', generic:'Other' }[(t || '').toLowerCase()] || (t || 'Other');
+    bambu:'Bambu Lab', generic:t('other') }[(t || '').toLowerCase()] || (t || t('other'));
 }
 
 // Normalize backend state strings ("printing", "RUNNING", "Printing from SD"…)
@@ -1445,7 +1633,7 @@ function updateSendBtn(){
   var eligible = current.filter(printerSelectable);
   var n = eligible.filter(function(p){ return selected[p.url]; }).length;
   sendBtn.disabled = n === 0;
-  sendBtn.textContent = n ? ('Send G-code to ' + n + ' selected…') : 'Send G-code to selected…';
+  sendBtn.textContent = n ? t('sendSelectedCount', {count:n}) : t('sendSelected');
   var all = document.getElementById('sel-all');
   all.disabled = eligible.length === 0;
   all.checked = eligible.length > 0 && eligible.every(function(p){ return selected[p.url]; });
@@ -1459,14 +1647,22 @@ document.getElementById('sel-all').addEventListener('change', function(e){
 function render(printers){
   current = printers;
   grid.innerHTML = '';
-  if (!printers.length){ grid.innerHTML = '<div class="empty">No printers found. Configure a printer host in OrcaSlicer, or add one above.</div>'; return; }
+  if (!printers.length){ grid.innerHTML = '<div class="empty">' + esc(t('noPrinters')) + '</div>'; return; }
   printers.forEach(function(p){
     var s = p.status || {};
     var supported = backendReady(p.type) && s.supported !== false;
     var dotClass = supported ? (s.online === true ? 'on' : (s.online === false ? 'off' : '')) : '';
-    var stateText = supported
+    var rawState = supported
       ? (s.state || (s.online === true ? 'online' : (s.online === false ? 'offline' : 'checking')))
       : 'not available yet';
+    var stateLabels = {
+      online:'stateOnline', offline:'stateOffline', checking:'stateChecking',
+      'not available yet':'stateUnavailable', idle:'stateIdle', standby:'stateStandby',
+      printing:'statePrinting', running:'statePrinting', paused:'statePaused',
+      complete:'stateComplete', completed:'stateComplete', error:'stateError'
+    };
+    var stateKey = stateLabels[String(rawState).toLowerCase()];
+    var stateText = stateKey ? t(stateKey) : rawState;
     var tile = document.createElement('div'); tile.className = 'tile';
     var prog = (s.progress == null) ? '' : '<div class="bar"><i style="width:' + s.progress + '%"></i></div>';
     var thumb = s.thumbnail ? '<img class="thumb show" src="' + s.thumbnail + '">' : '<div class="thumb"></div>';
@@ -1477,8 +1673,8 @@ function render(printers){
       '<span class="src">' + esc(typeLabel(p.type)) + '</span>' +
       '<span class="state">' + esc(stateText) + '</span></div>' +
       '<div class="body">' + thumb + '<div class="meta">' +
-      '<div class="temps"><span>Nozzle <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
-      '<span>Bed <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
+      '<div class="temps"><span>' + esc(t('nozzle')) + ' <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>' +
+      '<span>' + esc(t('bed')) + ' <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
       fname + prog + '</div></div>';
     var kind = stateKind(s);
     var busy = supported && s.online === true && (kind === 'printing' || kind === 'paused');
@@ -1486,26 +1682,26 @@ function render(printers){
     if (!selectable) selected[p.url] = false;
     var ctl = '<span class="ctl-slot">';
     if (s.online && kind === 'printing')
-      ctl += '<button class="ctl ghost" data-a="pause">Pause</button><button class="ctl danger" data-a="cancel">Stop</button>';
+      ctl += '<button class="ctl ghost" data-a="pause">' + esc(t('pause')) + '</button><button class="ctl danger" data-a="cancel">' + esc(t('stop')) + '</button>';
     else if (s.online && kind === 'paused')
-      ctl += '<button class="ctl ghost" data-a="resume">Resume</button><button class="ctl danger" data-a="cancel">Stop</button>';
+      ctl += '<button class="ctl ghost" data-a="resume">' + esc(t('resume')) + '</button><button class="ctl danger" data-a="cancel">' + esc(t('stop')) + '</button>';
     else
       ctl += '<button class="ctl spacer" disabled></button><button class="ctl spacer" disabled></button>';
     ctl += '</span>';
     var printDisabledReason = !supported
-      ? 'Printer integration is not available yet'
-      : (busy ? 'Printer is busy' : 'Printer is not online');
+      ? t('integrationUnavailable')
+      : (busy ? t('printerBusy') : t('printerNotOnline'));
     var printAttrs = selectable ? '' : ' disabled title="' + esc(printDisabledReason) + '"';
     tile.innerHTML +=
       '<div class="tile-actions"><div class="ctl-row">' + ctl + '</div>' +
       '<div class="row"><label><input type="checkbox" class="sel"' +
-      (selected[p.url] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> select</label>' +
-      '<button class="print ghost"' + printAttrs + '>Print…</button>' +
+      (selected[p.url] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> ' + esc(t('select')) + '</label>' +
+      '<button class="print ghost"' + printAttrs + '>' + esc(t('print')) + '</button>' +
       // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.
       (p.type === 'bambu'
         ? '<button class="open ghost spacer" disabled></button>'
-        : '<button class="open ghost">Open</button>') +
-      '<button class="remove ghost">Remove</button></div></div>';
+        : '<button class="open ghost">' + esc(t('open')) + '</button>') +
+      '<button class="remove ghost">' + esc(t('remove')) + '</button></div></div>';
     tile.querySelector('.sel').addEventListener('change', function(e){
       selected[p.url] = e.target.checked; updateSendBtn(); });
     // Stopping a print is destructive — the button arms on the first click and
@@ -1514,8 +1710,8 @@ function render(printers){
       btn.addEventListener('click', function(){
         var a = btn.getAttribute('data-a');
         if (a === 'cancel' && !btn._armed) {
-          btn._armed = true; btn.textContent = 'Sure?';
-          setTimeout(function(){ btn._armed = false; btn.textContent = 'Stop'; }, 3000);
+          btn._armed = true; btn.textContent = t('sure');
+          setTimeout(function(){ btn._armed = false; btn.textContent = t('stop'); }, 3000);
           return;
         }
         btn.disabled = true;
@@ -1538,16 +1734,16 @@ function render(printers){
         var row = document.createElement('div');
         row.className = 'qrow';
         var printBtn = !selectable
-          ? '<button class="qprint" disabled title="' + esc(printDisabledReason) + '">Print</button>'
-          : '<button class="qprint" title="Send to this printer and start printing">Print</button>';
+          ? '<button class="qprint" disabled title="' + esc(printDisabledReason) + '">' + esc(t('printShort')) + '</button>'
+          : '<button class="qprint" title="' + esc(t('sendToPrinterTitle')) + '">' + esc(t('printShort')) + '</button>';
         row.innerHTML = '<span class="qname" title="' + esc(r.name) + '">' + esc(r.name) + '</span>' +
-          printBtn + '<button class="qdrop ghost" title="Remove retained copy">&times;</button>';
+          printBtn + '<button class="qdrop ghost" title="' + esc(t('removeRetainedTitle')) + '">&times;</button>';
         var pb = row.querySelector('.qprint');
         if (selectable) {
           pb.addEventListener('click', function(){
             if (!pb._armed) {
-              pb._armed = true; pb.textContent = 'Sure?';
-              setTimeout(function(){ pb._armed = false; pb.textContent = 'Print'; }, 3000);
+              pb._armed = true; pb.textContent = t('sure');
+              setTimeout(function(){ pb._armed = false; pb.textContent = t('printShort'); }, 3000);
               return;
             }
             pb.disabled = true;
@@ -1580,7 +1776,7 @@ function syncTypeFields(){
   // SSDP discovery prefills it. The hidden input only carries those values.
   document.getElementById('f-access').style.display = bambu ? '' : 'none';
   document.getElementById('f-insecure-l').style.display = bambu ? 'none' : '';
-  document.getElementById('f-url').placeholder = bambu ? '192.168.0.42 (printer IP)' : '192.168.0.42';
+  document.getElementById('f-url').placeholder = bambu ? t('printerIpPlaceholder') : '192.168.0.42';
 }
 typeSel.addEventListener('change', syncTypeFields);
 syncTypeFields();
@@ -1623,10 +1819,10 @@ fileInput.addEventListener('change', function(){
   var hasBambu = targets.some(function(p){ return (p.type || '').toLowerCase() === 'bambu'; });
   // .3mf project files start only on Bambu; Moonraker/OctoPrint queue G-code.
   var warn = (/\.3mf$/i.test(file.name) && targets.some(function(p){ return (p.type || '').toLowerCase() !== 'bambu'; }))
-    ? '<br><span style="color:#c0504d">.3mf starts only on Bambu printers — the others expect G-code.</span>' : '';
+    ? '<br><span style="color:#c0504d">' + esc(t('file3mfWarning')) + '</span>' : '';
   document.getElementById('confirm-ams-l').style.display = hasBambu ? 'flex' : 'none';
   document.getElementById('confirm-body').innerHTML =
-    'Upload <b>' + esc(file.name) + '</b> to ' + urls.length + ' printer(s):<br>' + names.join(', ') + warn;
+    t('uploadToPrinters', {name:'<b>' + esc(file.name) + '</b>', count:urls.length}) + '<br>' + names.join(', ') + warn;
   document.getElementById('confirm').style.display = 'flex';
 });
 document.getElementById('confirm-cancel').addEventListener('click', function(){
@@ -1639,7 +1835,7 @@ document.getElementById('confirm-ok').addEventListener('click', function(){
   var reader = new FileReader();
   reader.onload = function(){
     var b64 = String(reader.result).split(',')[1] || '';
-    document.getElementById('status').textContent = 'Sending ' + file.name + ' to ' + urls.length + '…';
+    document.getElementById('status').textContent = t('sendingFile', {name:file.name, count:urls.length});
     orca.postMessage({ type:'mass-print', filename:file.name, dataB64:b64, urls:urls, start:start,
                        use_ams:document.getElementById('confirm-ams').checked });
   };
@@ -1654,12 +1850,12 @@ function renderAvailable(){
   var sel = document.getElementById('f-adopt');
   var items = lastAvailable.concat(lastDiscovered);
   if (!items.length){ sel.style.display = 'none'; sel.innerHTML = ''; return; }
-  var opts = '<option value="">Add a printer…</option>';
+  var opts = '<option value="">' + esc(t('addPrinter')) + '</option>';
   items.forEach(function(p, i){
-    var label = (p.source === 'network') ? (p.name + ' — found on network') : (p.name || p.url);
+    var label = (p.source === 'network') ? (p.name + ' — ' + t('foundOnNetwork')) : (p.name || p.url);
     var ready = backendReady(p.type);
     opts += '<option value="' + i + '"' + (ready ? '' : ' disabled') + '>' +
-      esc(label + (ready ? '' : ' — not available yet')) + '</option>';
+      esc(label + (ready ? '' : ' — ' + t('unavailableSuffix'))) + '</option>';
   });
   sel.innerHTML = opts;
   sel.style.display = '';
@@ -1698,7 +1894,7 @@ orca.onMessage(function(data){
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
   if (data.unmatched !== undefined)
     document.getElementById('status').textContent = data.unmatched
-      ? data.unmatched + ' queued file(s) match no printer on the dashboard'
+      ? t('unmatchedQueued', {count:data.unmatched})
       : '';
   if (data.status !== undefined) document.getElementById('status').textContent = data.status;
 });
@@ -1712,6 +1908,14 @@ setInterval(function(){
 </body>
 </html>
 """
+
+
+def render_page():
+    language = refresh_ui_language()
+    return PAGE.replace(
+        "__UI_COPY__",
+        json.dumps(UI_COPY, ensure_ascii=False).replace("</", "<\\/"),
+    ).replace("__HOST_UI_LANGUAGE__", language)
 
 
 # A plain full-window iframe of the printer's web UI — opened as its own host
@@ -1738,14 +1942,14 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         if self.win is not None and self.win.is_open():
             return False
         self.win = orca.host.ui.create_window(
-            title="Print Farm", html=PAGE, width=1000, height=700,
+            title="Print Farm", html=render_page(), width=1000, height=700,
             on_message=self.on_message, on_close=self.on_close,
         )
         return True
 
     def execute(self):
         self._open()
-        return orca.ExecutionResult.success("Print Farm dashboard opened.")
+        return orca.ExecutionResult.success(ui_text("dashboardOpened"))
 
     def on_close(self):
         self.win = None
@@ -1807,8 +2011,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             }
             if not backend_is_active(entry["type"]):
                 self._post_status(
-                    "%s support is planned but not available yet."
-                    % (entry["type"] or "This printer type")
+                    ui_text("supportPlanned", type=entry["type"] or ui_text("other"))
                 )
                 return
             ACTION_WORKER.submit(
@@ -1832,8 +2035,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 }
                 if not backend_is_active(entry["type"]):
                     self._post_status(
-                        "%s support is planned but not available yet."
-                        % (entry["type"] or "This printer type")
+                        ui_text("supportPlanned", type=entry["type"] or ui_text("other"))
                     )
                     return
                 ACTION_WORKER.submit(
@@ -2041,22 +2243,34 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             # normalized "state" field (Moonraker/OctoPrint/Bambu).
             live = poll_printer(printer) or {}
             if not live.get("online"):
-                self._post_status("%s: printer is not reachable — not started." % label)
+                self._post_status(ui_text("notReachableNotStarted", printer=label))
                 self._refresh_worker(None)
                 return
             if status_is_busy(live):
-                self._post_status("%s: printer is busy (%s) — not started." % (
-                    label, live.get("state") or "printing"))
+                self._post_status(ui_text(
+                    "busyNotStarted",
+                    printer=label,
+                    state=ui_state(live.get("state") or "printing"),
+                ))
                 self._refresh_worker(None)
                 return
         result = send_gcode(printer, record.get("name") or stored, file_bytes,
                             start=start, use_ams=bool(msg.get("use_ams", True)))
         if result.get("ok"):
             outbox_remove(stored)
-            done = "sent to print" if start else "uploaded (not started)"
-            self._post_status("%s: %s %s." % (label, record.get("name") or stored, done))
+            done = ui_text("sentToPrint" if start else "uploadedNotStarted")
+            self._post_status(ui_text(
+                "fileOperationDone",
+                printer=label,
+                name=record.get("name") or stored,
+                result=done,
+            ))
         else:
-            self._post_status("%s: send failed — %s" % (label, result.get("error") or "error"))
+            self._post_status(ui_text(
+                "sendFailed",
+                printer=label,
+                error=operation_error_text(result),
+            ))
         self._refresh_worker(None)
 
     def _do_printer_cmd(self, msg):
@@ -2068,10 +2282,18 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             return
         result = printer_command(printer, action)
         label = printer.get("name") or target
+        action_label = ui_text({"pause": "pause", "resume": "resume", "cancel": "stop"}.get(
+            action, "genericError"
+        ))
         if result.get("ok"):
-            self._post_status("%s: %s sent." % (label, action))
+            self._post_status(ui_text("commandSent", printer=label, action=action_label))
         else:
-            self._post_status("%s: %s failed — %s" % (label, action, result.get("error") or "error"))
+            self._post_status(ui_text(
+                "commandFailed",
+                printer=label,
+                action=action_label,
+                error=operation_error_text(result),
+            ))
         self._poll_and_push(printers)
 
     def _do_mass_print(self, msg):
@@ -2079,7 +2301,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         try:
             file_bytes = base64.b64decode(msg.get("dataB64") or "")
         except Exception:
-            self._post_status("Send failed: could not read the file.")
+            self._post_status(ui_text("fileReadFailed"))
             return
         filename = msg.get("filename") or "print.gcode"
         start = bool(msg.get("start"))
@@ -2092,14 +2314,16 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 live = poll_printer(p) or {}
                 if not live.get("online"):
                     fail += 1
-                    errors.append("%s: printer is not reachable" % (
-                        p.get("name") or p.get("url")))
+                    errors.append(ui_text(
+                        "notReachable", printer=p.get("name") or p.get("url")
+                    ))
                     continue
                 if status_is_busy(live):
                     fail += 1
-                    errors.append("%s: printer is busy (%s)" % (
-                        p.get("name") or p.get("url"),
-                        live.get("state") or "printing",
+                    errors.append(ui_text(
+                        "busy",
+                        printer=p.get("name") or p.get("url"),
+                        state=ui_state(live.get("state") or "printing"),
                     ))
                     continue
             result = send_gcode(p, filename, file_bytes, start, use_ams)
@@ -2107,8 +2331,11 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 ok += 1
             else:
                 fail += 1
-                errors.append("%s: %s" % (p.get("name") or p.get("url"), result.get("error") or "failed"))
-        text = "Sent to %d printer(s)%s." % (ok, (", %d failed" % fail) if fail else "")
+                errors.append("%s: %s" % (
+                    p.get("name") or p.get("url"), operation_error_text(result)
+                ))
+        failed_text = ui_text("massFailed", count=fail) if fail else ""
+        text = ui_text("massResult", count=ok, failed=failed_text)
         if errors:
             text += " " + "; ".join(errors[:3])
         self._post_status(text)
@@ -2121,6 +2348,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
 @orca.plugin
 class PrintersPlugin(orca.base):
     def register_capabilities(self):
+        refresh_ui_language()
         configure_plugin_storage()
         orca.register_capability(PrintersDashboard)
         orca.register_capability(PrintersOutbox)

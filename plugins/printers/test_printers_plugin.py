@@ -1,5 +1,6 @@
 import importlib.util
 import inspect
+import json
 import pathlib
 import re
 import sys
@@ -13,6 +14,7 @@ from unittest import mock
 
 PLUGIN_PATH = pathlib.Path(__file__).with_name("printers_plugin.py")
 BUILD_PATH = pathlib.Path(__file__).with_name("build_package.py")
+LOCALE_VALIDATOR_PATH = pathlib.Path(__file__).with_name("validate_locales.py")
 
 
 class _ExecutionResult:
@@ -141,6 +143,14 @@ class PrintersOutboxTest(unittest.TestCase):
                 (package / "printers.svg").read_bytes(),
                 PLUGIN_PATH.with_name("printers.svg").read_bytes(),
             )
+            self.assertEqual(
+                {path.name for path in (package / "printers_locales").glob("*.json")},
+                {"en.json", "ru.json", "zh_CN.json", "zh_TW.json"},
+            )
+            metadata = json.loads(
+                (package / "package-metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["locales"], ["en", "ru", "zh_CN", "zh_TW"])
 
 
 class PluginStorageTest(unittest.TestCase):
@@ -371,7 +381,10 @@ class PluginStorageTest(unittest.TestCase):
             '<option value="duet" disabled>Duet — coming later</option>',
             source,
         )
-        self.assertIn("Printer integration is not available yet", source)
+        self.assertEqual(
+            self.plugin.UI_COPY["en"]["integrationUnavailable"],
+            "Printer integration is not available yet",
+        )
 
     def test_refresh_preserves_known_status_while_a_new_printer_checks(self):
         dashboard = self.plugin.PrintersDashboard()
@@ -414,10 +427,58 @@ class PluginStorageTest(unittest.TestCase):
     def test_busy_main_print_action_is_disabled_and_controls_keep_their_slot(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
         self.assertIn("var printAttrs = selectable", source)
-        self.assertIn("Printer is busy", source)
+        self.assertIn("t('printerBusy')", source)
         self.assertIn('class="tile-actions"><div class="ctl-row">', source)
         self.assertIn('class="ctl-slot"', source)
         self.assertIn("class=\"ctl spacer\"", source)
+
+    def test_orca_language_drives_page_and_native_messages(self):
+        with mock.patch.object(
+            self.plugin.orca.host,
+            "app_language",
+            return_value="ru_RU",
+            create=True,
+        ):
+            rendered = self.plugin.render_page()
+
+        self.assertIn("var hostLanguage = 'ru';", rendered)
+        self.assertIn("Отправить G-code на выбранные", rendered)
+        self.assertEqual(
+            self.plugin.ui_text("dashboardOpened"),
+            "Панель Print Farm открыта.",
+        )
+
+    def test_all_orca_locales_are_preserved_with_per_key_english_fallback(self):
+        for locale in self.plugin.ORCA_UI_LOCALES:
+            self.assertEqual(self.plugin.normalize_ui_language(locale), locale)
+
+        original = self.plugin.UI_COPY
+        try:
+            self.plugin.UI_COPY = {
+                "en": {"shared": "English", "englishOnly": "Fallback"},
+                "de": {"shared": "Deutsch"},
+            }
+            self.assertEqual(
+                self.plugin.resolved_ui_catalog("de_DE"),
+                {"shared": "Deutsch", "englishOnly": "Fallback"},
+            )
+            self.assertEqual(
+                self.plugin.resolved_ui_catalog("pt_BR"),
+                {"shared": "English", "englishOnly": "Fallback"},
+            )
+        finally:
+            self.plugin.UI_COPY = original
+
+    def test_bundled_locale_catalogs_are_valid(self):
+        spec = importlib.util.spec_from_file_location(
+            "printers_locale_validator_test", LOCALE_VALIDATOR_PATH
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+
+        self.assertEqual(validator.validate_catalogs(), [])
 
     def test_mass_print_rechecks_busy_state_before_send(self):
         dashboard = self.plugin.PrintersDashboard()

@@ -11,6 +11,10 @@ authors = [{ name = "FilamentHub" }]
 
 [tool.setuptools]
 py-modules = ["printers_plugin"]
+packages = ["printers_locales"]
+
+[tool.setuptools.package-data]
+printers_locales = ["*.json"]
 
 # Single source of truth: the PLUGIN_VERSION constant in the module. The wheel
 # derives from it (no hand-copied number); build_package.py validates that the

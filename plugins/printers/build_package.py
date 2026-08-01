@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / "printers_plugin.py"
+LOCALES = ROOT / "printers_locales"
 
 
 def extract_metadata(source: str) -> dict[str, object]:
@@ -63,6 +64,7 @@ def _build_wheel(source_bytes: bytes, version: str, output_root: Path) -> Path:
     build_dir.mkdir(parents=True)
     (build_dir / "printers_plugin.py").write_bytes(source_bytes)
     shutil.copy2(ROOT / "pyproject.toml", build_dir / "pyproject.toml")
+    shutil.copytree(LOCALES, build_dir / LOCALES.name)
     wheels_out = output_root / "wheels"
     wheels_out.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -90,10 +92,20 @@ def build(output_root: Path, wheel: bool = True) -> Path:
     package_dir.mkdir(parents=True, exist_ok=True)
     package_path = package_dir / "printers_plugin.py"
     package_path.write_bytes(source_bytes)
+    package_locales = package_dir / LOCALES.name
+    if package_locales.exists():
+        shutil.rmtree(package_locales)
+    shutil.copytree(LOCALES, package_locales)
 
     digest = hashlib.sha256(source_bytes).hexdigest()
+    checksum_lines = [f"{digest}  printers_plugin.py"]
+    for locale_path in sorted(package_locales.glob("*.json")):
+        locale_digest = hashlib.sha256(locale_path.read_bytes()).hexdigest()
+        checksum_lines.append(
+            f"{locale_digest}  {LOCALES.name}/{locale_path.name}"
+        )
     (package_dir / "SHA256SUMS").write_text(
-        f"{digest}  printers_plugin.py\n", encoding="utf-8", newline="\n"
+        "\n".join(checksum_lines) + "\n", encoding="utf-8", newline="\n"
     )
     (package_dir / "package-metadata.json").write_text(
         json.dumps(
@@ -108,6 +120,7 @@ def build(output_root: Path, wheel: bool = True) -> Path:
                 "dependencies": metadata.get("dependencies"),
                 "entry_file": package_path.name,
                 "sha256": digest,
+                "locales": sorted(path.stem for path in package_locales.glob("*.json")),
             },
             ensure_ascii=False,
             indent=2,
