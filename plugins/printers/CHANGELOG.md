@@ -3,7 +3,7 @@
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
 ## 0.0.4
-- Renamed the plugin to Print Farm and made add, remove, refresh and printer polling update independently without stale or returning tiles.
+- Made add, remove, refresh and printer polling update independently without stale or returning tiles.
 - Moonraker, OctoPrint and Bambu Lab now use complete status/control/upload backends; unfinished host types remain visible but disabled instead of pretending to work.
 - Uses OrcaSlicer's private plugin storage when available, reuses bounded background workers and avoids temporary upload files that trigger extra permission requests.
 
