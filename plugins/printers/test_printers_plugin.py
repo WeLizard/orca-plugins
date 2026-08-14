@@ -152,6 +152,19 @@ class PrintersOutboxTest(unittest.TestCase):
             )
             self.assertEqual(metadata["locales"], ["en", "ru", "zh_CN", "zh_TW"])
 
+    def test_release_notes_use_only_current_changelog_section(self):
+        spec = importlib.util.spec_from_file_location("printers_build_under_test", BUILD_PATH)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+
+        notes = builder.render_release_notes("0.0.4")
+
+        self.assertIn("## Print Farm 0.0.4", notes)
+        self.assertIn("Made add, remove, refresh", notes)
+        self.assertNotIn("Bambu printers are now discovered", notes)
+
 
 class PluginStorageTest(unittest.TestCase):
     @classmethod

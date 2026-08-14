@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / "printers_plugin.py"
 LOCALES = ROOT / "printers_locales"
+CHANGELOG = ROOT / "CHANGELOG.md"
 
 
 def extract_metadata(source: str) -> dict[str, object]:
@@ -55,6 +56,37 @@ def extract_runtime_version(source: str) -> str:
                 if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                     return node.value.value
     raise ValueError("PLUGIN_VERSION constant is missing")
+
+
+def extract_changelog_section(version: str) -> str:
+    lines = CHANGELOG.read_text(encoding="utf-8").splitlines()
+    headings = [
+        (index, match.group("version"))
+        for index, line in enumerate(lines)
+        if (match := re.fullmatch(r"## (?P<version>\d+\.\d+\.\d+)", line.strip()))
+    ]
+    if not headings:
+        raise ValueError("No numeric release sections found in CHANGELOG.md")
+    if headings[0][1] != version:
+        raise ValueError(
+            f"Top CHANGELOG.md section is {headings[0][1]}, expected {version}"
+        )
+
+    start = headings[0][0] + 1
+    end = headings[1][0] if len(headings) > 1 else len(lines)
+    body = "\n".join(lines[start:end]).strip()
+    if not body:
+        raise ValueError(f"CHANGELOG.md section {version} is empty")
+    return body
+
+
+def render_release_notes(version: str) -> str:
+    notes = extract_changelog_section(version)
+    return (
+        f"## Print Farm {version}\n\n"
+        f"{notes}\n\n"
+        "Package checksums are available in `SHA256SUMS`.\n"
+    )
 
 
 def _build_wheel(source_bytes: bytes, version: str, output_root: Path) -> Path:
@@ -151,8 +183,21 @@ def main() -> int:
         action="store_true",
         help="Only stage the package; skip building the wheel",
     )
+    parser.add_argument(
+        "--release-notes",
+        type=Path,
+        help="Write GitHub release notes from the current changelog section",
+    )
     args = parser.parse_args()
     package_dir = build(args.output.resolve(), wheel=not args.no_wheel)
+    if args.release_notes is not None:
+        source = SOURCE.read_text(encoding="utf-8")
+        version = extract_runtime_version(source)
+        notes_path = args.release_notes.resolve()
+        notes_path.parent.mkdir(parents=True, exist_ok=True)
+        notes_path.write_text(
+            render_release_notes(version), encoding="utf-8", newline="\n"
+        )
     print(package_dir)
     return 0
 
