@@ -3,16 +3,17 @@ name: Release Print Farm
 on:
   push:
     tags:
-      - 'printers-v*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag (for example: printers-v0.0.4)'
+        description: 'Existing semantic-version tag (for example: v0.0.4)'
         required: true
         type: string
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: release-printers-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -64,7 +65,7 @@ jobs:
           if re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
               raise SystemExit(f"Invalid Plugin Hub version: {version}")
 
-          expected_tag = f"printers-v{version}"
+          expected_tag = f"v{version}"
           actual_tag = os.environ["RELEASE_TAG"]
           if actual_tag != expected_tag:
               raise SystemExit(
@@ -103,7 +104,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Print Farm ${RELEASE_TAG#printers-v}" \
+              --title "Print Farm ${RELEASE_TAG#v}" \
               --notes-file "$RUNNER_TEMP/release/RELEASE_NOTES.md" \
               --draft
           fi
@@ -125,3 +126,11 @@ jobs:
           gh release edit "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false
+
+      - name: Start OrcaCloud trusted publishing
+        if: github.event_name == 'push'
+        run: >-
+          gh workflow run publish-orcacloud.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref main
+          -f tag="$RELEASE_TAG"
