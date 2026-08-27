@@ -328,6 +328,78 @@ class PluginStorageTest(unittest.TestCase):
                 '[{"id":7}]',
             )
 
+    def test_single_file_install_materializes_the_tab_icon(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            missing = root / "not-packaged.svg"
+            with mock.patch.object(self.plugin, "PACKAGED_ICON_PATH", str(missing)), \
+                 mock.patch.object(self.plugin, "ICON_PATH", str(missing)), \
+                 mock.patch.object(self.plugin, "PLUGIN_STORAGE_DIR", str(root)):
+                icon = self.plugin.ensure_icon()
+
+            self.assertEqual(icon, str(root / "printers.svg"))
+            self.assertEqual((root / "printers.svg").read_bytes(), self.plugin._ICON_SVG)
+
+    def test_repeated_orca_picker_choice_upserts_one_printer(self):
+        dashboard = self.plugin.PrintersDashboard()
+        with tempfile.TemporaryDirectory() as temp:
+            store = pathlib.Path(temp) / "printers.json"
+            with mock.patch.object(self.plugin, "PRINTERS_FILE", str(store)):
+                first = dashboard._add_manual({
+                    "name": "Voron",
+                    "url": "192.168.0.122",
+                    "type": "moonraker",
+                    "source": "orca",
+                })
+                second = dashboard._add_manual({
+                    "name": "Voron renamed",
+                    "url": "http://192.168.0.122/",
+                    "type": "moonraker",
+                    "source": "orca",
+                })
+                stored = self.plugin.load_manual_printers()
+
+            self.assertEqual(first["id"], second["id"])
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0]["name"], "Voron renamed")
+
+    def test_legacy_duplicate_picker_records_collapse_on_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = pathlib.Path(temp) / "printers.json"
+            store.write_text(json.dumps([
+                {"id": 1, "name": "First", "url": "http://printer"},
+                {"id": 2, "name": "Latest", "url": "http://printer/"},
+            ]), encoding="utf-8")
+            with mock.patch.object(self.plugin, "PRINTERS_FILE", str(store)):
+                stored = self.plugin.load_manual_printers()
+
+            self.assertEqual(stored, [{
+                "id": 1,
+                "name": "Latest",
+                "url": "http://printer",
+            }])
+
+    def test_picker_waits_for_python_acknowledgement(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn("function typeLabel(value){", source)
+        self.assertNotIn("function typeLabel(t){", source)
+        self.assertIn("pendingAdoptUrl = p.url || '';", source)
+        self.assertIn("e.target.disabled = true;", source)
+        self.assertIn("if (data.adoptResult)", source)
+        self.assertIn("activeUrls[normalizedPrinterUrl(p.url)]", source)
+        self.assertIn("var pendingFormAdd = false;", source)
+
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        entry = {"name": "Voron", "url": "http://printer", "type": "moonraker"}
+        with mock.patch.object(dashboard, "_add_manual", return_value=dict(entry, id=1)), \
+             mock.patch.object(dashboard, "_refresh_worker"):
+            dashboard._add_and_refresh(entry, [])
+
+        dashboard._post.assert_called_once_with({
+            "adoptResult": {"url": "http://printer", "ok": True},
+        })
+
     def test_plugin_does_not_forge_host_owned_process_manifest_refs(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
         self.assertNotIn("OUTBOX_REF", source)

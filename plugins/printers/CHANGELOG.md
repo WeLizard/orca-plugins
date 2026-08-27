@@ -6,6 +6,7 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
 ## 0.0.5
 - Fixed Print Farm wheel installation and startup on Windows builds of OrcaSlicer.
+- Fixed dashboard rendering and printer selection so saved Voron/Bambu devices appear immediately, repeated choices do not create duplicates, and the native tab always has its Print Farm icon.
 - Added bounded local print history for each printer, covering jobs started by Print Farm and jobs observed while the dashboard is open.
 - Added complete interface translations for every current OrcaSlicer language; printer protocols and raw diagnostics remain in English.
 - Added a native OrcaSlicer plugin tab while keeping the dashboard available on supported older builds.

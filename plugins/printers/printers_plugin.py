@@ -453,13 +453,46 @@ PLUGIN_DIR = resolve_plugin_dir()
 PLUGIN_STORAGE_DIR = PLUGIN_DIR
 PRINTERS_FILE = os.path.join(PLUGIN_DIR, "printers.json")
 PRINT_HISTORY_FILE = os.path.join(PLUGIN_DIR, "print_history.json")
-# Use the adjacent source/package icon when present. Cloud wheel and single-file
-# installs fall back to Orca's default icon rather than writing an asset on load.
 ICON_PATH = os.path.join(PLUGIN_DIR, "printers.svg")
+PACKAGED_ICON_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "printers.svg",
+)
+_ICON_SVG = b'''<?xml version="1.0" encoding="UTF-8"?><svg id="a" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"><line x1="4.5" y1="14.5" x2="10.5" y2="14.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><polyline points="8.5 10.5 7.5 11.5 6.5 10.5" style="fill:none; stroke:#fff; stroke-linecap:round; stroke-linejoin:round;"/><line x1="4.5" y1="9.5" x2="6" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><line x1="9.5" y1="9.5" x2="10.5" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><rect x="6.5" y="8.5" width="2" height="2" rx=".27" ry=".27" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><rect x="1.5" y="6.5" width="12" height="11" rx="1" ry="1" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><path d="M5.5,5v-1.5c0-.55.45-1,1-1h10c.55,0,1,.45,1,1v9c0,.55-.45,1-1,1h-1.5" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/></svg>'''
+
+
+def _temporary_path(path):
+    return "%s.tmp.%d.%d" % (path, os.getpid(), threading.get_ident())
+
+
+def write_bytes_atomic(path, payload):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temporary = _temporary_path(path)
+    try:
+        with open(temporary, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def ensure_icon():
-    return ICON_PATH if os.path.isfile(ICON_PATH) else ""
+    for candidate in (PACKAGED_ICON_PATH, ICON_PATH):
+        if os.path.isfile(candidate):
+            return candidate
+    target = os.path.join(PLUGIN_STORAGE_DIR, "printers.svg")
+    try:
+        write_bytes_atomic(target, _ICON_SVG)
+    except OSError:
+        return ""
+    return target if os.path.isfile(target) else ""
 
 
 def fallback_plugin_storage_dir():
@@ -572,7 +605,31 @@ def load_manual_printers():
     try:
         with open(PRINTERS_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        # A picker action is an upsert, not an append. Older 0.0.5 candidates
+        # reset the picker before the worker acknowledged the choice, so a user
+        # could click the same Orca printer repeatedly. Collapse those records
+        # on read while preserving the first stable dashboard id.
+        result = []
+        positions = {}
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            printer = dict(raw)
+            printer["url"] = normalize_url(printer.get("url"))
+            key = printer["url"].casefold() if printer["url"] else ""
+            if not key or key not in positions:
+                if key:
+                    positions[key] = len(result)
+                result.append(printer)
+                continue
+            existing = result[positions[key]]
+            stable_id = existing.get("id")
+            existing.update(printer)
+            if stable_id is not None:
+                existing["id"] = stable_id
+        return result
     except (OSError, ValueError):
         return []
 
@@ -584,11 +641,13 @@ def save_manual_printers(printers):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(printers, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, PRINTERS_FILE)
+        return True
     except OSError:
         try:
             os.remove(tmp)
         except OSError:
             pass
+        return False
 
 
 def normalize_url(url):
@@ -2096,13 +2155,14 @@ function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c
 function temp(v){ return v == null ? '—' : Math.round(v) + '°'; }
 // Friendly badge for the connection type — the ecosystem we actually detect,
 // not the transport. (OctoPrint can front any firmware, so we don't claim Marlin.)
-function typeLabel(t){
+function typeLabel(value){
   return { moonraker:'Klipper', klipper:'Klipper', octoprint:'OctoPrint',
     prusalink:'PrusaLink', prusaconnect:'PrusaConnect', duet:'Duet', repetier:'Repetier',
     mks:'MKS', flashair:'FlashAir', astrobox:'AstroBox', esp3d:'ESP3D',
     crealityprint:'Creality', flashforge:'FlashForge', simplyprint:'SimplyPrint',
     elegoolink:'Elegoo', '3dprinteros':'3DPrinterOS', obico:'Obico',
-    bambu:'Bambu Lab', generic:t('other') }[(t || '').toLowerCase()] || (t || t('other'));
+    bambu:'Bambu Lab', generic:t('other') }[(value || '').toLowerCase()] ||
+    (value || t('other'));
 }
 
 // Normalize backend state strings ("printing", "RUNNING", "Printing from SD"…)
@@ -2344,14 +2404,20 @@ document.getElementById('add').addEventListener('click', function(){
   var name = document.getElementById('f-name').value.trim();
   var url = document.getElementById('f-url').value.trim();
   if (!url) return;
+  var access = document.getElementById('f-access').value.trim();
+  if (typeSel.value === 'bambu' && !access) {
+    document.getElementById('f-access').focus();
+    return;
+  }
+  pendingAdoptUrl = url;
+  pendingFormAdd = true;
+  document.getElementById('add').disabled = true;
+  document.getElementById('status').textContent = t('loading');
   orca.postMessage({ type:'add', name:name, url:url,
                      kind:typeSel.value,
                      serial:document.getElementById('f-serial').value.trim(),
-                     access_code:document.getElementById('f-access').value.trim(),
+                     access_code:access,
                      insecure:document.getElementById('f-insecure').checked });
-  document.getElementById('f-name').value = ''; document.getElementById('f-url').value = '';
-  document.getElementById('f-serial').value = ''; document.getElementById('f-access').value = '';
-  document.getElementById('f-insecure').checked = false;
 });
 document.getElementById('refresh').addEventListener('click', function(){ orca.postMessage({ type:'refresh' }); });
 
@@ -2405,10 +2471,30 @@ document.getElementById('confirm-ok').addEventListener('click', function(){
 // are not on the dashboard yet; choosing one adopts it (user decides, no auto-add).
 var lastAvailable = [];
 var lastDiscovered = [];
+var pendingAdoptUrl = '';
+var pendingFormAdd = false;
+function normalizedPrinterUrl(value){
+  var url = String(value || '').trim().replace(/\/+$/, '').toLowerCase();
+  if (url && url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0)
+    url = 'http://' + url;
+  return url;
+}
 function renderAvailable(){
   var sel = document.getElementById('f-adopt');
-  var items = lastAvailable.concat(lastDiscovered);
-  if (!items.length){ sel.style.display = 'none'; sel.innerHTML = ''; return; }
+  var activeUrls = {};
+  var activeSerials = {};
+  current.forEach(function(p){
+    activeUrls[normalizedPrinterUrl(p.url)] = true;
+    if (p.serial) activeSerials[String(p.serial).trim()] = true;
+  });
+  var items = lastAvailable.concat(lastDiscovered).filter(function(p){
+    return !activeUrls[normalizedPrinterUrl(p.url)] &&
+      !(p.serial && activeSerials[String(p.serial).trim()]);
+  });
+  if (!items.length){
+    sel.style.display = 'none'; sel.innerHTML = ''; sel.disabled = false;
+    return;
+  }
   var opts = '<option value="">' + esc(t('addPrinter')) + '</option>';
   items.forEach(function(p, i){
     var label = (p.source === 'network') ? (p.name + ' — ' + t('foundOnNetwork')) : (p.name || p.url);
@@ -2419,12 +2505,16 @@ function renderAvailable(){
   sel.innerHTML = opts;
   sel.style.display = '';
   sel._items = items;
+  if (pendingAdoptUrl) {
+    var pendingIndex = items.findIndex(function(p){ return p.url === pendingAdoptUrl; });
+    if (pendingIndex >= 0) sel.value = String(pendingIndex);
+  }
+  sel.disabled = !!pendingAdoptUrl;
 }
 document.getElementById('f-adopt').addEventListener('change', function(e){
   var i = e.target.value;
   if (i === '') return;
   var p = (e.target._items || [])[i];
-  e.target.value = '';
   if (!p) return;
   if (p.source === 'network') {
     // SSDP finds the printer but not its access code — prefill the form and
@@ -2435,14 +2525,18 @@ document.getElementById('f-adopt').addEventListener('change', function(e){
     syncTypeFields();
     document.getElementById('f-serial').value = p.serial || '';
     document.getElementById('f-access').focus();
+    e.target.value = '';
     return;
   }
+  pendingAdoptUrl = p.url || '';
+  e.target.disabled = true;
+  document.getElementById('status').textContent = t('loading');
   orca.postMessage({ type:'adopt', printer:p });
 });
 
 orca.onMessage(function(data){
   if (!data) return;
-  if (data.printers) render(data.printers);
+  if (data.printers) { render(data.printers); renderAvailable(); }
   if (data.printerStatus) {
     current.forEach(function(p){
       if (p.url === data.printerStatus.url) p.status = data.printerStatus.status;
@@ -2451,6 +2545,26 @@ orca.onMessage(function(data){
   }
   if (data.available) { lastAvailable = data.available; renderAvailable(); }
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
+  if (data.adoptResult) {
+    var completedFormAdd = pendingFormAdd;
+    pendingAdoptUrl = '';
+    pendingFormAdd = false;
+    document.getElementById('f-adopt').disabled = false;
+    document.getElementById('add').disabled = false;
+    if (!data.adoptResult.ok) {
+      document.getElementById('status').textContent = t('genericError');
+    } else {
+      document.getElementById('status').textContent = '';
+      if (completedFormAdd) {
+        document.getElementById('f-name').value = '';
+        document.getElementById('f-url').value = '';
+        document.getElementById('f-serial').value = '';
+        document.getElementById('f-access').value = '';
+        document.getElementById('f-insecure').checked = false;
+      }
+    }
+    renderAvailable();
+  }
   if (data.printHistory) renderPrintHistory(data.printHistory);
   if (data.unmatched !== undefined)
     document.getElementById('status').textContent = data.unmatched
@@ -2637,13 +2751,31 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
     def _add_manual(self, entry):
         with _STORE_LOCK:
             manual = load_manual_printers()
+            normalized = normalize_url(entry.get("url"))
+            for index, existing in enumerate(manual):
+                if normalize_url(existing.get("url")).casefold() != normalized.casefold():
+                    continue
+                stable_id = existing.get("id")
+                replacement = dict(existing)
+                replacement.update(entry)
+                replacement["url"] = normalized
+                replacement["id"] = stable_id
+                manual[index] = replacement
+                return replacement if save_manual_printers(manual) else None
             new_id = max(
-                [p.get("id", 0) for p in manual if isinstance(p.get("id"), int)],
+                [
+                    p.get("id", 0)
+                    for p in manual
+                    if isinstance(p.get("id"), int)
+                    and not isinstance(p.get("id"), bool)
+                ],
                 default=0,
             ) + 1
-            entry["id"] = new_id
-            manual.append(entry)
-            save_manual_printers(manual)
+            stored = dict(entry)
+            stored["url"] = normalized
+            stored["id"] = new_id
+            manual.append(stored)
+            return stored if save_manual_printers(manual) else None
 
     def _remove_manual(self, printer_id):
         with _STORE_LOCK:
@@ -2793,8 +2925,16 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
     def _add_and_refresh(self, entry, discovered):
         if not ACTION_WORKER.current_job_is_active():
             return
-        self._add_manual(entry)
+        stored = self._add_manual(entry)
+        if not ACTION_WORKER.current_job_is_active():
+            return
         self._refresh_worker(discovered)
+        self._post({
+            "adoptResult": {
+                "url": entry.get("url") or "",
+                "ok": stored is not None,
+            },
+        })
 
     def _remove_and_refresh(self, printer_id, discovered):
         if not ACTION_WORKER.current_job_is_active():
