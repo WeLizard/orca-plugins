@@ -312,6 +312,10 @@ _UI_LOCALE_ALIASES = {
     "zh_hant": "zh_TW",
     "zh_hant_tw": "zh_TW",
 }
+# build_package.py replaces this empty mapping in release artifacts. The JSON
+# files remain authoritative in the source tree while the installable wheel
+# stays a single OrcaSlicer plugin module.
+_EMBEDDED_UI_COPY = {}
 _LOCALE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "printers_locales",
@@ -345,7 +349,11 @@ def host_ui_language():
 
 def load_ui_catalogs(directory=None):
     root = directory or _LOCALE_DIR
-    catalogs = {}
+    catalogs = {
+        locale: dict(data)
+        for locale, data in _EMBEDDED_UI_COPY.items()
+        if locale in ORCA_UI_LOCALES and isinstance(data, dict)
+    }
     try:
         names = sorted(os.listdir(root))
     except OSError:

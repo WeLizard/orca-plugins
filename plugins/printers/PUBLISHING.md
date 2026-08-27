@@ -15,7 +15,9 @@ The command creates the installable wheel under `dist/wheels/`, a staged package
 under `dist/printers-X.Y.Z/`, checksums and release notes derived only from this
 directory's changelog. The source checkout is the development form; Print Farm
 has no separate localhost/prod backend contour, so a second byte-identical dev
-wheel is intentionally not produced.
+wheel is intentionally not produced. As with the FilamentHub plugin, the wheel
+contains one Python module with the validated locale catalogs embedded; the
+staged package also keeps the standalone JSON files for review and translation.
 
 ## Release
 

@@ -1,4 +1,9 @@
+import ast
 import importlib.util
+import base64
+import csv
+import hashlib
+import io
 import inspect
 import json
 import pathlib
@@ -9,6 +14,7 @@ import threading
 import tomllib
 import types
 import unittest
+import zipfile
 from unittest import mock
 
 
@@ -143,6 +149,8 @@ class PrintersOutboxTest(unittest.TestCase):
             project["tool"]["setuptools"]["dynamic"]["version"],
             {"attr": "printers_plugin.PLUGIN_VERSION"},
         )
+        self.assertEqual(project["tool"]["setuptools"]["py-modules"], ["printers_plugin"])
+        self.assertNotIn("packages", project["tool"]["setuptools"])
         self.assertEqual(match.group(1), self.plugin.PLUGIN_VERSION)
         self.assertIn('# name = "Print Farm"', source)
         self.assertEqual(self.plugin.PrintersDashboard().get_name(), "Print Farm")
@@ -158,10 +166,10 @@ class PrintersOutboxTest(unittest.TestCase):
             package = builder.build(pathlib.Path(temp), wheel=False)
 
             self.assertEqual(package.name, "printers-0.0.5")
-            self.assertEqual(
-                (package / "printers_plugin.py").read_bytes(),
-                PLUGIN_PATH.read_bytes(),
-            )
+            staged_source = (package / "printers_plugin.py").read_text(encoding="utf-8")
+            self.assertNotIn(builder.EMBEDDED_UI_COPY_TOKEN, staged_source)
+            self.assertIn('_EMBEDDED_UI_COPY = {"ca":', staged_source)
+            ast.parse(staged_source)
             self.assertEqual(
                 (package / "printers.svg").read_bytes(),
                 PLUGIN_PATH.with_name("printers.svg").read_bytes(),
@@ -178,6 +186,41 @@ class PrintersOutboxTest(unittest.TestCase):
                 (package / "package-metadata.json").read_text(encoding="utf-8")
             )
             self.assertEqual(metadata["locales"], sorted(self.plugin.ORCA_UI_LOCALES))
+
+    def test_wheel_metadata_uses_lf_and_updates_record_hash(self):
+        spec = importlib.util.spec_from_file_location("printers_build_under_test", BUILD_PATH)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+
+        with tempfile.TemporaryDirectory() as temp:
+            wheel = pathlib.Path(temp) / "printers-0.0.5-py3-none-any.whl"
+            metadata_path = "printers-0.0.5.dist-info/METADATA"
+            record_path = "printers-0.0.5.dist-info/RECORD"
+            metadata = b"Metadata-Version: 2.4\r\nName: printers\r\nVersion: 0.0.5\r\n\r\n"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr(metadata_path, metadata)
+                archive.writestr(
+                    record_path,
+                    f"{metadata_path},old,0\r\n{record_path},,\r\n",
+                )
+
+            builder._normalize_wheel_metadata(wheel)
+
+            with zipfile.ZipFile(wheel) as archive:
+                normalized = archive.read(metadata_path)
+                rows = list(csv.reader(io.StringIO(
+                    archive.read(record_path).decode("utf-8"),
+                    newline="",
+                )))
+            self.assertNotIn(b"\r", normalized)
+            expected_digest = base64.urlsafe_b64encode(
+                hashlib.sha256(normalized).digest()
+            ).rstrip(b"=").decode("ascii")
+            metadata_row = next(row for row in rows if row[0] == metadata_path)
+            self.assertEqual(metadata_row[1], f"sha256={expected_digest}")
+            self.assertEqual(metadata_row[2], str(len(normalized)))
 
     def test_release_notes_use_only_current_changelog_section(self):
         spec = importlib.util.spec_from_file_location("printers_build_under_test", BUILD_PATH)
