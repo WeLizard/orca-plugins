@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT / "printers_plugin.py"
 LOCALES = ROOT / "printers_locales"
 CHANGELOG = ROOT / "CHANGELOG.md"
+DESCRIPTION = ROOT / "description.md"
 
 
 def extract_metadata(source: str) -> dict[str, object]:
@@ -119,6 +120,8 @@ def build(output_root: Path, wheel: bool = True) -> Path:
         raise ValueError(
             f"Metadata version {version!r} does not match PLUGIN_VERSION {runtime_version!r}"
         )
+    if not DESCRIPTION.is_file():
+        raise FileNotFoundError(f"Plugin Hub description is missing: {DESCRIPTION}")
 
     package_dir = output_root / f"printers-{version}"
     package_dir.mkdir(parents=True, exist_ok=True)
@@ -128,6 +131,8 @@ def build(output_root: Path, wheel: bool = True) -> Path:
     if package_locales.exists():
         shutil.rmtree(package_locales)
     shutil.copytree(LOCALES, package_locales)
+    package_description = package_dir / DESCRIPTION.name
+    shutil.copy2(DESCRIPTION, package_description)
 
     digest = hashlib.sha256(source_bytes).hexdigest()
     checksum_lines = [f"{digest}  printers_plugin.py"]
@@ -136,6 +141,9 @@ def build(output_root: Path, wheel: bool = True) -> Path:
         checksum_lines.append(
             f"{locale_digest}  {LOCALES.name}/{locale_path.name}"
         )
+    checksum_lines.append(
+        f"{hashlib.sha256(package_description.read_bytes()).hexdigest()}  {DESCRIPTION.name}"
+    )
     (package_dir / "SHA256SUMS").write_text(
         "\n".join(checksum_lines) + "\n", encoding="utf-8", newline="\n"
     )

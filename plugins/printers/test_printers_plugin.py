@@ -167,6 +167,10 @@ class PrintersOutboxTest(unittest.TestCase):
                 PLUGIN_PATH.with_name("printers.svg").read_bytes(),
             )
             self.assertEqual(
+                (package / "description.md").read_bytes(),
+                PLUGIN_PATH.with_name("description.md").read_bytes(),
+            )
+            self.assertEqual(
                 {path.name for path in (package / "printers_locales").glob("*.json")},
                 {"%s.json" % locale for locale in self.plugin.ORCA_UI_LOCALES},
             )

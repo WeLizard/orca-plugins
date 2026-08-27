@@ -55,3 +55,6 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
   OrcaSlicer UI locale, with per-key English fallback.
 - `printers.svg` — tab icon (drop one in; absent → host default icon).
 - `validate_locales.py` / `TRANSLATING.md` — catalog validation and community workflow.
+- `description.md` — Orca Cloud listing text.
+- `CHANGELOG.md` — release notes owned by this plugin.
+- `build_package.py` / `PUBLISHING.md` — deterministic package and release workflow.
