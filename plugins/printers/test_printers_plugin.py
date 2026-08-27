@@ -31,22 +31,45 @@ class _ExecutionResult:
         return ("failure", kind, message)
 
 
-def _load_plugin():
+def _load_plugin(*, lifecycle=False, pages=False, registered=None):
+    def capability_base(name, *, page=False):
+        namespace = {}
+        if lifecycle:
+            namespace.update({
+                "on_load": lambda self: None,
+                "on_unload": lambda self: None,
+            })
+        if page:
+            namespace["post_message"] = lambda self, data: None
+        return type(name, (object,), namespace) if namespace else object
+
     fake_orca = types.ModuleType("orca")
     fake_orca.base = object
     fake_orca.plugin = lambda cls: cls
-    fake_orca.register_capability = lambda capability: None
+    fake_orca.register_capability = (
+        registered.append if registered is not None else lambda capability: None
+    )
     fake_orca.ExecutionResult = _ExecutionResult
     fake_orca.PluginResult = types.SimpleNamespace(RecoverableError="recoverable")
-    fake_orca.script = types.SimpleNamespace(ScriptPluginCapabilityBase=object)
+    fake_orca.script = types.SimpleNamespace(
+        ScriptPluginCapabilityBase=capability_base("ScriptCapabilityBase")
+    )
+    if pages:
+        fake_orca.pages = types.SimpleNamespace(
+            PagesPluginCapabilityBase=capability_base(
+                "PagesCapabilityBase",
+                page=True,
+            )
+        )
     fake_orca.host = types.SimpleNamespace(ui=types.SimpleNamespace())
     fake_orca.slicing = types.SimpleNamespace(
-        SlicingPipelineCapabilityBase=object,
+        SlicingPipelineCapabilityBase=capability_base("SlicingCapabilityBase"),
         Step=types.SimpleNamespace(psGCodePostProcess="post-process"),
     )
     sys.modules["orca"] = fake_orca
 
-    spec = importlib.util.spec_from_file_location("printers_plugin_under_test", PLUGIN_PATH)
+    module_name = "printers_plugin_under_test_%s" % id(fake_orca)
+    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -172,11 +195,12 @@ class PluginStorageTest(unittest.TestCase):
         cls.plugin = _load_plugin()
 
     def test_host_storage_migrates_state_without_deleting_legacy(self):
+        plugin = _load_plugin(lifecycle=True, pages=True)
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
-            legacy = root / "plugin"
+            legacy = root / "orca_plugins" / "printers"
             storage = root / "plugin_data" / "printers"
-            legacy.mkdir()
+            legacy.mkdir(parents=True)
             (legacy / "printers.json").write_text('[{"id":1}]', encoding="utf-8")
             (legacy / "outbox_index.json").write_text(
                 '[{"file":"fixture.gcode"}]', encoding="utf-8"
@@ -187,23 +211,35 @@ class PluginStorageTest(unittest.TestCase):
             (legacy / "outbox").mkdir()
             (legacy / "outbox" / "fixture.gcode").write_text("G28", encoding="utf-8")
 
-            plugin_host = types.SimpleNamespace(storage=lambda: str(storage))
-            with mock.patch.object(self.plugin, "PLUGIN_DIR", str(legacy)), \
-                 mock.patch.object(self.plugin, "PLUGIN_STORAGE_DIR", str(legacy)), \
-                 mock.patch.object(self.plugin, "PRINTERS_FILE", str(legacy / "printers.json")), \
-                 mock.patch.object(self.plugin, "PRINT_HISTORY_FILE", str(legacy / "print_history.json")), \
-                 mock.patch.object(self.plugin, "OUTBOX_DIR", str(legacy / "outbox")), \
-                 mock.patch.object(self.plugin, "OUTBOX_INDEX", str(legacy / "outbox_index.json")), \
-                 mock.patch.object(self.plugin.orca.host, "plugin", plugin_host, create=True):
-                self.plugin.PrintersPlugin().register_capabilities()
+            in_callback = False
 
-                self.assertEqual(self.plugin.PLUGIN_STORAGE_DIR, str(storage))
-                self.assertEqual(self.plugin.PRINTERS_FILE, str(storage / "printers.json"))
+            def host_storage():
+                if not in_callback:
+                    raise RuntimeError("storage requires a plugin callback")
+                return str(storage)
+
+            plugin_host = types.SimpleNamespace(storage=mock.Mock(side_effect=host_storage))
+            with mock.patch.object(plugin, "PLUGIN_DIR", str(legacy)), \
+                 mock.patch.object(plugin, "PLUGIN_STORAGE_DIR", str(legacy)), \
+                 mock.patch.object(plugin, "PRINTERS_FILE", str(legacy / "printers.json")), \
+                 mock.patch.object(plugin, "PRINT_HISTORY_FILE", str(legacy / "print_history.json")), \
+                 mock.patch.object(plugin, "OUTBOX_DIR", str(legacy / "outbox")), \
+                 mock.patch.object(plugin, "OUTBOX_INDEX", str(legacy / "outbox_index.json")), \
+                 mock.patch.object(plugin.orca.host, "plugin", plugin_host, create=True):
+                plugin.PrintersPlugin().register_capabilities()
+                plugin_host.storage.assert_not_called()
+
+                in_callback = True
+                dashboard = plugin.PrintersDashboard()
+                dashboard.on_load()
+
+                self.assertEqual(plugin.PLUGIN_STORAGE_DIR, str(storage))
+                self.assertEqual(plugin.PRINTERS_FILE, str(storage / "printers.json"))
                 self.assertEqual(
-                    self.plugin.PRINT_HISTORY_FILE,
+                    plugin.PRINT_HISTORY_FILE,
                     str(storage / "print_history.json"),
                 )
-                self.assertEqual(self.plugin.OUTBOX_DIR, str(storage / "outbox"))
+                self.assertEqual(plugin.OUTBOX_DIR, str(storage / "outbox"))
                 self.assertEqual(
                     (storage / "printers.json").read_text(encoding="utf-8"),
                     '[{"id":1}]',
@@ -216,9 +252,34 @@ class PluginStorageTest(unittest.TestCase):
                     json.loads((storage / "print_history.json").read_text(encoding="utf-8"))[0]["id"],
                     "history-1",
                 )
+                dashboard.on_unload()
 
             self.assertTrue((legacy / "printers.json").exists())
             self.assertTrue((legacy / "outbox" / "fixture.gcode").exists())
+
+    def test_old_host_uses_stable_storage_outside_replaceable_plugin_dir(self):
+        plugin = _load_plugin()
+        with tempfile.TemporaryDirectory() as temp:
+            data_root = pathlib.Path(temp)
+            legacy = data_root / "orca_plugins" / "printers"
+            legacy.mkdir(parents=True)
+            (legacy / "printers.json").write_text('[{"id":7}]', encoding="utf-8")
+            expected = data_root / ".print-farm" / "orca-plugin"
+
+            with mock.patch.object(plugin, "PLUGIN_DIR", str(legacy)), \
+                 mock.patch.object(
+                     plugin.orca.host,
+                     "plugin",
+                     types.SimpleNamespace(),
+                     create=True,
+                 ):
+                self.assertTrue(plugin.configure_plugin_storage())
+
+            self.assertEqual(plugin.PLUGIN_STORAGE_DIR, str(expected))
+            self.assertEqual(
+                (expected / "printers.json").read_text(encoding="utf-8"),
+                '[{"id":7}]',
+            )
 
     def test_plugin_does_not_forge_host_owned_process_manifest_refs(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
@@ -290,6 +351,136 @@ class PluginStorageTest(unittest.TestCase):
 
         self.assertTrue(done.wait(2))
         self.assertEqual(len(set(thread_ids)), 1)
+
+    def test_pool_shutdown_discards_queued_printer_work(self):
+        pool = self.plugin.ReusableDaemonPool(
+            "printers-cancel-test",
+            max_workers=1,
+            idle_timeout=0.2,
+        )
+        started = threading.Event()
+        release = threading.Event()
+        ran = []
+
+        def blocking_job():
+            started.set()
+            release.wait(2)
+
+        first = pool.submit(blocking_job)
+        self.assertTrue(started.wait(1))
+        queued = pool.submit(lambda: ran.append("printer-command"))
+
+        pool.shutdown(wait_timeout=0)
+        pool.activate()
+        current = pool.submit(lambda: ran.append("new-generation"))
+        release.set()
+        first.wait(1)
+        current.wait(1)
+
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            queued.wait(1)
+        self.assertEqual(ran, ["new-generation"])
+
+    def test_stale_worker_generation_cannot_post_to_window(self):
+        plugin = _load_plugin()
+        pool = plugin.ACTION_WORKER
+        started = threading.Event()
+        release = threading.Event()
+        posted = []
+
+        class Window:
+            def is_open(self):
+                return True
+
+            def post(self, payload):
+                posted.append(payload)
+
+        def stale_post():
+            started.set()
+            release.wait(2)
+            plugin.post_window(Window(), {"status": "stale"})
+
+        job = pool.submit(stale_post)
+        self.assertTrue(started.wait(1))
+        pool.shutdown(wait_timeout=0)
+        release.set()
+        job.wait(1)
+
+        self.assertEqual(posted, [])
+
+    def test_dashboard_lifecycle_drops_queued_physical_command(self):
+        plugin = _load_plugin(lifecycle=True)
+        dashboard = plugin.PrintersDashboard()
+        started = threading.Event()
+        release = threading.Event()
+        command = mock.Mock()
+
+        with mock.patch.object(plugin, "configure_plugin_storage"), \
+             mock.patch.object(dashboard, "_do_printer_cmd", command):
+            dashboard.on_load()
+
+            def blocking_job():
+                started.set()
+                release.wait(2)
+
+            plugin.ACTION_WORKER.submit(blocking_job)
+            self.assertTrue(started.wait(1))
+            dashboard.on_message({
+                "type": "printer-cmd",
+                "url": "http://printer",
+                "action": "cancel",
+            })
+            dashboard.on_cancelled()
+            release.set()
+
+        command.assert_not_called()
+
+    def test_finished_upload_cannot_mutate_state_after_unload(self):
+        plugin = _load_plugin(lifecycle=True)
+        dashboard = plugin.PrintersDashboard()
+        started = threading.Event()
+        release = threading.Event()
+        printer = {
+            "name": "Printer",
+            "url": "http://printer",
+            "type": "moonraker",
+        }
+        record = {"file": "fixture.gcode", "name": "fixture.gcode"}
+
+        def blocking_send(*args, **kwargs):
+            started.set()
+            release.wait(2)
+            return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as temp:
+            plugin.OUTBOX_DIR = temp
+            pathlib.Path(temp, "fixture.gcode").write_bytes(b"G28")
+            with mock.patch.object(plugin, "configure_plugin_storage"), \
+                 mock.patch.object(plugin, "dashboard_printers", return_value=[printer]), \
+                 mock.patch.object(plugin, "load_outbox_index", return_value=[record]), \
+                 mock.patch.object(plugin, "poll_printer", return_value={
+                     "online": True,
+                     "state": "idle",
+                 }), \
+                 mock.patch.object(plugin, "send_gcode", side_effect=blocking_send), \
+                 mock.patch.object(plugin, "record_print_started") as history, \
+                 mock.patch.object(plugin, "outbox_remove") as remove:
+                dashboard.on_load()
+                job = plugin.ACTION_WORKER.submit(
+                    dashboard._do_outbox_send,
+                    {
+                        "file": "fixture.gcode",
+                        "url": "http://printer",
+                        "start": True,
+                    },
+                )
+                self.assertTrue(started.wait(1))
+                dashboard.on_unload()
+                release.set()
+                job.wait(1)
+
+        history.assert_not_called()
+        remove.assert_not_called()
 
     def test_dashboard_uses_reusable_workers_instead_of_per_refresh_threads(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
@@ -557,6 +748,120 @@ class PluginStorageTest(unittest.TestCase):
         send.assert_not_called()
         status_payload = dashboard._post.call_args.args[0]
         self.assertIn("printer is busy", status_payload["status"])
+
+
+class HostApiCompatibilityTest(unittest.TestCase):
+    def test_pages_capability_is_primary_when_host_exposes_it(self):
+        registered = []
+        plugin = _load_plugin(
+            lifecycle=True,
+            pages=True,
+            registered=registered,
+        )
+
+        plugin.PrintersPlugin().register_capabilities()
+
+        self.assertEqual(registered, [plugin.PrintersDashboard, plugin.PrintersOutbox])
+        self.assertTrue(issubclass(
+            plugin.PrintersDashboard,
+            plugin.orca.pages.PagesPluginCapabilityBase,
+        ))
+        self.assertFalse(plugin._PLUGIN_RUNTIME_ACTIVE)
+        dashboard = plugin.PrintersDashboard()
+        self.assertIn("orca.postMessage({ type:'ready' })", dashboard.get_ui())
+        self.assertIn("if (document.hidden) return;", dashboard.get_ui())
+        with mock.patch.object(dashboard, "post_message") as post:
+            self.assertTrue(dashboard._post({"status": "ready"}))
+        post.assert_called_once_with({"status": "ready"})
+
+    def test_script_window_remains_the_old_host_fallback(self):
+        registered = []
+        plugin = _load_plugin(lifecycle=True, registered=registered)
+
+        plugin.PrintersPlugin().register_capabilities()
+
+        self.assertEqual(registered, [plugin.PrintersDashboard, plugin.PrintersOutbox])
+        self.assertIsNone(plugin._PAGE_CAPABILITY_BASE)
+        self.assertTrue(issubclass(
+            plugin.PrintersDashboard,
+            plugin.orca.script.ScriptPluginCapabilityBase,
+        ))
+
+    def test_printer_viewer_accepts_lan_http_urls_and_confines_navigation(self):
+        plugin = _load_plugin()
+
+        page = plugin.render_viewer_page(
+            "https://printer.local:8443/ui/?token=a&mode=full#status"
+        )
+
+        self.assertIn("frame-src https://printer.local:8443", page)
+        self.assertIn(
+            'src="https://printer.local:8443/ui/?token=a&amp;mode=full#status"',
+            page,
+        )
+        self.assertIn("allow-same-origin allow-scripts allow-forms", page)
+        self.assertNotIn("allow-popups", page)
+        self.assertNotIn("allow-top-navigation", page)
+        self.assertEqual(
+            plugin.validated_printer_web_url("printer:7125"),
+            "http://printer:7125",
+        )
+        self.assertEqual(
+            plugin.validated_printer_web_url("[::1]:8080"),
+            "http://[::1]:8080",
+        )
+
+    def test_printer_viewer_rejects_markup_credentials_and_non_http_urls(self):
+        plugin = _load_plugin()
+        rejected = (
+            'http://printer.local/\"><script>alert(1)</script>',
+            "http://user:password@printer.local/",
+            "javascript:alert(1)",
+            "http://printer.local/\nnext",
+            "http://printer.local\\@example.com/",
+            "http://printer local/",
+            "file:///etc/passwd",
+        )
+
+        for value in rejected:
+            with self.subTest(value=value):
+                self.assertEqual(plugin.validated_printer_web_url(value), "")
+                self.assertEqual(plugin.render_viewer_page(value), "")
+
+    def test_invalid_viewer_url_never_creates_a_host_window(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        create_window = mock.Mock()
+
+        with mock.patch.object(
+            plugin.orca.host.ui,
+            "create_window",
+            create_window,
+            create=True,
+        ):
+            self.assertFalse(dashboard._open_viewer("https://user:pw@printer", "Printer"))
+
+        create_window.assert_not_called()
+
+    def test_dashboard_unload_closes_owned_printer_windows(self):
+        plugin = _load_plugin(lifecycle=True)
+        dashboard = plugin.PrintersDashboard()
+        viewer = mock.Mock()
+        viewer.is_open.return_value = True
+
+        with mock.patch.object(plugin, "configure_plugin_storage"), \
+             mock.patch.object(
+                 plugin.orca.host.ui,
+                 "create_window",
+                 return_value=viewer,
+                 create=True,
+             ):
+            dashboard.on_load()
+            self.assertTrue(dashboard._open_viewer("http://printer.local", "Printer"))
+            dashboard.on_unload()
+
+        viewer.close.assert_called_once_with()
+        self.assertEqual(dashboard._viewers, [])
 
 
 class PrintHistoryTest(unittest.TestCase):

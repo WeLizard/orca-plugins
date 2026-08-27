@@ -25,7 +25,7 @@ Printers come from two sources, merged and de-duplicated by URL:
   * OrcaSlicer's own printer presets that have a network address configured
     (read via orca.host.preset_bundle() on the UI thread) — no manual entry.
   * Manually added entries, stored in Orca's private plugin storage when
-    available, with the install directory as a compatibility fallback.
+    available, with a stable Orca data-root directory as an old-host fallback.
 
 Active backends: Moonraker (Klipper), OctoPrint, and Bambu Lab in LAN mode.
 Other OrcaSlicer host types remain visible as planned integrations, but are not
@@ -38,14 +38,15 @@ offloaded to worker threads.
 
 What is intentionally NOT done here, because it belongs to the host and would be
 a good plugin capability to expose rather than work around:
-  * "Open" switches this window to an iframe of the printer's web UI; a plugin
-    cannot programmatically open the native Device tab for a specific printer.
+  * "Open" uses a confined host window for the printer's web UI; a plugin cannot
+    programmatically open the native Device tab for a specific printer.
   * The outbox uses the slicing-pipeline G-code export seam, which currently
     runs on file export and print-host upload rather than on Slice alone.
 """
 
 import base64
 import ftplib
+import html
 import io
 import json
 import os
@@ -101,8 +102,11 @@ class PollBatch:
             callback()
 
 
+_POOL_STOP = object()
+
+
 class ReusableDaemonPool:
-    """A bounded pool whose daemon workers are reused while the dashboard is open."""
+    """A lifecycle-aware bounded pool of reusable daemon workers."""
 
     def __init__(self, name, max_workers, idle_timeout=45.0):
         self._name = name
@@ -113,11 +117,33 @@ class ReusableDaemonPool:
         self._workers = set()
         self._busy = 0
         self._sequence = 0
+        self._generation = 0
+        self._stopping = False
+        self._local = threading.local()
+
+    def activate(self):
+        """Accept work for a new plugin lifecycle generation."""
+        with self._lock:
+            if self._stopping:
+                self._generation += 1
+                self._stopping = False
+
+    def current_job_is_active(self):
+        """Whether the calling job still belongs to the loaded plugin."""
+        generation = getattr(self._local, "generation", None)
+        if generation is None:
+            return True
+        with self._lock:
+            return not self._stopping and generation == self._generation
 
     def submit(self, function, *args, **kwargs):
         job = BackgroundJob()
-        self._jobs.put((job, function, args, kwargs))
         with self._lock:
+            if self._stopping:
+                job.finish(error=RuntimeError("background worker is stopped"))
+                return job
+            generation = self._generation
+            self._jobs.put((generation, job, function, args, kwargs))
             desired = min(self._max_workers, max(1, self._busy + self._jobs.qsize()))
             while len(self._workers) < desired:
                 self._sequence += 1
@@ -130,27 +156,80 @@ class ReusableDaemonPool:
                 worker.start()
         return job
 
+    def shutdown(self, wait_timeout=0.25):
+        """Reject new work and discard every queued job from this generation."""
+        with self._lock:
+            if not self._stopping:
+                self._stopping = True
+                self._generation += 1
+            workers = list(self._workers)
+            while True:
+                try:
+                    marker, job, _function, _args, _kwargs = self._jobs.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    if marker is not _POOL_STOP:
+                        job.finish(error=RuntimeError("background job cancelled"))
+                    self._jobs.task_done()
+            for _worker in workers:
+                self._jobs.put((_POOL_STOP, self._generation, None, None, None))
+        deadline = time.monotonic() + max(0.0, wait_timeout)
+        for worker in workers:
+            if worker is threading.current_thread():
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+
     def _run(self):
         current = threading.current_thread()
+        idle_deadline = time.monotonic() + self._idle_timeout
         while True:
+            remaining = idle_deadline - time.monotonic()
+            if remaining <= 0:
+                remaining = 0.001
             try:
-                job, function, args, kwargs = self._jobs.get(timeout=self._idle_timeout)
+                generation, job, function, args, kwargs = self._jobs.get(timeout=remaining)
             except queue.Empty:
                 with self._lock:
-                    if self._jobs.empty():
+                    if self._stopping or self._jobs.empty():
                         self._workers.discard(current)
                         return
+                idle_deadline = time.monotonic() + self._idle_timeout
+                continue
+            if generation is _POOL_STOP:
+                with self._lock:
+                    should_stop = self._stopping and job == self._generation
+                    if should_stop:
+                        self._workers.discard(current)
+                self._jobs.task_done()
+                if should_stop:
+                    return
+                idle_deadline = time.monotonic() + self._idle_timeout
                 continue
             with self._lock:
+                should_run = not self._stopping and generation == self._generation
+                if not should_run:
+                    job.finish(error=RuntimeError("background job cancelled"))
+                    self._jobs.task_done()
+                    continue
                 self._busy += 1
             try:
+                self._local.generation = generation
                 job.finish(result=function(*args, **kwargs))
             except Exception as exc:
                 job.finish(error=exc)
             finally:
+                try:
+                    del self._local.generation
+                except AttributeError:
+                    pass
                 with self._lock:
                     self._busy -= 1
                 self._jobs.task_done()
+                idle_deadline = time.monotonic() + self._idle_timeout
 
 
 # Host callbacks stay on the UI thread. One coordinator serializes state
@@ -159,8 +238,52 @@ class ReusableDaemonPool:
 ACTION_WORKER = ReusableDaemonPool("printers-action", max_workers=1)
 POLL_WORKERS = ReusableDaemonPool("printers-poll", max_workers=8)
 
+_PLUGIN_RUNTIME_LOCK = threading.Lock()
+_PLUGIN_RUNTIME_ACTIVE = False
+
+
+def start_plugin_runtime():
+    """Start process-wide resources from an audited lifecycle callback."""
+    global _PLUGIN_RUNTIME_ACTIVE
+    with _PLUGIN_RUNTIME_LOCK:
+        if _PLUGIN_RUNTIME_ACTIVE:
+            return False
+        _PLUGIN_RUNTIME_ACTIVE = True
+    ACTION_WORKER.activate()
+    POLL_WORKERS.activate()
+    refresh_ui_language()
+    configure_plugin_storage()
+    return True
+
+
+def stop_plugin_runtime():
+    """Stop accepting work and invalidate all jobs from the loaded generation."""
+    global _PLUGIN_RUNTIME_ACTIVE
+    with _PLUGIN_RUNTIME_LOCK:
+        if not _PLUGIN_RUNTIME_ACTIVE:
+            return False
+        _PLUGIN_RUNTIME_ACTIVE = False
+    ACTION_WORKER.shutdown()
+    POLL_WORKERS.shutdown()
+    return True
+
+
+class _PluginRuntimeLifecycleMixin:
+    def on_load(self):
+        start_plugin_runtime()
+
+    def on_cancelled(self):
+        stop_plugin_runtime()
+
+    def on_unload(self):
+        stop_plugin_runtime()
+
 
 def post_window(window, payload):
+    for worker_name in ("ACTION_WORKER", "POLL_WORKERS"):
+        worker = globals().get(worker_name)
+        if worker is not None and not worker.current_job_is_active():
+            return False
     try:
         post = getattr(window, "post", None)
         if window is None or not window.is_open() or not callable(post):
@@ -309,8 +432,8 @@ BAMBU_MQTT_PORT = 8883
 def resolve_plugin_dir():
     """The plugin's install dir (orca_plugins/<name>), stable across package
     formats. A wheel runs from __whl_extracted__/<pkg>/ INSIDE the install dir
-    and that cache is wiped on update — sidecar state (the printers store, the
-    icon) must live in the install dir, not wherever __file__ happens to be."""
+    and that cache is wiped on update. This locates packaged assets and mutable
+    state left by releases that predate private plugin storage."""
     here = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
     parts = here.split("/")
     if "__whl_extracted__" in parts:
@@ -331,38 +454,70 @@ def ensure_icon():
     return ICON_PATH if os.path.isfile(ICON_PATH) else ""
 
 
+def fallback_plugin_storage_dir():
+    """Stable state root for hosts without ``orca.host.plugin.storage()``."""
+    plugins_root = os.path.dirname(os.path.abspath(PLUGIN_DIR))
+    if os.path.basename(plugins_root).lower() != "orca_plugins":
+        return ""
+    data_root = os.path.dirname(plugins_root)
+    return os.path.join(data_root, ".print-farm", "orca-plugin")
+
+
 def configure_plugin_storage():
-    """Move mutable state to Orca's private plugin storage when available."""
+    """Move mutable state to native storage or a durable old-host fallback."""
     global PLUGIN_STORAGE_DIR, PRINTERS_FILE, PRINT_HISTORY_FILE, OUTBOX_DIR, OUTBOX_INDEX
 
+    fallback_root = fallback_plugin_storage_dir()
+    target_root = ""
     plugin_host = getattr(getattr(orca, "host", None), "plugin", None)
     storage = getattr(plugin_host, "storage", None)
-    if not callable(storage):
+    if callable(storage):
+        try:
+            target_root = os.path.abspath(storage())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            target_root = ""
+    if not target_root:
+        target_root = fallback_root
+    if not target_root:
         return False
     try:
-        target_root = os.path.abspath(storage())
-        if not target_root:
-            return False
-        os.makedirs(target_root, exist_ok=True)
-    except (OSError, RuntimeError, TypeError, ValueError):
+        os.makedirs(target_root, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(target_root, 0o700)
+        except OSError:
+            pass
+    except OSError:
         return False
 
+    source_roots = []
+    for candidate in (fallback_root, PLUGIN_DIR):
+        if candidate and os.path.abspath(candidate) != os.path.abspath(target_root):
+            source_roots.append(candidate)
     for name in ("printers.json", "print_history.json", "outbox_index.json"):
-        source = os.path.join(PLUGIN_DIR, name)
         target = os.path.join(target_root, name)
-        if source != target and os.path.isfile(source) and not os.path.exists(target):
+        if os.path.exists(target):
+            continue
+        for source_root in source_roots:
+            source = os.path.join(source_root, name)
+            if not os.path.isfile(source):
+                continue
             try:
                 shutil.copy2(source, target)
             except OSError:
                 pass
+            break
 
-    legacy_outbox = os.path.join(PLUGIN_DIR, "outbox")
     target_outbox = os.path.join(target_root, "outbox")
-    if legacy_outbox != target_outbox and os.path.isdir(legacy_outbox) and not os.path.exists(target_outbox):
-        try:
-            shutil.copytree(legacy_outbox, target_outbox)
-        except OSError:
-            pass
+    if not os.path.exists(target_outbox):
+        for source_root in source_roots:
+            source_outbox = os.path.join(source_root, "outbox")
+            if not os.path.isdir(source_outbox):
+                continue
+            try:
+                shutil.copytree(source_outbox, target_outbox)
+            except OSError:
+                pass
+            break
 
     PLUGIN_STORAGE_DIR = target_root
     PRINTERS_FILE = os.path.join(target_root, "printers.json")
@@ -401,7 +556,7 @@ def ssl_ctx_for(printer):
 
 
 # --------------------------------------------------------------------------- #
-# Manual printer store (printers.json next to the plugin)
+# Manual printer store (redirected to durable storage during plugin lifecycle)
 # --------------------------------------------------------------------------- #
 def load_manual_printers():
     if not os.path.isfile(PRINTERS_FILE):
@@ -1259,7 +1414,10 @@ def attach_outbox(printers):
     return unmatched
 
 
-class PrintersOutbox(orca.slicing.SlicingPipelineCapabilityBase):
+class PrintersOutbox(
+    _PluginRuntimeLifecycleMixin,
+    orca.slicing.SlicingPipelineCapabilityBase,
+):
     def get_name(self):
         return OUTBOX_CAP
 
@@ -2296,6 +2454,7 @@ orca.postMessage({ type:'ready' });
 // Live dashboard: refresh statuses while the tab is open. Status-only tick —
 // the store and the picker are rebuilt only on explicit Refresh/actions.
 setInterval(function(){
+  if (document.hidden) return;
   try { orca.postMessage({ type:'poll' }); } catch (e) { /* bridge not ready */ }
 }, 15000);
 </script>
@@ -2312,27 +2471,121 @@ def render_page():
     ).replace("__HOST_UI_LANGUAGE__", language)
 
 
-# A plain full-window iframe of the printer's web UI — opened as its own host
-# window (create_window) so it stays inside OrcaSlicer without hijacking the
-# dashboard tab or launching an external browser.
-VIEWER_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%;display:block}
-</style></head><body><iframe src="__URL__" allow="fullscreen"></iframe></body></html>"""
+# A printer UI stays inside a separate host window. The parent document permits
+# only the selected printer origin, and the iframe cannot open popups or replace
+# Orca's top-level page.
+VIEWER_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; frame-src __ORIGIN__">
+<style>html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%;display:block}</style>
+</head><body><iframe src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe></body></html>"""
 
 
-class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
-    win = None
+def validated_printer_web_url(value):
+    candidate = str(value or "").strip().rstrip("/")
+    initial = urllib.parse.urlsplit(candidate)
+    if initial.scheme and initial.scheme.lower() not in {"http", "https"}:
+        port_token = candidate.split(":", 1)[1].split("/", 1)[0]
+        if not port_token.isdigit():
+            return ""
+    raw = normalize_url(candidate)
+    if not raw or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        return ""
+    if any(char in raw for char in "\"'<>\\"):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return ""
+    host = parsed.hostname
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    if not all(char.isalnum() or char in ".-_:" for char in host):
+        return ""
+    if ":" in host:
+        host = "[" + host + "]"
+    netloc = host + ((":" + str(port)) if port is not None else "")
+    return urllib.parse.urlunsplit((
+        parsed.scheme.lower(),
+        netloc,
+        parsed.path,
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
+def render_viewer_page(url):
+    safe_url = validated_printer_web_url(url)
+    if not safe_url:
+        return ""
+    parsed = urllib.parse.urlsplit(safe_url)
+    host = parsed.hostname
+    if ":" in host:
+        host = "[" + host + "]"
+    origin = "%s://%s%s" % (
+        parsed.scheme,
+        host,
+        (":" + str(parsed.port)) if parsed.port is not None else "",
+    )
+    return VIEWER_PAGE.replace(
+        "__ORIGIN__",
+        html.escape(origin, quote=True),
+    ).replace(
+        "__URL__",
+        html.escape(safe_url, quote=True),
+    )
+
+
+_PAGES = getattr(orca, "pages", None)
+_PAGE_CAPABILITY_BASE = getattr(_PAGES, "PagesPluginCapabilityBase", None)
+_SCRIPT_CAPABILITY_BASE = orca.script.ScriptPluginCapabilityBase
+_DASHBOARD_CAPABILITY_BASE = _PAGE_CAPABILITY_BASE or _SCRIPT_CAPABILITY_BASE
+
+
+class _PageWindowProxy:
+    """Adapt Pages.post_message() to the existing window push contract."""
+
+    def __init__(self, page):
+        self._page = page
+
+    def is_open(self):
+        return self._page is not None
+
+    def post(self, payload):
+        self._page.post_message(payload)
+
+
+class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE):
 
     def __init__(self):
         super().__init__()
         self._status_cache = {}
         self._status_lock = threading.Lock()
         self._list_generation = 0
+        self._viewers = []
+        self.win = _PageWindowProxy(self) if _PAGE_CAPABILITY_BASE is not None else None
 
     def get_name(self):
         return "Print Farm"
 
+    def get_icon(self):
+        return ensure_icon()
+
+    def get_ui(self):
+        return render_page()
+
     def _open(self):
+        if _PAGE_CAPABILITY_BASE is not None:
+            return False
         if self.win is not None and self.win.is_open():
             return False
         self.win = orca.host.ui.create_window(
@@ -2347,6 +2600,31 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
 
     def on_close(self):
         self.win = None
+
+    def _close_owned_windows(self):
+        if _PAGE_CAPABILITY_BASE is None:
+            window = self.win
+            self.win = None
+            try:
+                if window is not None and window.is_open():
+                    window.close()
+            except Exception:
+                pass
+        for viewer in self._viewers:
+            try:
+                if viewer.is_open():
+                    viewer.close()
+            except Exception:
+                pass
+        self._viewers = []
+
+    def on_cancelled(self):
+        self._close_owned_windows()
+        stop_plugin_runtime()
+
+    def on_unload(self):
+        self._close_owned_windows()
+        stop_plugin_runtime()
 
     def _add_manual(self, entry):
         with _STORE_LOCK:
@@ -2446,7 +2724,7 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 discover_orca_printers(),
             )
         elif kind == "open":
-            url = normalize_url(msg.get("url"))
+            url = validated_printer_web_url(msg.get("url"))
             if url:
                 self._open_viewer(url, msg.get("name") or url)
         elif kind == "mass-print":
@@ -2455,15 +2733,21 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     def _open_viewer(self, url, name):
         # Printer web UI in its own host window — inside Orca, no external browser
         # and without hijacking the dashboard tab. Keep a reference so it lives on.
+        page = render_viewer_page(url)
+        if not page:
+            return False
         try:
             win = orca.host.ui.create_window(
-                title=(name or url)[:80], html=VIEWER_PAGE.replace("__URL__", url),
+                title=(name or url)[:80], html=page,
                 width=1100, height=760, on_message=lambda m: None, on_close=lambda: None)
-            if not hasattr(self, "_viewers"):
-                self._viewers = []
+            self._viewers = [
+                viewer for viewer in self._viewers
+                if viewer is not None and viewer.is_open()
+            ]
             self._viewers.append(win)
+            return True
         except Exception:
-            pass
+            return False
 
     def _refresh_async(self, discover_network=False):
         # Capture host-owned preset state on the UI thread. Disk and LAN work
@@ -2472,6 +2756,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         ACTION_WORKER.submit(self._refresh_worker, discovered, discover_network)
 
     def _refresh_worker(self, discovered, discover_network=False):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         printers = dashboard_printers()
         unmatched = attach_outbox(printers)
         active_urls = {printer.get("url") for printer in printers}
@@ -2497,18 +2783,26 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         self._poll_and_push(printers, discover_network, generation=generation)
 
     def _add_and_refresh(self, entry, discovered):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         self._add_manual(entry)
         self._refresh_worker(discovered)
 
     def _remove_and_refresh(self, printer_id, discovered):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         self._remove_manual(printer_id)
         self._refresh_worker(discovered)
 
     def _drop_and_refresh(self, stored, discovered):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         outbox_remove(stored)
         self._refresh_worker(discovered)
 
     def _poll_dashboard(self):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         with self._status_lock:
             generation = self._list_generation
         self._poll_and_push(
@@ -2523,6 +2817,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     def _poll_into(self, printer, batch=None, generation=None):
         try:
             status = poll_printer(printer)
+            if not POLL_WORKERS.current_job_is_active():
+                return
             printer["status"] = status
             with self._status_lock:
                 if generation is not None and generation != self._list_generation:
@@ -2545,6 +2841,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
 
     def _finish_poll_batch(self, printers, on_complete=None, generation=None):
         try:
+            if not POLL_WORKERS.current_job_is_active():
+                return
             with self._status_lock:
                 if generation is not None and generation != self._list_generation:
                     return
@@ -2568,6 +2866,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
     def _discover_and_push(self, printers, generation=None):
         # Bambu printers announce themselves over SSDP — offer ones that aren't
         # on the dashboard yet (explicit Refresh only).
+        if not POLL_WORKERS.current_job_is_active():
+            return
         try:
             known_hosts = {
                 urllib.parse.urlparse(normalize_url(p.get("url"))).hostname
@@ -2580,6 +2880,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             }
             found = []
             for ip, info in ssdp_bambu_names(2.0).items():
+                if not POLL_WORKERS.current_job_is_active():
+                    return
                 if ip in known_hosts or (
                     info.get("serial") and info["serial"] in known_serials
                 ):
@@ -2608,6 +2910,13 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         # Poll all printers concurrently — one offline/slow host would otherwise
         # block additions or the rest of the dashboard. The action worker only
         # schedules the batch; reusable poll workers push individual results.
+        if (
+            not ACTION_WORKER.current_job_is_active()
+            or not POLL_WORKERS.current_job_is_active()
+        ):
+            if on_complete is not None:
+                on_complete()
+            return
         if not printers:
             self._finish_poll_batch(printers, on_complete, generation)
         else:
@@ -2626,6 +2935,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         )
 
     def _do_outbox_send(self, msg):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         printers = dashboard_printers()
         stored = msg.get("file") or ""
         target = normalize_url(msg.get("url") or "")
@@ -2648,6 +2959,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             # that is already printing or paused. Vendor-agnostic via the
             # normalized "state" field (Moonraker/OctoPrint/Bambu).
             live = poll_printer(printer) or {}
+            if not ACTION_WORKER.current_job_is_active():
+                return
             if not live.get("online"):
                 self._post_status(ui_text("notReachableNotStarted", printer=label))
                 self._refresh_worker(None)
@@ -2662,6 +2975,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 return
         result = send_gcode(printer, record.get("name") or stored, file_bytes,
                             start=start, use_ams=bool(msg.get("use_ams", True)))
+        if not ACTION_WORKER.current_job_is_active():
+            return
         if result.get("ok"):
             if start:
                 record_print_started(printer, record.get("name") or stored)
@@ -2705,6 +3020,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         })
 
     def _do_printer_cmd(self, msg):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         printers = dashboard_printers()
         target = normalize_url(msg.get("url") or "")
         action = msg.get("action") or ""
@@ -2728,6 +3045,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         self._poll_and_push(printers)
 
     def _do_mass_print(self, msg):
+        if not ACTION_WORKER.current_job_is_active():
+            return
         printers = dashboard_printers()
         try:
             file_bytes = base64.b64decode(msg.get("dataB64") or "")
@@ -2741,8 +3060,12 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         selected = [p for p in printers if normalize_url(p.get("url")) in targets]
         ok, fail, errors = 0, 0, []
         for p in selected:
+            if not ACTION_WORKER.current_job_is_active():
+                return
             if start:
                 live = poll_printer(p) or {}
+                if not ACTION_WORKER.current_job_is_active():
+                    return
                 if not live.get("online"):
                     fail += 1
                     errors.append(ui_text(
@@ -2758,6 +3081,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                     ))
                     continue
             result = send_gcode(p, filename, file_bytes, start, use_ams)
+            if not ACTION_WORKER.current_job_is_active():
+                return
             if result.get("ok"):
                 ok += 1
                 if start:
@@ -2778,10 +3103,23 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         self._post({"status": text})
 
 
+def host_capability_lifecycle_available():
+    """Whether every selected host base supplies load and unload callbacks."""
+    bases = [
+        _DASHBOARD_CAPABILITY_BASE,
+        orca.slicing.SlicingPipelineCapabilityBase,
+    ]
+    return all(
+        callable(getattr(base, "on_load", None))
+        and callable(getattr(base, "on_unload", None))
+        for base in bases
+    )
+
+
 @orca.plugin
 class PrintersPlugin(orca.base):
     def register_capabilities(self):
-        refresh_ui_language()
-        configure_plugin_storage()
+        if not host_capability_lifecycle_available():
+            start_plugin_runtime()
         orca.register_capability(PrintersDashboard)
         orca.register_capability(PrintersOutbox)

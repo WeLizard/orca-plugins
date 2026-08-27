@@ -3,19 +3,19 @@
 A second, **independent** plugin built on OrcaSlicer's Python plugin system —
 deliberately unrelated to the FilamentHub catalog plugin.
 
-It opens a **Print Farm** dashboard that shows supported networked printers as
-tiles with live status, nozzle/bed temperatures and print progress, and can open
-a printer's web interface in place. It currently uses the stable host-managed
-window API. Native Pages from draft PR #14992 are tracked separately and are
-not treated as a production contract yet. OrcaSlicer's own Multi-device tab is
-Bambu-only.
+It opens a native **Print Farm** plugin page that shows supported networked
+printers as tiles with live status, nozzle/bed temperatures and print progress,
+and can open a printer's web interface in a confined host window. Older
+OrcaSlicer builds retain the host-managed Script window fallback. OrcaSlicer's
+own Multi-device tab is Bambu-only.
 
 **Active testing:** this is an alpha plugin tested against exact OrcaSlicer PR
 artifacts. The upstream plugin API is still evolving and updates may be frequent.
 
 ## What it does
 
-- `create_window(...)` → a host-managed, host-themed dashboard.
+- Native `orca.pages.PagesPluginCapabilityBase` dashboard, with
+  `create_window(...)` retained for hosts that do not expose Pages.
 - Polls each printer on a worker thread and pushes status to the page:
   - **Moonraker** (Klipper): `/printer/objects/query` (temps, `print_stats`, progress).
   - **OctoPrint**: `/api/printer` + `/api/job`.
@@ -24,10 +24,10 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
   They are not presented as working until status, control, and upload are
   implemented and can be tested.
 - **Add / remove** printers in the page; mutable state uses
-  `orca.host.plugin.storage()` when available and falls back to the install
-  directory on older hosts.
-- **Open** → swaps the grid for an `<iframe>` of the printer's web UI
-  (Mainsail/Fluidd/OctoPrint are framable on the LAN).
+  `orca.host.plugin.storage()` when available and falls back to a stable
+  directory outside the replaceable plugin package on older hosts.
+- **Open** → opens a sandboxed `<iframe>` restricted to that printer's exact
+  HTTP(S) origin (Mainsail/Fluidd/OctoPrint remain framable on the LAN).
 - Polls live status while the tab is open and exposes Pause / Resume / Stop when
   supported by the selected printer backend.
 - Keeps a bounded local history for each printer. It records jobs started from
@@ -42,9 +42,8 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
 
 ## Upstream integration coverage
 
-- **Plugin page candidate:** `printers.svg` is packaged for the Pages capability
-  icon path from draft PR #14992; adopting that capability remains gated by an
-  exact artifact test and a host-owned tab/window presentation choice.
+- **Plugin page:** Pages is the primary capability when present; capability
+  detection keeps the Script window working on supported older hosts.
 - **Local-network access:** printers live on user-chosen LAN addresses no static
   manifest allow-list can enumerate — concrete motivation for a future
   `network = ["local-network"]` permission class (declared here, ignored today).

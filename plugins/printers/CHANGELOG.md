@@ -5,6 +5,10 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 ## Unreleased
 - Added a per-printer local history modal for jobs started by Print Farm or observed while the dashboard is open, with explicit offline-coverage limits.
 - Bundled complete interface catalogs for every current OrcaSlicer UI locale; printer protocols and raw backend diagnostics remain unchanged.
+- Adopted OrcaSlicer's native Pages capability while retaining the Script window fallback for older hosts.
+- Moved mutable state initialization into the audited plugin lifecycle and added a durable old-host storage fallback outside the replaceable package.
+- Cancelled queued LAN work and blocked stale worker generations during plugin disable, update, and unload.
+- Restricted embedded printer pages to validated HTTP(S) origins with CSP and a sandbox that cannot open external sites or replace Orca's page.
 
 ## 0.0.4
 - Made add, remove, refresh and printer polling update independently without stale or returning tiles.
