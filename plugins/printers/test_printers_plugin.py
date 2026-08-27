@@ -157,7 +157,7 @@ class PrintersOutboxTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             package = builder.build(pathlib.Path(temp), wheel=False)
 
-            self.assertEqual(package.name, "printers-0.0.4")
+            self.assertEqual(package.name, "printers-0.0.5")
             self.assertEqual(
                 (package / "printers_plugin.py").read_bytes(),
                 PLUGIN_PATH.read_bytes(),
@@ -182,11 +182,11 @@ class PrintersOutboxTest(unittest.TestCase):
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
 
-        notes = builder.render_release_notes("0.0.4")
+        notes = builder.render_release_notes("0.0.5")
 
-        self.assertIn("## Print Farm 0.0.4", notes)
-        self.assertIn("Made add, remove, refresh", notes)
-        self.assertNotIn("Bambu printers are now discovered", notes)
+        self.assertIn("## Print Farm 0.0.5", notes)
+        self.assertIn("local print history", notes)
+        self.assertNotIn("Made add, remove, refresh", notes)
 
 
 class PluginStorageTest(unittest.TestCase):
