@@ -30,6 +30,9 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
   (Mainsail/Fluidd/OctoPrint are framable on the LAN).
 - Polls live status while the tab is open and exposes Pause / Resume / Stop when
   supported by the selected printer backend.
+- Keeps a bounded local history for each printer. It records jobs started from
+  Print Farm and jobs actually observed while the dashboard is open; it does
+  not invent jobs that ran while OrcaSlicer was offline.
 - Sends one local G-code to one or several printers.
 - Optional outbox records OrcaSlicer file-export and upload events on the matching
   printer tile. Select **Printers Outbox** in OrcaSlicer's **Slicing pipeline
@@ -49,6 +52,7 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
 ## Files
 
 - `printers_plugin.py` — the dependency-free plugin runtime.
-- `printers_locales/` — bundled interface translations with English fallback.
+- `printers_locales/` — bundled interface translations for every current
+  OrcaSlicer UI locale, with per-key English fallback.
 - `printers.svg` — tab icon (drop one in; absent → host default icon).
 - `validate_locales.py` / `TRANSLATING.md` — catalog validation and community workflow.

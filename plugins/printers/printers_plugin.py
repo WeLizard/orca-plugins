@@ -321,6 +321,7 @@ def resolve_plugin_dir():
 PLUGIN_DIR = resolve_plugin_dir()
 PLUGIN_STORAGE_DIR = PLUGIN_DIR
 PRINTERS_FILE = os.path.join(PLUGIN_DIR, "printers.json")
+PRINT_HISTORY_FILE = os.path.join(PLUGIN_DIR, "print_history.json")
 # Use the adjacent source/package icon when present. Cloud wheel and single-file
 # installs fall back to Orca's default icon rather than writing an asset on load.
 ICON_PATH = os.path.join(PLUGIN_DIR, "printers.svg")
@@ -332,7 +333,7 @@ def ensure_icon():
 
 def configure_plugin_storage():
     """Move mutable state to Orca's private plugin storage when available."""
-    global PLUGIN_STORAGE_DIR, PRINTERS_FILE, OUTBOX_DIR, OUTBOX_INDEX
+    global PLUGIN_STORAGE_DIR, PRINTERS_FILE, PRINT_HISTORY_FILE, OUTBOX_DIR, OUTBOX_INDEX
 
     plugin_host = getattr(getattr(orca, "host", None), "plugin", None)
     storage = getattr(plugin_host, "storage", None)
@@ -346,7 +347,7 @@ def configure_plugin_storage():
     except (OSError, RuntimeError, TypeError, ValueError):
         return False
 
-    for name in ("printers.json", "outbox_index.json"):
+    for name in ("printers.json", "print_history.json", "outbox_index.json"):
         source = os.path.join(PLUGIN_DIR, name)
         target = os.path.join(target_root, name)
         if source != target and os.path.isfile(source) and not os.path.exists(target):
@@ -365,6 +366,7 @@ def configure_plugin_storage():
 
     PLUGIN_STORAGE_DIR = target_root
     PRINTERS_FILE = os.path.join(target_root, "printers.json")
+    PRINT_HISTORY_FILE = os.path.join(target_root, "print_history.json")
     OUTBOX_DIR = target_outbox
     OUTBOX_INDEX = os.path.join(target_root, "outbox_index.json")
     return True
@@ -604,6 +606,7 @@ def poll_moonraker(base, ctx):
         "target_bed": bed.get("target"),
         "progress": round((display.get("progress") or 0.0) * 100),
         "filename": filename,
+        "elapsed_seconds": print_stats.get("total_duration") or print_stats.get("print_duration"),
         # Show the loaded file's thumbnail whenever one is loaded (printing,
         # paused or just finished) — not only while actively printing.
         "thumbnail": moonraker_thumbnail(base, ctx, filename) if filename else "",
@@ -642,10 +645,11 @@ def poll_octoprint(base, ctx, apikey):
     tool0 = temps.get("tool0", {})
     bed = temps.get("bed", {})
     state = printer.get("state", {}).get("text", "Operational")
-    progress, filename, filepath = 0, "", ""
+    progress, elapsed_seconds, filename, filepath = 0, None, "", ""
     try:
         job = _get_json(base + "/api/job", ctx, headers=headers)
         progress = round(job.get("progress", {}).get("completion") or 0)
+        elapsed_seconds = job.get("progress", {}).get("printTime")
         job_file = job.get("job", {}).get("file", {})
         filename = job_file.get("name", "") or ""
         filepath = job_file.get("path", "") or filename
@@ -656,6 +660,7 @@ def poll_octoprint(base, ctx, apikey):
         "nozzle": tool0.get("actual"), "target_nozzle": tool0.get("target"),
         "bed": bed.get("actual"), "target_bed": bed.get("target"),
         "progress": progress, "filename": filename,
+        "elapsed_seconds": elapsed_seconds,
         "thumbnail": octoprint_thumbnail(base, headers, ctx, filepath) if filepath else "",
     }
 
@@ -1340,6 +1345,300 @@ def status_is_busy(status):
     return "paus" in state or "print" in state or state == "running"
 
 
+# --------------------------------------------------------------------------- #
+# Local observed print history. Providers expose incompatible history APIs, so
+# this store records only jobs Print Farm starts or actually sees while polling.
+# It never claims to reconstruct work performed while OrcaSlicer was offline.
+# --------------------------------------------------------------------------- #
+PRINT_HISTORY_MAX = 500
+PRINT_HISTORY_START_GRACE_SECONDS = 30
+PRINT_HISTORY_MAX_DURATION_SECONDS = 10 * 365 * 24 * 60 * 60
+PRINT_HISTORY_PROGRESS_FLUSH_PERCENT = 5
+PRINT_HISTORY_DURATION_FLUSH_SECONDS = 5 * 60
+_HISTORY_LOCK = threading.Lock()
+_HISTORY_ACTIVE_STATES = {"printing", "paused"}
+_HISTORY_TERMINAL_STATES = {"completed", "failed", "cancelled", "ended"}
+
+
+def printer_history_key(printer):
+    serial = str((printer or {}).get("serial") or "").strip()
+    if serial:
+        return "serial:%s" % serial.casefold()
+    url = normalize_url((printer or {}).get("url")).casefold()
+    if url:
+        return "url:%s" % url
+    printer_id = (printer or {}).get("id")
+    if isinstance(printer_id, int) and not isinstance(printer_id, bool):
+        return "printer:%d" % printer_id
+    return "printer:unknown"
+
+
+def _history_state(status):
+    raw = str((status or {}).get("state") or "").strip().lower()
+    if "cancel" in raw or "cancell" in raw:
+        return "cancelled"
+    if "fail" in raw or "error" in raw:
+        return "failed"
+    if raw in {"complete", "completed", "finish", "finished"}:
+        return "completed"
+    if "paus" in raw:
+        return "paused"
+    if "print" in raw or raw == "running":
+        return "printing"
+    if raw in {"idle", "standby", "operational", "ready", "connected"}:
+        return "idle"
+    return None
+
+
+def _history_filename(value):
+    return os.path.basename(str(value or "").strip().replace("\\", "/"))[:300]
+
+
+def _history_int(value, default=0, minimum=None, maximum=None):
+    if isinstance(value, bool):
+        return default
+    try:
+        result = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _normalized_history_record(item):
+    record = dict(item)
+    record["id"] = str(record.get("id") or "")[:80]
+    record["printer_key"] = str(record.get("printer_key") or "")[:500]
+    record["printer_name"] = str(record.get("printer_name") or "")[:160]
+    record["backend"] = str(record.get("backend") or "")[:40].lower()
+    record["filename"] = _history_filename(record.get("filename"))
+    state = str(record.get("state") or "").lower()
+    record["state"] = (
+        state if state in _HISTORY_ACTIVE_STATES | _HISTORY_TERMINAL_STATES else "ended"
+    )
+    record["source"] = (
+        "print_farm" if record.get("source") == "print_farm" else "observed"
+    )
+    record["started_at"] = _history_int(record.get("started_at"), minimum=0)
+    record["updated_at"] = _history_int(
+        record.get("updated_at"), record["started_at"], minimum=0
+    )
+    if record.get("finished_at") is not None:
+        record["finished_at"] = _history_int(
+            record.get("finished_at"), record["updated_at"], minimum=0
+        )
+    record["duration_seconds"] = _history_int(
+        record.get("duration_seconds"),
+        minimum=0,
+        maximum=PRINT_HISTORY_MAX_DURATION_SECONDS,
+    )
+    progress = record.get("progress")
+    record["progress"] = (
+        None
+        if progress is None
+        else _history_int(progress, None, minimum=0, maximum=100)
+    )
+    return record
+
+
+def load_print_history():
+    if not os.path.isfile(PRINT_HISTORY_FILE):
+        return []
+    try:
+        with open(PRINT_HISTORY_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    records = [
+        _normalized_history_record(item)
+        for item in data
+        if isinstance(item, dict) and item.get("id")
+    ]
+    records.sort(key=lambda item: _history_int(item.get("started_at")), reverse=True)
+    return records[:PRINT_HISTORY_MAX]
+
+
+def save_print_history(records):
+    records = [dict(item) for item in records if isinstance(item, dict) and item.get("id")]
+    records.sort(key=lambda item: _history_int(item.get("started_at")), reverse=True)
+    records = records[:PRINT_HISTORY_MAX]
+    tmp = PRINT_HISTORY_FILE + ".tmp"
+    try:
+        parent = os.path.dirname(PRINT_HISTORY_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(records, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, PRINT_HISTORY_FILE)
+        return True
+    except (OSError, TypeError, ValueError):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _history_elapsed(status):
+    value = (status or {}).get("elapsed_seconds")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return _history_int(value, minimum=0, maximum=PRINT_HISTORY_MAX_DURATION_SECONDS)
+
+
+def _new_history_record(printer, filename, now, source, elapsed_seconds=None):
+    started_at = now - elapsed_seconds if elapsed_seconds is not None else now
+    return {
+        "id": str(time.time_ns()),
+        "printer_key": printer_history_key(printer),
+        "printer_name": str((printer or {}).get("name") or (printer or {}).get("url") or "")[:160],
+        "backend": str((printer or {}).get("type") or "")[:40].lower(),
+        "filename": _history_filename(filename),
+        "state": "printing",
+        "source": source,
+        "started_at": started_at,
+        "updated_at": now,
+        "finished_at": None,
+        "duration_seconds": elapsed_seconds or 0,
+        "progress": None,
+    }
+
+
+def _update_history_record(record, status, state, now):
+    changed = False
+    filename = _history_filename((status or {}).get("filename"))
+    if filename and not record.get("filename"):
+        record["filename"] = filename
+        changed = True
+    progress = (status or {}).get("progress")
+    if isinstance(progress, (int, float)) and not isinstance(progress, bool):
+        progress = max(0, min(100, int(progress)))
+        previous_progress = _history_int(
+            record.get("progress"), None, minimum=0, maximum=100
+        )
+        progress = max(previous_progress or 0, progress)
+        if previous_progress != progress:
+            record["progress"] = progress
+            if (
+                previous_progress is None
+                or progress == 100
+                or progress - previous_progress >= PRINT_HISTORY_PROGRESS_FLUSH_PERCENT
+            ):
+                changed = True
+    elapsed = _history_elapsed(status)
+    started_at = _history_int(record.get("started_at"), now, minimum=0)
+    observed_duration = max(0, now - started_at)
+    duration = min(
+        PRINT_HISTORY_MAX_DURATION_SECONDS,
+        max(
+            _history_int(record.get("duration_seconds"), minimum=0),
+            elapsed or 0,
+            observed_duration,
+        ),
+    )
+    previous_duration = _history_int(record.get("duration_seconds"), minimum=0)
+    if previous_duration != duration:
+        record["duration_seconds"] = duration
+        if (
+            state in _HISTORY_TERMINAL_STATES
+            or duration - previous_duration >= PRINT_HISTORY_DURATION_FLUSH_SECONDS
+        ):
+            changed = True
+    if record.get("state") != state:
+        record["state"] = state
+        changed = True
+    finished_at = now if state in _HISTORY_TERMINAL_STATES else None
+    if record.get("finished_at") != finished_at:
+        record["finished_at"] = finished_at
+        changed = True
+    if changed:
+        record["updated_at"] = now
+    return changed
+
+
+def record_print_started(printer, filename, now=None):
+    """Persist a job immediately after a backend accepts a start request."""
+    now = int(time.time()) if now is None else int(now)
+    key = printer_history_key(printer)
+    with _HISTORY_LOCK:
+        records = load_print_history()
+        for item in records:
+            if item.get("printer_key") == key and item.get("state") in _HISTORY_ACTIVE_STATES:
+                _update_history_record(item, {"filename": filename}, "ended", now)
+        records.insert(0, _new_history_record(printer, filename, now, "print_farm"))
+        save_print_history(records)
+    return records[0]
+
+
+def record_print_observation(printer, status, now=None):
+    """Reconcile one live status into the bounded local history store."""
+    state = _history_state(status)
+    if state is None:
+        return False
+    now = int(time.time()) if now is None else int(now)
+    key = printer_history_key(printer)
+    filename = _history_filename((status or {}).get("filename"))
+    elapsed = _history_elapsed(status)
+    with _HISTORY_LOCK:
+        records = load_print_history()
+        active = next((
+            item for item in records
+            if item.get("printer_key") == key and item.get("state") in _HISTORY_ACTIVE_STATES
+        ), None)
+        changed = False
+        if state in _HISTORY_ACTIVE_STATES:
+            if active is None:
+                active = _new_history_record(printer, filename, now, "observed", elapsed)
+                records.insert(0, active)
+                changed = True
+            changed = _update_history_record(active, status, state, now) or changed
+        elif active is not None:
+            if (
+                state == "idle"
+                and active.get("source") == "print_farm"
+                and now - _history_int(active.get("started_at"), now) < PRINT_HISTORY_START_GRACE_SECONDS
+            ):
+                return False
+            terminal = state
+            if state == "idle":
+                progress = max(
+                    _history_int(active.get("progress"), minimum=0, maximum=100),
+                    _history_int((status or {}).get("progress"), minimum=0, maximum=100),
+                )
+                terminal = "completed" if progress >= 99 else "ended"
+            changed = _update_history_record(active, status, terminal, now) or changed
+        elif state in {"completed", "failed", "cancelled"} or (
+            state == "idle"
+            and filename
+            and _history_int((status or {}).get("progress"), minimum=0, maximum=100) >= 99
+        ):
+            terminal = "completed" if state == "idle" else state
+            latest = next((
+                item for item in records
+                if item.get("printer_key") == key
+                and item.get("filename") == filename
+                and item.get("state") in _HISTORY_TERMINAL_STATES
+            ), None)
+            if latest is None:
+                latest = _new_history_record(printer, filename, now, "observed", elapsed)
+                records.insert(0, latest)
+                changed = True
+            changed = _update_history_record(latest, status, terminal, now) or changed
+        if changed:
+            save_print_history(records)
+        return changed
+
+
+def print_history_for_printer(printer):
+    key = printer_history_key(printer)
+    return [item for item in load_print_history() if item.get("printer_key") == key]
+
+
 def _post_json(url, ctx, headers=None, payload=None, timeout=HTTP_TIMEOUT):
     body = json.dumps(payload if payload is not None else {}).encode("utf-8")
     hdrs = {"Content-Type": "application/json"}
@@ -1462,7 +1761,7 @@ PAGE = r"""<!DOCTYPE html>
      printing tile can expose two extra controls without overflowing into the
      next grid column or moving the ordinary actions. */
   .tile-actions { display:flex; flex-direction:column; gap:6px; margin-top:auto; min-width:0; }
-  .ctl-row { display:flex; justify-content:flex-end; min-height:28px; }
+  .ctl-row { display:flex; justify-content:space-between; align-items:center; gap:6px; min-height:28px; }
   .row { display:flex; gap:6px; align-items:center; min-width:0; }
   .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
   .row button { white-space:nowrap; padding-left:4px; padding-right:4px; }
@@ -1479,6 +1778,27 @@ PAGE = r"""<!DOCTYPE html>
   .qrow .qname { margin-right:auto; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .qrow .qstatus { color:var(--orca-muted,#a0a0a0); white-space:nowrap; }
   .qrow button { padding:1px 8px; font-size:11px; }
+  .history-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55);
+                   align-items:center; justify-content:center; z-index:25; padding:18px; }
+  .history-card { display:flex; flex-direction:column; width:min(680px,100%); max-height:85%;
+                  background:var(--orca-bg,#1e1e2e); border:1px solid var(--orca-border,#3c3c4c);
+                  border-radius:10px; box-shadow:0 12px 38px rgba(0,0,0,.35); }
+  .history-head { display:flex; align-items:center; gap:10px; padding:12px 14px;
+                  border-bottom:1px solid var(--orca-border,#3c3c4c); }
+  .history-head strong { margin-right:auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                         white-space:nowrap; }
+  .history-note { padding:10px 14px; font-size:11px; line-height:1.45;
+                  color:var(--orca-muted,#a0a0a0); }
+  .history-list { overflow:auto; padding:0 14px 14px; display:flex; flex-direction:column; gap:7px; }
+  .history-item { border:1px solid var(--orca-border,#3c3c4c); border-radius:7px;
+                  padding:8px 10px; display:flex; flex-direction:column; gap:5px; }
+  .history-item-top { display:flex; align-items:center; gap:8px; }
+  .history-file { margin-right:auto; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                  white-space:nowrap; font-size:12px; font-weight:600; }
+  .history-state { font-size:10px; padding:1px 6px; border-radius:999px;
+                   border:1px solid var(--orca-border,#3c3c4c); white-space:nowrap; }
+  .history-meta { color:var(--orca-muted,#a0a0a0); font-size:10px; display:flex;
+                  flex-wrap:wrap; gap:5px 12px; }
 </style></head>
 <body>
   <div id="bar">
@@ -1526,6 +1846,16 @@ PAGE = r"""<!DOCTYPE html>
         <button id="confirm-cancel" class="ghost">Cancel</button>
         <button id="confirm-ok">Send</button>
       </div>
+    </div>
+  </div>
+  <div id="history-modal" class="history-modal">
+    <div class="history-card">
+      <div class="history-head">
+        <strong id="history-title">Print history</strong>
+        <button id="history-close" class="ghost">Close</button>
+      </div>
+      <div id="history-note" class="history-note"></div>
+      <div id="history-list" class="history-list"><div class="empty">Loading…</div></div>
     </div>
   </div>
   <div id="grid"><div class="empty">Loading…</div></div>
@@ -1581,6 +1911,7 @@ function applyStaticCopy() {
   text('confirm-title', 'confirmTitle'); text('confirm-start-text', 'startImmediately');
   text('confirm-ams-text', 'useAms'); text('confirm-cancel', 'cancel');
   text('confirm-ok', 'send');
+  text('history-close', 'close'); text('history-note', 'historyCoverage');
   var empty = document.querySelector('#grid .empty'); if (empty) empty.textContent = t('loading');
   Array.prototype.forEach.call(document.getElementById('f-type').options, function(option) {
     if (!option.disabled) return;
@@ -1693,7 +2024,7 @@ function render(printers){
       : (busy ? t('printerBusy') : t('printerNotOnline'));
     var printAttrs = selectable ? '' : ' disabled title="' + esc(printDisabledReason) + '"';
     tile.innerHTML +=
-      '<div class="tile-actions"><div class="ctl-row">' + ctl + '</div>' +
+      '<div class="tile-actions"><div class="ctl-row"><button class="history ghost">' + esc(t('history')) + '</button>' + ctl + '</div>' +
       '<div class="row"><label><input type="checkbox" class="sel"' +
       (selected[p.url] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> ' + esc(t('select')) + '</label>' +
       '<button class="print ghost"' + printAttrs + '>' + esc(t('print')) + '</button>' +
@@ -1719,6 +2050,7 @@ function render(printers){
       });
     });
     tile.querySelector('.print').addEventListener('click', function(){ pickAndSend([p.url]); });
+    tile.querySelector('.history').addEventListener('click', function(){ openPrintHistory(p); });
     // Outbox records may be local exports waiting for an action, or copies of a
     // file Orca has already handed to a print host. Never offer a duplicate send
     // for the latter. Print arms on first click; × drops the retained copy.
@@ -1765,6 +2097,67 @@ function render(printers){
   });
   updateSendBtn();
 }
+
+
+var historyExpected = null;
+function historyStateLabel(state){
+  return t({ printing:'historyStatePrinting', paused:'historyStatePaused',
+    completed:'historyStateCompleted', failed:'historyStateFailed',
+    cancelled:'historyStateCancelled', ended:'historyStateEnded' }[state] || 'historyStateEnded');
+}
+function historyDuration(seconds){
+  var value = Math.max(0, Number(seconds) || 0);
+  var hours = Math.floor(value / 3600);
+  var minutes = Math.floor((value % 3600) / 60);
+  return hours
+    ? t('historyDurationHoursMinutes', {hours:hours, minutes:minutes})
+    : t('historyDurationMinutes', {minutes:minutes});
+}
+function openPrintHistory(printer){
+  historyExpected = { id:printer.id, url:printer.url };
+  document.getElementById('history-title').textContent = t('historyTitle', {
+    printer:printer.name || printer.url
+  });
+  document.getElementById('history-list').innerHTML = '<div class="empty">' + esc(t('historyLoading')) + '</div>';
+  document.getElementById('history-modal').style.display = 'flex';
+  orca.postMessage({ type:'print-history', id:printer.id, url:printer.url });
+}
+function closePrintHistory(){
+  historyExpected = null;
+  document.getElementById('history-modal').style.display = 'none';
+}
+function renderPrintHistory(payload){
+  if (!historyExpected || !payload) return;
+  if (historyExpected.id != null && payload.printerId != null && historyExpected.id !== payload.printerId) return;
+  if (historyExpected.id == null && historyExpected.url !== payload.printerUrl) return;
+  document.getElementById('history-title').textContent = t('historyTitle', {
+    printer:payload.printerName || historyExpected.url
+  });
+  var list = document.getElementById('history-list');
+  var items = payload.items || [];
+  if (!items.length) {
+    list.innerHTML = '<div class="empty">' + esc(t('historyEmpty')) + '</div>';
+    return;
+  }
+  list.innerHTML = '';
+  items.forEach(function(item){
+    var row = document.createElement('div'); row.className = 'history-item';
+    var source = item.source === 'print_farm' ? t('historyStartedHere') : t('historyObserved');
+    var started = item.started_at ? new Date(item.started_at * 1000).toLocaleString() : '—';
+    var progress = item.progress == null ? '' : t('historyProgress', {progress:item.progress});
+    row.innerHTML = '<div class="history-item-top"><span class="history-file" title="' +
+      esc(item.filename || t('historyUnknownFile')) + '">' + esc(item.filename || t('historyUnknownFile')) +
+      '</span><span class="history-state">' + esc(historyStateLabel(item.state)) + '</span></div>' +
+      '<div class="history-meta"><span>' + esc(started) + '</span><span>' +
+      esc(historyDuration(item.duration_seconds)) + '</span><span>' + esc(source) + '</span>' +
+      (progress ? '<span>' + esc(progress) + '</span>' : '') + '</div>';
+    list.appendChild(row);
+  });
+}
+document.getElementById('history-close').addEventListener('click', closePrintHistory);
+document.getElementById('history-modal').addEventListener('click', function(event){
+  if (event.target === this) closePrintHistory();
+});
 
 
 // Bambu (LAN) needs a serial + access code instead of the self-signed toggle;
@@ -1892,6 +2285,7 @@ orca.onMessage(function(data){
   }
   if (data.available) { lastAvailable = data.available; renderAvailable(); }
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
+  if (data.printHistory) renderPrintHistory(data.printHistory);
   if (data.unmatched !== undefined)
     document.getElementById('status').textContent = data.unmatched
       ? t('unmatchedQueued', {count:data.unmatched})
@@ -1989,6 +2383,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 ACTION_WORKER.submit(self._poll_dashboard)
         elif kind == "printer-cmd":
             ACTION_WORKER.submit(self._do_printer_cmd, msg)
+        elif kind == "print-history":
+            ACTION_WORKER.submit(self._post_print_history, msg)
         elif kind == "outbox-send":
             ACTION_WORKER.submit(self._do_outbox_send, msg)
         elif kind == "outbox-drop":
@@ -2132,7 +2528,17 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 if generation is not None and generation != self._list_generation:
                     return
                 self._status_cache[printer.get("url")] = dict(status)
-            self._post({"printerStatus": {"url": printer.get("url"), "status": status}})
+            history_changed = record_print_observation(printer, status)
+            payload = {"printerStatus": {"url": printer.get("url"), "status": status}}
+            if history_changed:
+                payload["printHistory"] = {
+                    "printerKey": printer_history_key(printer),
+                    "printerId": printer.get("id"),
+                    "printerUrl": printer.get("url") or "",
+                    "printerName": printer.get("name") or printer.get("url") or "",
+                    "items": print_history_for_printer(printer),
+                }
+            self._post(payload)
         finally:
             if batch is not None:
                 batch.finish_one()
@@ -2257,6 +2663,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
         result = send_gcode(printer, record.get("name") or stored, file_bytes,
                             start=start, use_ams=bool(msg.get("use_ams", True)))
         if result.get("ok"):
+            if start:
+                record_print_started(printer, record.get("name") or stored)
             outbox_remove(stored)
             done = ui_text("sentToPrint" if start else "uploadedNotStarted")
             self._post_status(ui_text(
@@ -2272,6 +2680,29 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
                 error=operation_error_text(result),
             ))
         self._refresh_worker(None)
+
+    def _post_print_history(self, msg):
+        target = normalize_url(msg.get("url") or "")
+        printer_id = msg.get("id")
+        printer = next((
+            item for item in dashboard_printers()
+            if (
+                isinstance(printer_id, int)
+                and not isinstance(printer_id, bool)
+                and item.get("id") == printer_id
+            ) or normalize_url(item.get("url")) == target
+        ), None)
+        if printer is None:
+            return
+        self._post({
+            "printHistory": {
+                "printerKey": printer_history_key(printer),
+                "printerId": printer.get("id"),
+                "printerUrl": printer.get("url") or "",
+                "printerName": printer.get("name") or printer.get("url") or "",
+                "items": print_history_for_printer(printer),
+            }
+        })
 
     def _do_printer_cmd(self, msg):
         printers = dashboard_printers()
@@ -2329,6 +2760,8 @@ class PrintersDashboard(orca.script.ScriptPluginCapabilityBase):
             result = send_gcode(p, filename, file_bytes, start, use_ams)
             if result.get("ok"):
                 ok += 1
+                if start:
+                    record_print_started(p, filename)
             else:
                 fail += 1
                 errors.append("%s: %s" % (

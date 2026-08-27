@@ -145,12 +145,12 @@ class PrintersOutboxTest(unittest.TestCase):
             )
             self.assertEqual(
                 {path.name for path in (package / "printers_locales").glob("*.json")},
-                {"en.json", "ru.json", "zh_CN.json", "zh_TW.json"},
+                {"%s.json" % locale for locale in self.plugin.ORCA_UI_LOCALES},
             )
             metadata = json.loads(
                 (package / "package-metadata.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(metadata["locales"], ["en", "ru", "zh_CN", "zh_TW"])
+            self.assertEqual(metadata["locales"], sorted(self.plugin.ORCA_UI_LOCALES))
 
     def test_release_notes_use_only_current_changelog_section(self):
         spec = importlib.util.spec_from_file_location("printers_build_under_test", BUILD_PATH)
@@ -181,6 +181,9 @@ class PluginStorageTest(unittest.TestCase):
             (legacy / "outbox_index.json").write_text(
                 '[{"file":"fixture.gcode"}]', encoding="utf-8"
             )
+            (legacy / "print_history.json").write_text(
+                '[{"id":"history-1","started_at":1}]', encoding="utf-8"
+            )
             (legacy / "outbox").mkdir()
             (legacy / "outbox" / "fixture.gcode").write_text("G28", encoding="utf-8")
 
@@ -188,6 +191,7 @@ class PluginStorageTest(unittest.TestCase):
             with mock.patch.object(self.plugin, "PLUGIN_DIR", str(legacy)), \
                  mock.patch.object(self.plugin, "PLUGIN_STORAGE_DIR", str(legacy)), \
                  mock.patch.object(self.plugin, "PRINTERS_FILE", str(legacy / "printers.json")), \
+                 mock.patch.object(self.plugin, "PRINT_HISTORY_FILE", str(legacy / "print_history.json")), \
                  mock.patch.object(self.plugin, "OUTBOX_DIR", str(legacy / "outbox")), \
                  mock.patch.object(self.plugin, "OUTBOX_INDEX", str(legacy / "outbox_index.json")), \
                  mock.patch.object(self.plugin.orca.host, "plugin", plugin_host, create=True):
@@ -195,6 +199,10 @@ class PluginStorageTest(unittest.TestCase):
 
                 self.assertEqual(self.plugin.PLUGIN_STORAGE_DIR, str(storage))
                 self.assertEqual(self.plugin.PRINTERS_FILE, str(storage / "printers.json"))
+                self.assertEqual(
+                    self.plugin.PRINT_HISTORY_FILE,
+                    str(storage / "print_history.json"),
+                )
                 self.assertEqual(self.plugin.OUTBOX_DIR, str(storage / "outbox"))
                 self.assertEqual(
                     (storage / "printers.json").read_text(encoding="utf-8"),
@@ -203,6 +211,10 @@ class PluginStorageTest(unittest.TestCase):
                 self.assertEqual(
                     (storage / "outbox" / "fixture.gcode").read_text(encoding="utf-8"),
                     "G28",
+                )
+                self.assertEqual(
+                    json.loads((storage / "print_history.json").read_text(encoding="utf-8"))[0]["id"],
+                    "history-1",
                 )
 
             self.assertTrue((legacy / "printers.json").exists())
@@ -493,6 +505,23 @@ class PluginStorageTest(unittest.TestCase):
 
         self.assertEqual(validator.validate_catalogs(), [])
 
+    def test_every_orca_locale_has_a_complete_catalog(self):
+        locale_dir = PLUGIN_PATH.with_name("printers_locales")
+        english_keys = set(json.loads(
+            (locale_dir / "en.json").read_text(encoding="utf-8")
+        ))
+
+        self.assertEqual(
+            {path.stem for path in locale_dir.glob("*.json")},
+            set(self.plugin.ORCA_UI_LOCALES),
+        )
+        for locale in self.plugin.ORCA_UI_LOCALES:
+            with self.subTest(locale=locale):
+                catalog = json.loads(
+                    (locale_dir / (locale + ".json")).read_text(encoding="utf-8")
+                )
+                self.assertEqual(set(catalog), english_keys)
+
     def test_mass_print_rechecks_busy_state_before_send(self):
         dashboard = self.plugin.PrintersDashboard()
         dashboard._post = mock.Mock(return_value=True)
@@ -528,6 +557,210 @@ class PluginStorageTest(unittest.TestCase):
         send.assert_not_called()
         status_payload = dashboard._post.call_args.args[0]
         self.assertIn("printer is busy", status_payload["status"])
+
+
+class PrintHistoryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = _load_plugin()
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.plugin.PRINT_HISTORY_FILE = str(
+            pathlib.Path(self.temp_dir.name) / "print_history.json"
+        )
+        self.printer = {
+            "id": 7,
+            "name": "Voron",
+            "url": "http://voron.local",
+            "type": "moonraker",
+        }
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_observed_job_keeps_one_record_across_pause_and_completion(self):
+        self.assertTrue(self.plugin.record_print_observation(
+            self.printer,
+            {
+                "state": "printing",
+                "filename": "parts/cube.gcode",
+                "progress": 25,
+                "elapsed_seconds": 30,
+            },
+            now=1_000,
+        ))
+        self.assertTrue(self.plugin.record_print_observation(
+            self.printer,
+            {"state": "paused", "filename": "cube.gcode", "progress": 50},
+            now=1_060,
+        ))
+        self.assertTrue(self.plugin.record_print_observation(
+            self.printer,
+            {
+                "state": "complete",
+                "filename": "cube.gcode",
+                "progress": 100,
+                "elapsed_seconds": 120,
+            },
+            now=1_120,
+        ))
+
+        history = self.plugin.print_history_for_printer(self.printer)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["filename"], "cube.gcode")
+        self.assertEqual(history[0]["state"], "completed")
+        self.assertEqual(history[0]["progress"], 100)
+        self.assertEqual(history[0]["duration_seconds"], 150)
+        self.assertEqual(history[0]["source"], "observed")
+
+    def test_partial_job_returning_to_idle_is_ended_not_claimed_complete(self):
+        self.plugin.record_print_observation(
+            self.printer,
+            {"state": "printing", "filename": "fixture.gcode", "progress": 30},
+            now=2_000,
+        )
+        self.plugin.record_print_observation(
+            self.printer,
+            {"state": "standby", "filename": "fixture.gcode", "progress": 30},
+            now=2_100,
+        )
+
+        self.assertEqual(
+            self.plugin.print_history_for_printer(self.printer)[0]["state"],
+            "ended",
+        )
+
+    def test_repeated_terminal_snapshot_does_not_duplicate_history(self):
+        terminal = {
+            "state": "finished",
+            "filename": "fixture.gcode",
+            "progress": 100,
+            "elapsed_seconds": 90,
+        }
+        self.plugin.record_print_observation(self.printer, terminal, now=3_000)
+        self.plugin.record_print_observation(self.printer, terminal, now=3_015)
+
+        self.assertEqual(len(self.plugin.print_history_for_printer(self.printer)), 1)
+
+    def test_print_farm_start_is_persisted_before_the_first_poll(self):
+        record = self.plugin.record_print_started(
+            self.printer,
+            "fresh.gcode",
+            now=4_000,
+        )
+
+        self.assertEqual(record["source"], "print_farm")
+        self.assertEqual(record["state"], "printing")
+        self.assertEqual(
+            self.plugin.print_history_for_printer(self.printer)[0]["filename"],
+            "fresh.gcode",
+        )
+
+    def test_accepted_start_ignores_an_immediate_stale_idle_poll(self):
+        self.plugin.record_print_started(self.printer, "fresh.gcode", now=4_000)
+
+        self.assertFalse(self.plugin.record_print_observation(
+            self.printer,
+            {"state": "idle", "filename": "", "progress": 0},
+            now=4_010,
+        ))
+
+        record = self.plugin.print_history_for_printer(self.printer)[0]
+        self.assertEqual(record["state"], "printing")
+        self.assertIsNone(record["finished_at"])
+
+    def test_malformed_numeric_fields_are_sanitized_when_history_is_loaded(self):
+        pathlib.Path(self.plugin.PRINT_HISTORY_FILE).write_text(
+            json.dumps([{
+                "id": "broken",
+                "printer_key": "url:http://voron.local",
+                "state": "printing",
+                "started_at": "not-a-time",
+                "updated_at": {},
+                "duration_seconds": "forever",
+                "progress": "lots",
+            }]),
+            encoding="utf-8",
+        )
+
+        record = self.plugin.load_print_history()[0]
+
+        self.assertEqual(record["started_at"], 0)
+        self.assertEqual(record["updated_at"], 0)
+        self.assertEqual(record["duration_seconds"], 0)
+        self.assertIsNone(record["progress"])
+
+    def test_reused_numeric_id_does_not_inherit_another_printer_history(self):
+        self.plugin.record_print_started(self.printer, "voron.gcode", now=4_000)
+        replacement = dict(self.printer, url="http://replacement.local")
+
+        self.assertEqual(self.plugin.print_history_for_printer(replacement), [])
+
+    def test_successful_mass_print_records_the_accepted_start(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        message = {
+            "dataB64": "RzI4",
+            "filename": "fresh.gcode",
+            "urls": [self.printer["url"]],
+            "start": True,
+        }
+
+        with mock.patch.object(
+            self.plugin,
+            "dashboard_printers",
+            return_value=[self.printer],
+        ), mock.patch.object(
+            self.plugin,
+            "poll_printer",
+            return_value={"online": True, "state": "idle"},
+        ), mock.patch.object(
+            self.plugin,
+            "send_gcode",
+            return_value={"ok": True},
+        ), mock.patch.object(
+            self.plugin,
+            "record_print_started",
+        ) as record_started, mock.patch.object(
+            dashboard,
+            "_refresh_worker",
+        ):
+            dashboard._do_mass_print(message)
+
+        record_started.assert_called_once_with(self.printer, "fresh.gcode")
+
+    def test_dashboard_pushes_only_the_requested_printer_history(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        other = {
+            "id": 8,
+            "name": "Other",
+            "url": "http://other.local",
+            "type": "octoprint",
+        }
+        self.plugin.record_print_started(self.printer, "voron.gcode", now=5_000)
+        self.plugin.record_print_started(other, "other.gcode", now=5_001)
+
+        with mock.patch.object(
+            self.plugin,
+            "dashboard_printers",
+            return_value=[self.printer, other],
+        ):
+            dashboard._post_print_history({
+                "id": self.printer["id"],
+                "url": self.printer["url"],
+            })
+
+        payload = dashboard._post.call_args.args[0]["printHistory"]
+        self.assertEqual(payload["printerId"], 7)
+        self.assertEqual([item["filename"] for item in payload["items"]], ["voron.gcode"])
+
+    def test_history_button_is_per_printer_and_explains_observation_scope(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn('class="history ghost"', source)
+        self.assertIn("openPrintHistory(p)", source)
+        self.assertIn("text('history-note', 'historyCoverage')", source)
 
 
 if __name__ == "__main__":

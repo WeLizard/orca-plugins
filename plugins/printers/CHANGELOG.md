@@ -2,6 +2,10 @@
 
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
+## Unreleased
+- Added a per-printer local history modal for jobs started by Print Farm or observed while the dashboard is open, with explicit offline-coverage limits.
+- Bundled complete interface catalogs for every current OrcaSlicer UI locale; printer protocols and raw backend diagnostics remain unchanged.
+
 ## 0.0.4
 - Made add, remove, refresh and printer polling update independently without stale or returning tiles.
 - Moonraker, OctoPrint and Bambu Lab now use complete status/control/upload backends; unfinished host types remain visible but disabled instead of pretending to work.
