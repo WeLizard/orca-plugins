@@ -12,6 +12,14 @@ own Multi-device tab is Bambu-only.
 **Active testing:** this is an alpha plugin tested against exact OrcaSlicer PR
 artifacts. The upstream plugin API is still evolving and updates may be frequent.
 
+## Known OrcaSlicer UI limitation
+
+The available-printer picker currently uses the native drop-down supplied by
+OrcaSlicer's embedded WebView. If that drop-down is open while the OrcaSlicer
+window is moved, its popup may remain at its original screen position until it
+is closed. Selecting an item, pressing Esc, or clicking outside closes it; the
+dashboard and printer data are unaffected.
+
 ## What it does
 
 - Native `orca.pages.PagesPluginCapabilityBase` dashboard, with

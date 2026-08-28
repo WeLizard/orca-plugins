@@ -17,3 +17,8 @@ Printer protocols and raw diagnostic messages remain in English.
 
 **Development status:** Alpha. The OrcaSlicer Python Plugin API is still
 evolving, and some capabilities use compatibility fallbacks on older builds.
+
+**Known OrcaSlicer UI limitation:** if the native available-printer drop-down
+is open while the OrcaSlicer window is moved, its popup may remain at its
+original screen position until it is closed. Selecting an item, pressing Esc,
+or clicking outside closes it; the dashboard and printer data are unaffected.
