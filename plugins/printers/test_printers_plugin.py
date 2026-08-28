@@ -785,8 +785,28 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn('id="manual-toggle" class="ghost"', source)
         self.assertIn("setManualFormOpen(true);", source)
         self.assertIn('class="compact-option"', source)
+        self.assertIn('class="disclosure-icon" viewBox="0 0 12 8"', source)
+        self.assertIn(
+            '#manual-toggle[aria-expanded="true"] .disclosure-icon',
+            source,
+        )
         self.assertIn('<span aria-hidden="true">TLS</span>', source)
         self.assertNotIn('id="f-insecure-text"', source)
+        self.assertLess(source.index('id="f-apikey"'), source.index('id="f-type"'))
+        self.assertLess(source.index('id="f-type"'), source.index('id="add"'))
+
+    def test_removing_a_printer_rechecks_lan_availability(self):
+        dashboard = self.plugin.PrintersDashboard()
+        discovered = [{"name": "Configured", "url": "http://printer"}]
+
+        with mock.patch.object(dashboard, "_remove_manual") as remove, mock.patch.object(
+            dashboard,
+            "_refresh_worker",
+        ) as refresh:
+            dashboard._remove_and_refresh(7, discovered)
+
+        remove.assert_called_once_with(7)
+        refresh.assert_called_once_with(discovered, discover_network=True)
 
     def test_each_printer_status_is_pushed_without_waiting_for_slower_peers(self):
         dashboard = self.plugin.PrintersDashboard()

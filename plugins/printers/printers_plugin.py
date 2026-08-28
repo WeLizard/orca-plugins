@@ -2012,7 +2012,9 @@ PAGE = r"""<!DOCTYPE html>
                     border:1px solid var(--orca-border,#3c3c4c); cursor:pointer;
                     color:var(--orca-muted,#a0a0a0); font-size:10px; white-space:nowrap; }
   .compact-option input { margin:0; }
-  .button-icon { font-size:14px; line-height:1; }
+  .disclosure-icon { width:11px; height:7px; flex:0 0 auto;
+                     transition:transform 120ms ease; }
+  #manual-toggle[aria-expanded="true"] .disclosure-icon { transform:rotate(180deg); }
   button { font:inherit; font-size:12px; cursor:pointer; padding:4px 12px; border-radius:4px;
            background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff);
            border:1px solid var(--orca-accent,#009688); }
@@ -2095,15 +2097,23 @@ PAGE = r"""<!DOCTYPE html>
       <span id="status"></span>
       <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
       <button id="manual-toggle" class="ghost" type="button" aria-expanded="false">
-        <span class="button-icon" aria-hidden="true">＋</span> <span id="manual-toggle-text">Add</span>
+        <span id="manual-toggle-text">Add</span>
+        <svg class="disclosure-icon" viewBox="0 0 12 8" aria-hidden="true" focusable="false">
+          <path d="M1 1.5 6 6.5 11 1.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
       </button>
       <button id="refresh" class="ghost" type="button">
-        <span class="button-icon" aria-hidden="true">↻</span> <span id="refresh-text">Refresh</span>
+        <span aria-hidden="true">↻</span> <span id="refresh-text">Refresh</span>
       </button>
     </div>
     <div id="manual-form" class="manual-form" aria-hidden="true">
       <input id="f-name" placeholder="Name" size="8">
       <input id="f-url" placeholder="192.168.0.42" size="14">
+      <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
+      <input id="f-access" placeholder="Access code" size="10" style="display:none">
+      <input id="f-apikey" type="password" autocomplete="off" placeholder="OctoPrint API key" size="18" style="display:none">
+      <label id="f-insecure-l" class="compact-option" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this.">
+        <input id="f-insecure" type="checkbox"> <span aria-hidden="true">TLS</span></label>
       <select id="f-type" title="Connection type. Active integrations provide live status, controls and upload. Disabled entries remain planned targets.">
         <option value="moonraker">Moonraker / Klipper</option>
         <option value="octoprint">OctoPrint</option>
@@ -2120,11 +2130,6 @@ PAGE = r"""<!DOCTYPE html>
         <option value="elegoolink" disabled>Elegoo — coming later</option>
         <option value="generic" disabled>Other — coming later</option>
       </select>
-      <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
-      <input id="f-access" placeholder="Access code" size="10" style="display:none">
-      <input id="f-apikey" type="password" autocomplete="off" placeholder="OctoPrint API key" size="18" style="display:none">
-      <label id="f-insecure-l" class="compact-option" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this.">
-        <input id="f-insecure" type="checkbox"> <span aria-hidden="true">TLS</span></label>
       <button id="add">Add</button>
     </div>
     <input id="file" type="file" accept=".gcode,.gco,.g,.gz,.3mf" style="display:none">
@@ -3058,7 +3063,9 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         if not ACTION_WORKER.current_job_is_active():
             return
         self._remove_manual(printer_id)
-        self._refresh_worker(discovered)
+        # A LAN printer that was removed should immediately become available
+        # for adoption again, without making the user press Refresh.
+        self._refresh_worker(discovered, discover_network=True)
 
     def _drop_and_refresh(self, stored, discovered):
         if not ACTION_WORKER.current_job_is_active():
