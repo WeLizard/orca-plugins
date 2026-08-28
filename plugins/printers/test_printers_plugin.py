@@ -14,6 +14,7 @@ import threading
 import tomllib
 import types
 import unittest
+import urllib.error
 import zipfile
 from unittest import mock
 
@@ -388,6 +389,8 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn("if (data.adoptResult)", source)
         self.assertIn("activeUrls[normalizedPrinterUrl(p.url)]", source)
         self.assertIn("var pendingFormAdd = false;", source)
+        self.assertIn("orca.postMessage({ type:'adopt', discoveryRef:p.discovery_ref });", source)
+        self.assertNotIn("orca.postMessage({ type:'adopt', printer:p });", source)
 
         dashboard = self.plugin.PrintersDashboard()
         dashboard._post = mock.Mock(return_value=True)
@@ -399,6 +402,141 @@ class PluginStorageTest(unittest.TestCase):
         dashboard._post.assert_called_once_with({
             "adoptResult": {"url": "http://printer", "ok": True},
         })
+
+    def test_saved_credentials_never_reach_the_dashboard_page(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        private = {
+            "id": 1,
+            "discovery_ref": "orca:fixture",
+            "name": "Authenticated OctoPrint",
+            "url": "http://octoprint.local",
+            "type": "octoprint",
+            "apikey": "octoprint-secret",
+            "access_code": "bambu-secret",
+        }
+
+        self.assertEqual(
+            self.plugin.public_printer_record(private),
+            {
+                "id": 1,
+                "discovery_ref": "orca:fixture",
+                "name": "Authenticated OctoPrint",
+                "url": "http://octoprint.local",
+                "type": "octoprint",
+            },
+        )
+        with mock.patch.object(
+            self.plugin,
+            "load_manual_printers",
+            return_value=[],
+        ):
+            self.assertEqual(
+                self.plugin.available_orca_printers([private]),
+                [self.plugin.public_printer_record(private)],
+            )
+
+        with mock.patch.object(
+            self.plugin,
+            "dashboard_printers",
+            return_value=[dict(private)],
+        ), mock.patch.object(
+            self.plugin,
+            "attach_outbox",
+            return_value=0,
+        ), mock.patch.object(
+            dashboard,
+            "_poll_and_push",
+        ):
+            dashboard._refresh_worker([dict(private)], False)
+
+        payload = dashboard._post.call_args.args[0]
+        serialized = json.dumps(payload)
+        self.assertNotIn("octoprint-secret", serialized)
+        self.assertNotIn("bambu-secret", serialized)
+        self.assertEqual(payload["available"][0]["discovery_ref"], "orca:fixture")
+
+        dashboard._post.reset_mock()
+        with mock.patch.object(self.plugin, "autoname_printers"), mock.patch.object(
+            self.plugin,
+            "attach_outbox",
+        ):
+            dashboard._finish_poll_batch([dict(private)])
+        serialized = json.dumps(dashboard._post.call_args.args[0])
+        self.assertNotIn("octoprint-secret", serialized)
+        self.assertNotIn("bambu-secret", serialized)
+
+    def test_orca_picker_resolves_credentials_only_from_python_snapshot(self):
+        dashboard = self.plugin.PrintersDashboard()
+        private = {
+            "discovery_ref": "orca:trusted",
+            "name": "OctoPrint",
+            "url": "http://octoprint.local",
+            "type": "octoprint",
+            "apikey": "trusted-secret",
+        }
+        dashboard._discovered_printers = {"orca:trusted": private}
+
+        with mock.patch.object(
+            dashboard,
+            "_capture_discovered_printers",
+            return_value=[private],
+        ), mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
+            dashboard.on_message({
+                "type": "adopt",
+                "discoveryRef": "orca:trusted",
+                "printer": {
+                    "url": "http://attacker.invalid",
+                    "apikey": "attacker-secret",
+                },
+            })
+
+            submit.assert_called_once()
+            entry = submit.call_args.args[1]
+            self.assertEqual(entry["url"], "http://octoprint.local")
+            self.assertEqual(entry["apikey"], "trusted-secret")
+
+            submit.reset_mock()
+            dashboard.on_message({
+                "type": "adopt",
+                "discoveryRef": "orca:unknown",
+                "printer": private,
+            })
+            submit.assert_not_called()
+
+    def test_manual_octoprint_api_key_is_private_and_type_scoped(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="f-apikey" type="password" autocomplete="off"', source)
+        self.assertIn("document.getElementById('f-apikey').value = '';", source)
+        dashboard = self.plugin.PrintersDashboard()
+
+        with mock.patch.object(
+            dashboard,
+            "_capture_discovered_printers",
+            return_value=[],
+        ), mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
+            dashboard.on_message({
+                "type": "add",
+                "name": "OctoPrint",
+                "url": "octoprint.local",
+                "kind": "octoprint",
+                "apikey": "  secret-key  ",
+                "access_code": "must-not-be-stored",
+            })
+
+            entry = submit.call_args.args[1]
+            self.assertEqual(entry["apikey"], "secret-key")
+            self.assertEqual(entry["access_code"], "")
+
+            submit.reset_mock()
+            dashboard.on_message({
+                "type": "add",
+                "name": "Moonraker",
+                "url": "moonraker.local",
+                "kind": "moonraker",
+                "apikey": "must-not-be-stored",
+            })
+            self.assertEqual(submit.call_args.args[1]["apikey"], "")
 
     def test_plugin_does_not_forge_host_owned_process_manifest_refs(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
@@ -867,6 +1005,206 @@ class PluginStorageTest(unittest.TestCase):
         send.assert_not_called()
         status_payload = dashboard._post.call_args.args[0]
         self.assertIn("printer is busy", status_payload["status"])
+
+
+class OctoPrintTransportTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = _load_plugin()
+
+    def test_status_uses_authenticated_printer_and_job_endpoints(self):
+        printer_response = {
+            "temperature": {
+                "tool0": {"actual": 214.5, "target": 215.0},
+                "bed": {"actual": 59.5, "target": 60.0},
+            },
+            "state": {"text": "Printing"},
+        }
+        job_response = {
+            "progress": {"completion": 42.4, "printTime": 120},
+            "job": {"file": {"name": "fixture.gcode", "path": "fixture.gcode"}},
+        }
+        context = mock.sentinel.ssl_context
+
+        with mock.patch.object(
+            self.plugin,
+            "_get_json",
+            side_effect=[printer_response, job_response],
+        ) as get_json, mock.patch.object(
+            self.plugin,
+            "octoprint_thumbnail",
+            return_value="data:image/png;base64,fixture",
+        ) as thumbnail:
+            status = self.plugin.poll_octoprint(
+                "http://octoprint.local",
+                context,
+                "secret-key",
+            )
+
+        headers = {"Accept": "application/json", "X-Api-Key": "secret-key"}
+        self.assertEqual(
+            get_json.call_args_list,
+            [
+                mock.call(
+                    "http://octoprint.local/api/printer",
+                    context,
+                    headers=headers,
+                ),
+                mock.call(
+                    "http://octoprint.local/api/job",
+                    context,
+                    headers=headers,
+                ),
+            ],
+        )
+        thumbnail.assert_called_once_with(
+            "http://octoprint.local",
+            headers,
+            context,
+            "fixture.gcode",
+        )
+        self.assertEqual(status["state"], "Printing")
+        self.assertEqual(status["progress"], 42)
+        self.assertEqual(status["filename"], "fixture.gcode")
+        self.assertEqual(status["nozzle"], 214.5)
+        self.assertEqual(status["bed"], 59.5)
+
+    def test_disconnected_printer_keeps_reachable_octoprint_online(self):
+        disconnected = urllib.error.HTTPError(
+            "http://octoprint.local/api/printer",
+            409,
+            "Conflict",
+            {},
+            None,
+        )
+        context = mock.sentinel.ssl_context
+        with mock.patch.object(
+            self.plugin,
+            "_get_json",
+            side_effect=[
+                disconnected,
+                {"current": {"state": "Closed"}},
+                {"progress": {}, "job": {"file": {}}},
+            ],
+        ) as get_json:
+            status = self.plugin.poll_octoprint(
+                "http://octoprint.local",
+                context,
+                "secret-key",
+            )
+
+        self.assertTrue(status["online"])
+        self.assertEqual(status["state"], "Closed")
+        self.assertIsNone(status["nozzle"])
+        self.assertEqual(
+            [call.args[0] for call in get_json.call_args_list],
+            [
+                "http://octoprint.local/api/printer",
+                "http://octoprint.local/api/connection",
+                "http://octoprint.local/api/job",
+            ],
+        )
+
+    def test_authentication_failure_does_not_fall_back_to_false_online(self):
+        unauthorized = urllib.error.HTTPError(
+            "http://octoprint.local/api/printer",
+            401,
+            "Unauthorized",
+            {},
+            None,
+        )
+        with mock.patch.object(
+            self.plugin,
+            "_get_json",
+            side_effect=unauthorized,
+        ) as get_json:
+            with self.assertRaises(urllib.error.HTTPError):
+                self.plugin.poll_octoprint(
+                    "http://octoprint.local",
+                    mock.sentinel.ssl_context,
+                    "wrong-key",
+                )
+
+        get_json.assert_called_once()
+
+    def test_controls_use_authenticated_job_endpoint(self):
+        printer = {
+            "url": "http://octoprint.local/",
+            "type": "octoprint",
+            "apikey": "secret-key",
+        }
+        expected_payloads = {
+            "pause": {"command": "pause", "action": "pause"},
+            "resume": {"command": "pause", "action": "resume"},
+            "cancel": {"command": "cancel"},
+        }
+
+        for action, expected_payload in expected_payloads.items():
+            with self.subTest(action=action), mock.patch.object(
+                self.plugin,
+                "ssl_ctx_for",
+                return_value=mock.sentinel.ssl_context,
+            ), mock.patch.object(self.plugin, "_post_json") as post_json:
+                result = self.plugin.printer_command(printer, action)
+
+            self.assertEqual(result, {"ok": True})
+            post_json.assert_called_once_with(
+                "http://octoprint.local/api/job",
+                mock.sentinel.ssl_context,
+                {"X-Api-Key": "secret-key"},
+                expected_payload,
+                timeout=self.plugin.CONTROL_TIMEOUT,
+            )
+
+    def test_upload_uses_authenticated_local_files_endpoint(self):
+        printer = {
+            "url": "http://octoprint.local",
+            "type": "octoprint",
+            "apikey": "secret-key",
+        }
+
+        with mock.patch.object(
+            self.plugin,
+            "ssl_ctx_for",
+            return_value=mock.sentinel.ssl_context,
+        ), mock.patch.object(self.plugin, "_multipart_upload") as upload:
+            result = self.plugin.send_gcode(
+                printer,
+                "fixture.gcode",
+                b"G28\n",
+                start=True,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        upload.assert_called_once_with(
+            "http://octoprint.local/api/files/local",
+            mock.sentinel.ssl_context,
+            {"X-Api-Key": "secret-key"},
+            "fixture.gcode",
+            b"G28\n",
+            {"select": "true", "print": "true"},
+        )
+
+    def test_transport_errors_are_reported_without_false_success(self):
+        printer = {
+            "url": "http://octoprint.local",
+            "type": "octoprint",
+            "apikey": "secret-key",
+        }
+        with mock.patch.object(
+            self.plugin,
+            "_multipart_upload",
+            side_effect=RuntimeError("401 Unauthorized"),
+        ):
+            result = self.plugin.send_gcode(
+                printer,
+                "fixture.gcode",
+                b"G28\n",
+                start=False,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("401 Unauthorized", result["error"])
 
 
 class HostApiCompatibilityTest(unittest.TestCase):

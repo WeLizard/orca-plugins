@@ -12,6 +12,7 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 - Added a native OrcaSlicer plugin tab while keeping the dashboard available on supported older builds.
 - Preserved printers, history, and queued files across plugin updates and stopped queued LAN actions when the plugin is disabled or updated.
 - Kept embedded printer interfaces inside their selected HTTP(S) site so links cannot replace the OrcaSlicer page.
+- Authenticated OctoPrint instances can now be added manually, while saved OctoPrint and Bambu credentials remain in Python private storage and are never reflected into the dashboard page.
 
 ## 0.0.4
 - Made add, remove, refresh and printer polling update independently without stale or returning tiles.

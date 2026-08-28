@@ -26,6 +26,9 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
 - **Add / remove** printers in the page; mutable state uses
   `orca.host.plugin.storage()` when available and falls back to a stable
   directory outside the replaceable plugin package on older hosts.
+- Authenticated OctoPrint instances can be added with an API key. Credentials
+  remain in Python/private plugin storage; saved keys and Bambu access codes are
+  never sent back to the dashboard page.
 - **Open** → opens a sandboxed `<iframe>` restricted to that printer's exact
   HTTP(S) origin (Mainsail/Fluidd/OctoPrint remain framable on the LAN).
 - Polls live status while the tab is open and exposes Pause / Resume / Stop when

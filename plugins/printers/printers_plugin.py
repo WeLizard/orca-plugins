@@ -46,6 +46,7 @@ a good plugin capability to expose rather than work around:
 
 import base64
 import ftplib
+import hashlib
 import html
 import io
 import json
@@ -703,11 +704,19 @@ def discover_orca_printers():
             host = preset.config_value("print_host")
             if not host:
                 continue
+            normalized_url = normalize_url(host)
+            host_type = normalize_host_type(preset.config_value("host_type"))
+            discovery_ref = "orca:" + hashlib.sha256(
+                (preset.name + "\0" + normalized_url + "\0" + host_type).encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:24]
             found.append({
                 "id": "orca:" + preset.name,
+                "discovery_ref": discovery_ref,
                 "name": preset.name,
-                "url": normalize_url(host),
-                "type": normalize_host_type(preset.config_value("host_type")),
+                "url": normalized_url,
+                "type": host_type,
                 "apikey": preset.config_value("printhost_apikey") or "",
                 "source": "orca",
             })
@@ -727,6 +736,28 @@ def dashboard_printers():
     return result
 
 
+_PRIVATE_PRINTER_FIELDS = frozenset({"apikey", "access_code"})
+
+
+def private_credential(value):
+    """Normalize a credential received from a host preset or the plugin page."""
+    return value.strip()[:512] if isinstance(value, str) else ""
+
+
+def public_printer_record(printer):
+    """Return the dashboard-safe part of a stored/discovered printer.
+
+    Credentials remain in Python/private plugin storage.  A local plugin page
+    may submit a newly typed secret once, but Python never reflects saved
+    secrets back into JavaScript.
+    """
+    return {
+        key: value
+        for key, value in (printer or {}).items()
+        if key not in _PRIVATE_PRINTER_FIELDS
+    }
+
+
 def available_orca_printers(discovered=None):
     # OrcaSlicer network presets (Moonraker/OctoPrint) not yet on the dashboard.
     # Bambu comes via SSDP now — the audit blocks OrcaSlicer.conf.
@@ -739,7 +770,7 @@ def available_orca_printers(discovered=None):
             continue
         if p.get("serial") and p["serial"] in added_serials:
             continue
-        out.append(p)
+        out.append(public_printer_record(p))
     return out
 
 
@@ -862,11 +893,22 @@ def poll_octoprint(base, ctx, apikey):
     headers = {"Accept": "application/json"}
     if apikey:
         headers["X-Api-Key"] = apikey
-    printer = _get_json(base + "/api/printer", ctx, headers=headers)
+    try:
+        printer = _get_json(base + "/api/printer", ctx, headers=headers)
+        state = printer.get("state", {}).get("text", "Operational")
+    except urllib.error.HTTPError as exc:
+        # OctoPrint exposes the server and file API while its serial printer is
+        # disconnected, but the full printer-state endpoint is unavailable in
+        # that state (409 by contract; some configurations answer 404).  The
+        # connection endpoint remains authoritative for the live state.
+        if exc.code not in {404, 409}:
+            raise
+        connection = _get_json(base + "/api/connection", ctx, headers=headers)
+        printer = {}
+        state = connection.get("current", {}).get("state") or "Disconnected"
     temps = printer.get("temperature", {})
     tool0 = temps.get("tool0", {})
     bed = temps.get("bed", {})
-    state = printer.get("state", {}).get("text", "Operational")
     progress, elapsed_seconds, filename, filepath = 0, None, "", ""
     try:
         job = _get_json(base + "/api/job", ctx, headers=headers)
@@ -2051,6 +2093,7 @@ PAGE = r"""<!DOCTYPE html>
     </select>
     <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
     <input id="f-access" placeholder="Access code" size="10" style="display:none">
+    <input id="f-apikey" type="password" autocomplete="off" placeholder="OctoPrint API key" size="18" style="display:none">
     <label id="f-insecure-l" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this." style="font-size:11px;display:flex;align-items:center;gap:4px">
       <input id="f-insecure" type="checkbox"> <span id="f-insecure-text">self-signed</span></label>
     <button id="add">Add</button>
@@ -2386,14 +2429,17 @@ document.getElementById('history-modal').addEventListener('click', function(even
 });
 
 
-// Bambu (LAN) needs a serial + access code instead of the self-signed toggle;
-// swap the relevant fields when the backend type changes.
+// Bambu (LAN) needs a serial + access code. Authenticated OctoPrint instances
+// need an API key when they are added manually; Orca-discovered keys stay in
+// Python and are never reflected into this page.
 var typeSel = document.getElementById('f-type');
 function syncTypeFields(){
   var bambu = typeSel.value === 'bambu';
+  var octoprint = typeSel.value === 'octoprint';
   // The serial is never typed: the MQTT wildcard learns it on first poll and
   // SSDP discovery prefills it. The hidden input only carries those values.
   document.getElementById('f-access').style.display = bambu ? '' : 'none';
+  document.getElementById('f-apikey').style.display = octoprint ? '' : 'none';
   document.getElementById('f-insecure-l').style.display = bambu ? 'none' : '';
   document.getElementById('f-url').placeholder = bambu ? t('printerIpPlaceholder') : '192.168.0.42';
 }
@@ -2405,6 +2451,7 @@ document.getElementById('add').addEventListener('click', function(){
   var url = document.getElementById('f-url').value.trim();
   if (!url) return;
   var access = document.getElementById('f-access').value.trim();
+  var apiKey = document.getElementById('f-apikey').value.trim();
   if (typeSel.value === 'bambu' && !access) {
     document.getElementById('f-access').focus();
     return;
@@ -2417,6 +2464,7 @@ document.getElementById('add').addEventListener('click', function(){
                      kind:typeSel.value,
                      serial:document.getElementById('f-serial').value.trim(),
                      access_code:access,
+                     apikey:typeSel.value === 'octoprint' ? apiKey : '',
                      insecure:document.getElementById('f-insecure').checked });
 });
 document.getElementById('refresh').addEventListener('click', function(){ orca.postMessage({ type:'refresh' }); });
@@ -2531,7 +2579,7 @@ document.getElementById('f-adopt').addEventListener('change', function(e){
   pendingAdoptUrl = p.url || '';
   e.target.disabled = true;
   document.getElementById('status').textContent = t('loading');
-  orca.postMessage({ type:'adopt', printer:p });
+  orca.postMessage({ type:'adopt', discoveryRef:p.discovery_ref });
 });
 
 orca.onMessage(function(data){
@@ -2560,6 +2608,7 @@ orca.onMessage(function(data){
         document.getElementById('f-url').value = '';
         document.getElementById('f-serial').value = '';
         document.getElementById('f-access').value = '';
+        document.getElementById('f-apikey').value = '';
         document.getElementById('f-insecure').checked = false;
       }
     }
@@ -2693,6 +2742,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         self._status_cache = {}
         self._status_lock = threading.Lock()
         self._list_generation = 0
+        self._discovered_printers = {}
         self._viewers = []
         self.win = _PageWindowProxy(self) if _PAGE_CAPABILITY_BASE is not None else None
 
@@ -2811,15 +2861,25 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 ACTION_WORKER.submit(
                     self._drop_and_refresh,
                     stored,
-                    discover_orca_printers(),
+                    self._capture_discovered_printers(),
                 )
         elif kind == "add":
+            printer_type = msg.get("kind") or "moonraker"
             entry = {
                 "name": msg.get("name") or msg.get("url"),
                 "url": normalize_url(msg.get("url")),
-                "type": msg.get("kind") or "moonraker",
+                "type": printer_type,
+                "apikey": (
+                    private_credential(msg.get("apikey"))
+                    if printer_type == "octoprint"
+                    else ""
+                ),
                 "serial": msg.get("serial") or "",
-                "access_code": msg.get("access_code") or "",
+                "access_code": (
+                    private_credential(msg.get("access_code"))
+                    if printer_type == "bambu"
+                    else ""
+                ),
                 "insecure": bool(msg.get("insecure")),
                 "source": "manual",
             }
@@ -2831,19 +2891,24 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             ACTION_WORKER.submit(
                 self._add_and_refresh,
                 entry,
-                discover_orca_printers(),
+                self._capture_discovered_printers(),
             )
         elif kind == "adopt":
             # User chose an OrcaSlicer-configured printer to put on the dashboard.
-            p = msg.get("printer") or {}
+            discovery_ref = msg.get("discoveryRef")
+            p = (
+                self._discovered_printers.get(discovery_ref) or {}
+                if isinstance(discovery_ref, str) and len(discovery_ref) <= 100
+                else {}
+            )
             if p.get("url"):
                 entry = {
                     "name": p.get("name") or p.get("url"),
                     "url": normalize_url(p.get("url")),
                     "type": p.get("type") or "moonraker",
-                    "apikey": p.get("apikey", ""),
+                    "apikey": private_credential(p.get("apikey")),
                     "serial": p.get("serial") or "",
-                    "access_code": p.get("access_code") or "",
+                    "access_code": private_credential(p.get("access_code")),
                     "insecure": bool(p.get("insecure")),
                     "source": "orca",
                 }
@@ -2855,13 +2920,13 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 ACTION_WORKER.submit(
                     self._add_and_refresh,
                     entry,
-                    discover_orca_printers(),
+                    self._capture_discovered_printers(),
                 )
         elif kind == "remove":
             ACTION_WORKER.submit(
                 self._remove_and_refresh,
                 msg.get("id"),
-                discover_orca_printers(),
+                self._capture_discovered_printers(),
             )
         elif kind == "open":
             url = validated_printer_web_url(msg.get("url"))
@@ -2892,8 +2957,17 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
     def _refresh_async(self, discover_network=False):
         # Capture host-owned preset state on the UI thread. Disk and LAN work
         # continue on the reusable coordinator.
-        discovered = discover_orca_printers()
+        discovered = self._capture_discovered_printers()
         ACTION_WORKER.submit(self._refresh_worker, discovered, discover_network)
+
+    def _capture_discovered_printers(self):
+        discovered = discover_orca_printers()
+        self._discovered_printers = {
+            item["discovery_ref"]: dict(item)
+            for item in discovered
+            if isinstance(item.get("discovery_ref"), str)
+        }
+        return discovered
 
     def _refresh_worker(self, discovered, discover_network=False):
         if not ACTION_WORKER.current_job_is_active():
@@ -2914,7 +2988,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                     else {"online": None, "state": "checking"}
                 )
         payload = {
-            "printers": printers,
+            "printers": [public_printer_record(item) for item in printers],
             "unmatched": unmatched,
         }
         if discovered is not None:
@@ -3006,7 +3080,9 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 attach_outbox(printers)
             except Exception:
                 pass
-            self._post({"printers": printers})
+            self._post({
+                "printers": [public_printer_record(item) for item in printers]
+            })
         finally:
             if on_complete is not None:
                 on_complete()
