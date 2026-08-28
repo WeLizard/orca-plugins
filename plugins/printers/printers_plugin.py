@@ -1992,12 +1992,27 @@ PAGE = r"""<!DOCTYPE html>
   html, body { margin:0; height:100%; }
   body { display:flex; flex-direction:column; background:var(--orca-bg,#1e1e2e);
          color:var(--orca-fg,#e0e0e0); font-family:var(--orca-font,sans-serif); }
-  #bar { flex:0 0 auto; display:flex; align-items:center; gap:8px; padding:8px 12px;
-         border-bottom:1px solid var(--orca-border,#3c3c4c); flex-wrap:wrap; }
-  #bar h1 { margin:0; margin-right:auto; font-size:14px; font-weight:600; }
-  #bar input, #bar select { font:inherit; font-size:12px; padding:4px 8px;
+  #bar { flex:0 0 auto; display:flex; flex-direction:column; gap:7px; padding:8px 12px;
+         border-bottom:1px solid var(--orca-border,#3c3c4c); }
+  .bar-main, .manual-form { display:flex; align-items:center; gap:7px; min-width:0; }
+  .bar-main { width:100%; }
+  #bar input:not([type="checkbox"]), #bar select { font:inherit; font-size:12px; padding:4px 8px;
          background:var(--orca-bg,#1e1e2e); color:var(--orca-fg,#e0e0e0);
          border:1px solid var(--orca-border,#3c3c4c); border-radius:4px; }
+  #f-adopt { min-width:170px; max-width:260px; }
+  #status { flex:1 1 auto; min-width:40px; overflow:hidden; text-overflow:ellipsis;
+            white-space:nowrap; }
+  .manual-form { display:none; padding-top:7px;
+                 border-top:1px solid var(--orca-border,#3c3c4c); }
+  .manual-form.open { display:flex; }
+  .manual-form #f-url { flex:1 1 190px; min-width:150px; }
+  .manual-form #f-name { flex:0 1 130px; min-width:90px; }
+  .compact-option { display:flex; align-items:center; gap:5px; min-height:24px;
+                    box-sizing:border-box; padding:3px 7px; border-radius:4px;
+                    border:1px solid var(--orca-border,#3c3c4c); cursor:pointer;
+                    color:var(--orca-muted,#a0a0a0); font-size:10px; white-space:nowrap; }
+  .compact-option input { margin:0; }
+  .button-icon { font-size:14px; line-height:1; }
   button { font:inherit; font-size:12px; cursor:pointer; padding:4px 12px; border-radius:4px;
            background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff);
            border:1px solid var(--orca-accent,#009688); }
@@ -2065,39 +2080,53 @@ PAGE = r"""<!DOCTYPE html>
   .history-state { font-size:10px; padding:1px 6px; border-radius:999px;
                    border:1px solid var(--orca-border,#3c3c4c); white-space:nowrap; }
   .history-meta { color:var(--orca-muted,#a0a0a0); font-size:10px; display:flex;
-                  flex-wrap:wrap; gap:5px 12px; }
+                   flex-wrap:wrap; gap:5px 12px; }
+  @media (max-width:760px) {
+    .bar-main, .manual-form { flex-wrap:wrap; }
+    #status { order:8; flex-basis:100%; }
+    #f-adopt { flex:1 1 170px; max-width:none; }
+  }
 </style></head>
 <body>
   <div id="bar">
-    <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> <span id="sel-all-text">all</span></label>
-    <span id="status"></span>
-    <button id="send" class="ghost" disabled>Send G-code to selected…</button>
-    <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
-    <input id="f-name" placeholder="Name" size="8">
-    <input id="f-url" placeholder="192.168.0.42" size="14">
-    <select id="f-type" title="Connection type. Active integrations provide live status, controls and upload. Disabled entries remain planned targets.">
-      <option value="moonraker">Moonraker / Klipper</option>
-      <option value="octoprint">OctoPrint</option>
-      <option value="bambu">Bambu (LAN)</option>
-      <option value="prusalink" disabled>PrusaLink — coming later</option>
-      <option value="repetier" disabled>Repetier — coming later</option>
-      <option value="duet" disabled>Duet — coming later</option>
-      <option value="mks" disabled>MKS — coming later</option>
-      <option value="flashair" disabled>FlashAir — coming later</option>
-      <option value="astrobox" disabled>AstroBox — coming later</option>
-      <option value="esp3d" disabled>ESP3D — coming later</option>
-      <option value="crealityprint" disabled>Creality — coming later</option>
-      <option value="flashforge" disabled>FlashForge — coming later</option>
-      <option value="elegoolink" disabled>Elegoo — coming later</option>
-      <option value="generic" disabled>Other — coming later</option>
-    </select>
-    <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
-    <input id="f-access" placeholder="Access code" size="10" style="display:none">
-    <input id="f-apikey" type="password" autocomplete="off" placeholder="OctoPrint API key" size="18" style="display:none">
-    <label id="f-insecure-l" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this." style="font-size:11px;display:flex;align-items:center;gap:4px">
-      <input id="f-insecure" type="checkbox"> <span id="f-insecure-text">self-signed</span></label>
-    <button id="add">Add</button>
-    <button id="refresh" class="ghost">Refresh</button>
+    <div class="bar-main">
+      <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> <span id="sel-all-text">all</span></label>
+      <button id="send" class="ghost" disabled>Send G-code to selected…</button>
+      <span id="status"></span>
+      <select id="f-adopt" title="Add a printer configured in OrcaSlicer" style="display:none"></select>
+      <button id="manual-toggle" class="ghost" type="button" aria-expanded="false">
+        <span class="button-icon" aria-hidden="true">＋</span> <span id="manual-toggle-text">Add</span>
+      </button>
+      <button id="refresh" class="ghost" type="button">
+        <span class="button-icon" aria-hidden="true">↻</span> <span id="refresh-text">Refresh</span>
+      </button>
+    </div>
+    <div id="manual-form" class="manual-form" aria-hidden="true">
+      <input id="f-name" placeholder="Name" size="8">
+      <input id="f-url" placeholder="192.168.0.42" size="14">
+      <select id="f-type" title="Connection type. Active integrations provide live status, controls and upload. Disabled entries remain planned targets.">
+        <option value="moonraker">Moonraker / Klipper</option>
+        <option value="octoprint">OctoPrint</option>
+        <option value="bambu">Bambu (LAN)</option>
+        <option value="prusalink" disabled>PrusaLink — coming later</option>
+        <option value="repetier" disabled>Repetier — coming later</option>
+        <option value="duet" disabled>Duet — coming later</option>
+        <option value="mks" disabled>MKS — coming later</option>
+        <option value="flashair" disabled>FlashAir — coming later</option>
+        <option value="astrobox" disabled>AstroBox — coming later</option>
+        <option value="esp3d" disabled>ESP3D — coming later</option>
+        <option value="crealityprint" disabled>Creality — coming later</option>
+        <option value="flashforge" disabled>FlashForge — coming later</option>
+        <option value="elegoolink" disabled>Elegoo — coming later</option>
+        <option value="generic" disabled>Other — coming later</option>
+      </select>
+      <input id="f-serial" placeholder="Serial (auto)" size="10" style="display:none" title="Leave empty — the serial is discovered from the printer automatically. Fill only to pin a specific printer. MQTT port 8883 is used.">
+      <input id="f-access" placeholder="Access code" size="10" style="display:none">
+      <input id="f-apikey" type="password" autocomplete="off" placeholder="OctoPrint API key" size="18" style="display:none">
+      <label id="f-insecure-l" class="compact-option" title="Check only if the printer is served over HTTPS with a self-signed certificate — this skips TLS verification for it. Plain http:// LAN printers don't need this.">
+        <input id="f-insecure" type="checkbox"> <span aria-hidden="true">TLS</span></label>
+      <button id="add">Add</button>
+    </div>
     <input id="file" type="file" accept=".gcode,.gco,.g,.gz,.3mf" style="display:none">
   </div>
   <div id="confirm" style="display:none;position:absolute;inset:0;background:rgba(0,0,0,.55);
@@ -2173,9 +2202,10 @@ function applyStaticCopy() {
   document.getElementById('f-serial').placeholder = t('serialAuto');
   title('f-serial', 'serialTitle');
   document.getElementById('f-access').placeholder = t('accessCode');
-  text('f-insecure-text', 'selfSigned');
   title('f-insecure-l', 'selfSignedTitle');
-  text('add', 'add'); text('refresh', 'refresh');
+  document.getElementById('f-insecure').setAttribute('aria-label', t('selfSigned'));
+  text('manual-toggle-text', 'add'); title('manual-toggle', 'addPrinter');
+  text('add', 'add'); text('refresh-text', 'refresh'); title('refresh', 'refresh');
   text('confirm-title', 'confirmTitle'); text('confirm-start-text', 'startImmediately');
   text('confirm-ams-text', 'useAms'); text('confirm-cancel', 'cancel');
   text('confirm-ok', 'send');
@@ -2433,6 +2463,16 @@ document.getElementById('history-modal').addEventListener('click', function(even
 // need an API key when they are added manually; Orca-discovered keys stay in
 // Python and are never reflected into this page.
 var typeSel = document.getElementById('f-type');
+var manualForm = document.getElementById('manual-form');
+var manualToggle = document.getElementById('manual-toggle');
+function setManualFormOpen(open){
+  manualForm.classList.toggle('open', !!open);
+  manualForm.setAttribute('aria-hidden', open ? 'false' : 'true');
+  manualToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+manualToggle.addEventListener('click', function(){
+  setManualFormOpen(!manualForm.classList.contains('open'));
+});
 function syncTypeFields(){
   var bambu = typeSel.value === 'bambu';
   var octoprint = typeSel.value === 'octoprint';
@@ -2570,6 +2610,7 @@ document.getElementById('f-adopt').addEventListener('change', function(e){
     document.getElementById('f-name').value = p.name || '';
     document.getElementById('f-url').value = p.url || '';
     document.getElementById('f-type').value = 'bambu';
+    setManualFormOpen(true);
     syncTypeFields();
     document.getElementById('f-serial').value = p.serial || '';
     document.getElementById('f-access').focus();
@@ -2610,6 +2651,7 @@ orca.onMessage(function(data){
         document.getElementById('f-access').value = '';
         document.getElementById('f-apikey').value = '';
         document.getElementById('f-insecure').checked = false;
+        setManualFormOpen(false);
       }
     }
     renderAvailable();
@@ -2623,7 +2665,7 @@ orca.onMessage(function(data){
 });
 orca.postMessage({ type:'ready' });
 // Live dashboard: refresh statuses while the tab is open. Status-only tick —
-// the store and the picker are rebuilt only on explicit Refresh/actions.
+// the store and picker are rebuilt on initial load, explicit Refresh and actions.
 setInterval(function(){
   if (document.hidden) return;
   try { orca.postMessage({ type:'poll' }); } catch (e) { /* bridge not ready */ }
@@ -2840,7 +2882,9 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         msg = msg or {}
         kind = msg.get("type")
         if kind == "ready":
-            self._refresh_async(discover_network=False)
+            # Populate both Orca-configured and LAN-discovered choices on open.
+            # Periodic status ticks below remain discovery-free.
+            self._refresh_async(discover_network=True)
         elif kind == "refresh":
             self._refresh_async(discover_network=True)
         elif kind == "poll":
@@ -3119,7 +3163,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 })
             with self._status_lock:
                 is_current = generation is None or generation == self._list_generation
-            if found and is_current:
+            if is_current:
                 self._post({"discovered": found})
         except Exception:
             pass

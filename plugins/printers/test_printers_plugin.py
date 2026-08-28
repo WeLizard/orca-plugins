@@ -745,7 +745,7 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn("POLL_WORKERS.submit", source)
         self.assertIn("ACTION_WORKER.submit", source)
 
-    def test_network_discovery_runs_only_after_explicit_refresh(self):
+    def test_network_discovery_runs_on_open_and_explicit_refresh(self):
         dashboard = self.plugin.PrintersDashboard()
         discovered = [{"name": "Configured", "url": "http://printer"}]
 
@@ -758,7 +758,7 @@ class PluginStorageTest(unittest.TestCase):
             submit.assert_called_once_with(
                 dashboard._refresh_worker,
                 discovered,
-                False,
+                True,
             )
 
             submit.reset_mock()
@@ -768,6 +768,25 @@ class PluginStorageTest(unittest.TestCase):
                 discovered,
                 True,
             )
+
+    def test_empty_network_discovery_clears_stale_picker_entries(self):
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+
+        with mock.patch.object(self.plugin, "ssdp_bambu_names", return_value={}):
+            dashboard._discover_and_push([])
+
+        dashboard._post.assert_called_once_with({"discovered": []})
+
+    def test_top_bar_keeps_manual_add_fields_compact_and_collapsed(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('id="manual-form" class="manual-form" aria-hidden="true"', source)
+        self.assertIn('id="manual-toggle" class="ghost"', source)
+        self.assertIn("setManualFormOpen(true);", source)
+        self.assertIn('class="compact-option"', source)
+        self.assertIn('<span aria-hidden="true">TLS</span>', source)
+        self.assertNotIn('id="f-insecure-text"', source)
 
     def test_each_printer_status_is_pushed_without_waiting_for_slower_peers(self):
         dashboard = self.plugin.PrintersDashboard()
