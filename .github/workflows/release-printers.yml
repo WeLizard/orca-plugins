@@ -13,7 +13,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: release-printers-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -74,7 +73,10 @@ jobs:
           PY
 
       - name: Test Print Farm
-        run: python -m pytest plugins/printers/test_printers_plugin.py
+        run: >-
+          python -m pytest
+          plugins/printers/test_release_workflow.py
+          plugins/printers/test_printers_plugin.py
         env:
           PYTHONPATH: plugins/printers
 
@@ -118,19 +120,3 @@ jobs:
           gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/release/assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
-
-      - name: Publish tag-triggered release
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          gh release edit "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft=false
-
-      - name: Start OrcaCloud trusted publishing
-        if: github.event_name == 'push'
-        run: >-
-          gh workflow run publish-orcacloud.yml
-          --repo "$GITHUB_REPOSITORY"
-          --ref main
-          -f tag="$RELEASE_TAG"

@@ -166,7 +166,7 @@ class PrintersOutboxTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             package = builder.build(pathlib.Path(temp), wheel=False)
 
-            self.assertEqual(package.name, "printers-0.0.5")
+            self.assertEqual(package.name, "printers-0.0.6")
             staged_source = (package / "printers_plugin.py").read_text(encoding="utf-8")
             self.assertNotIn(builder.EMBEDDED_UI_COPY_TOKEN, staged_source)
             self.assertIn('_EMBEDDED_UI_COPY = {"ca":', staged_source)
@@ -196,10 +196,10 @@ class PrintersOutboxTest(unittest.TestCase):
         spec.loader.exec_module(builder)
 
         with tempfile.TemporaryDirectory() as temp:
-            wheel = pathlib.Path(temp) / "printers-0.0.5-py3-none-any.whl"
-            metadata_path = "printers-0.0.5.dist-info/METADATA"
-            record_path = "printers-0.0.5.dist-info/RECORD"
-            metadata = b"Metadata-Version: 2.4\r\nName: printers\r\nVersion: 0.0.5\r\n\r\n"
+            wheel = pathlib.Path(temp) / "printers-0.0.6-py3-none-any.whl"
+            metadata_path = "printers-0.0.6.dist-info/METADATA"
+            record_path = "printers-0.0.6.dist-info/RECORD"
+            metadata = b"Metadata-Version: 2.4\r\nName: printers\r\nVersion: 0.0.6\r\n\r\n"
             with zipfile.ZipFile(wheel, "w") as archive:
                 archive.writestr(metadata_path, metadata)
                 archive.writestr(
@@ -230,10 +230,11 @@ class PrintersOutboxTest(unittest.TestCase):
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
 
-        notes = builder.render_release_notes("0.0.5")
+        notes = builder.render_release_notes("0.0.6")
 
-        self.assertIn("## Print Farm 0.0.5", notes)
-        self.assertIn("local print history", notes)
+        self.assertIn("## Print Farm 0.0.6", notes)
+        self.assertIn("connected GitHub release workflow", notes)
+        self.assertNotIn("local print history", notes)
         self.assertNotIn("Made add, remove, refresh", notes)
 
 

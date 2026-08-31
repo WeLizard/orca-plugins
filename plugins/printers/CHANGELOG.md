@@ -4,6 +4,9 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
 ## Unreleased
 
+## 0.0.6
+- Restored OrcaCloud delivery through the connected GitHub release workflow; plugin behavior is unchanged from 0.0.5.
+
 ## 0.0.5
 - Fixed Print Farm wheel installation and startup on Windows builds of OrcaSlicer.
 - Fixed dashboard rendering and printer selection so saved Voron/Bambu devices appear immediately, repeated choices do not create duplicates, and the native tab always has its Print Farm icon.
