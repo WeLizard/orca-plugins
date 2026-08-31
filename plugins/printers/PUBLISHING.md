@@ -26,8 +26,11 @@ staged package also keeps the standalone JSON files for review and translation.
    version.
 3. Create and push the exact Orca Cloud tag `vX.Y.Z`.
 4. The Print Farm workflow tests and builds only `plugins/printers/`, creates
-   the matching GitHub release and starts trusted Orca Cloud publishing.
-5. Verify the GitHub release, Orca Cloud card and downloadable wheel before
+   the matching draft GitHub release and uploads the verified assets.
+5. After checking the draft assets, publish that GitHub release through the
+   owner's authenticated session. The resulting `release.published` event
+   starts the connected Orca Cloud trusted-publishing workflow.
+6. Verify the GitHub release, Orca Cloud card and downloadable wheel before
    announcing the update.
 
 The owner performs the push and final publication checks.
