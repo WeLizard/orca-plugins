@@ -3,12 +3,18 @@
 
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
+import io
 import importlib.util
 import pathlib
 import struct
 import sys
+import tempfile
 import types
 import unittest
+import zipfile
 from unittest import mock
 
 import numpy as np
@@ -234,6 +240,41 @@ class BumpMeshPluginTest(unittest.TestCase):
         self.assertIn("## BumpMesh 0.1.0", notes)
         self.assertIn("full-size BumpMesh Plugin Page", notes)
         self.assertNotIn("## 0.1.0", notes)
+
+    def test_wheel_metadata_uses_lf_and_updates_record_hash(self):
+        spec = importlib.util.spec_from_file_location("bumpmesh_builder_under_test", BUILD_PATH)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(builder)
+
+        with tempfile.TemporaryDirectory() as temp:
+            wheel = pathlib.Path(temp) / "bumpmesh-0.1.0-py3-none-any.whl"
+            metadata_path = "bumpmesh-0.1.0.dist-info/METADATA"
+            record_path = "bumpmesh-0.1.0.dist-info/RECORD"
+            metadata = b"Metadata-Version: 2.4\r\nName: bumpmesh\r\nVersion: 0.1.0\r\n\r\n"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr(metadata_path, metadata)
+                archive.writestr(
+                    record_path,
+                    f"{metadata_path},old,0\r\n{record_path},,\r\n",
+                )
+
+            builder._normalize_wheel_metadata(wheel)
+
+            with zipfile.ZipFile(wheel) as archive:
+                normalized = archive.read(metadata_path)
+                rows = list(csv.reader(io.StringIO(
+                    archive.read(record_path).decode("utf-8"),
+                    newline="",
+                )))
+            self.assertNotIn(b"\r", normalized)
+            expected_digest = base64.urlsafe_b64encode(
+                hashlib.sha256(normalized).digest()
+            ).rstrip(b"=").decode("ascii")
+            metadata_row = next(row for row in rows if row[0] == metadata_path)
+            self.assertEqual(metadata_row[1], f"sha256={expected_digest}")
+            self.assertEqual(metadata_row[2], str(len(normalized)))
 
 if __name__ == "__main__":
     unittest.main()
