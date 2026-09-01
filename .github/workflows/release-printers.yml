@@ -81,10 +81,13 @@ jobs:
           PYTHONPATH: plugins/printers
 
       - name: Build Print Farm and release notes
-        run: >-
-          python plugins/printers/build_package.py
-          --output "$RUNNER_TEMP/release/print-farm"
-          --release-notes "$RUNNER_TEMP/release/RELEASE_NOTES.md"
+        run: |
+          python plugins/printers/build_package.py \
+            --output "$RUNNER_TEMP/release/print-farm"
+          cp "$RUNNER_TEMP/release/print-farm/RELEASE_NOTES.md" \
+            "$RUNNER_TEMP/release/RELEASE_NOTES.md"
+          cd "$RUNNER_TEMP/release/print-farm"
+          sha256sum --check SHA256SUMS
 
       - name: Collect release assets and checksums
         shell: bash

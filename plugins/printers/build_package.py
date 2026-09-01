@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import zipfile
 from pathlib import Path
@@ -22,6 +23,12 @@ LOCALES = ROOT / "printers_locales"
 CHANGELOG = ROOT / "CHANGELOG.md"
 DESCRIPTION = ROOT / "description.md"
 EMBEDDED_UI_COPY_TOKEN = "_EMBEDDED_UI_COPY = {}"
+
+
+def _reset_output_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
 
 
 def extract_metadata(source: str) -> dict[str, object]:
@@ -62,6 +69,22 @@ def extract_runtime_version(source: str) -> str:
                 if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
                     return node.value.value
     raise ValueError("PLUGIN_VERSION constant is missing")
+
+
+def current_version() -> str:
+    source = SOURCE.read_text(encoding="utf-8")
+    metadata = extract_metadata(source)
+    version = metadata["tool"]["orcaslicer"]["plugin"]["version"]
+    runtime_version = extract_runtime_version(source)
+    if runtime_version != version:
+        raise ValueError(
+            f"Metadata version {version!r} does not match PLUGIN_VERSION {runtime_version!r}"
+        )
+    return version
+
+
+def default_release_output_root() -> Path:
+    return ROOT / "dist" / f"release-{current_version()}"
 
 
 def _source_with_embedded_locales(source: str) -> str:
@@ -129,61 +152,109 @@ def _wheel_record_digest(payload: bytes) -> str:
     return "sha256=" + digest.rstrip(b"=").decode("ascii")
 
 
-def _normalize_wheel_metadata(wheel_path: Path) -> None:
-    """Keep Orca's current Windows wheel parser from retaining CR in fields."""
-    with zipfile.ZipFile(wheel_path, "r") as archive:
-        entries = archive.infolist()
-        payloads = {entry.filename: archive.read(entry.filename) for entry in entries}
-
-    metadata_paths = [
-        name for name in payloads if name.endswith(".dist-info/METADATA")
+def _canonical_core_metadata(version: str) -> bytes:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
     ]
-    if len(metadata_paths) != 1:
-        raise ValueError("Wheel must contain exactly one METADATA file")
-    metadata_path = metadata_paths[0]
-    record_path = metadata_path.removesuffix("METADATA") + "RECORD"
-    if record_path not in payloads:
-        raise ValueError("Wheel RECORD file is missing")
+    authors = project.get("authors")
+    if not isinstance(authors, list) or len(authors) != 1:
+        raise ValueError("The wheel must declare exactly one project author")
+    author = authors[0].get("name") if isinstance(authors[0], dict) else None
+    fields = {
+        "Name": project.get("name"),
+        "Summary": project.get("description"),
+        "Author": author,
+        "Requires-Python": project.get("requires-python"),
+    }
+    if not all(isinstance(value, str) and value for value in fields.values()):
+        raise ValueError("Wheel project metadata is incomplete")
+    return (
+        "Metadata-Version: 2.4\n"
+        f"Name: {fields['Name']}\n"
+        f"Version: {version}\n"
+        f"Summary: {fields['Summary']}\n"
+        f"Author: {fields['Author']}\n"
+        f"Requires-Python: {fields['Requires-Python']}\n"
+        "\n"
+    ).encode("utf-8")
 
-    metadata = payloads[metadata_path].replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    payloads[metadata_path] = metadata
 
-    record_text = payloads[record_path].decode("utf-8")
-    rows = list(csv.reader(io.StringIO(record_text, newline="")))
-    metadata_rows = [row for row in rows if row and row[0] == metadata_path]
-    if len(metadata_rows) != 1:
-        raise ValueError("Wheel RECORD must contain exactly one METADATA row")
-    metadata_rows[0][1:] = [_wheel_record_digest(metadata), str(len(metadata))]
+def _canonical_wheel_file() -> bytes:
+    return (
+        "Wheel-Version: 1.0\n"
+        "Generator: print-farm build_package.py\n"
+        "Root-Is-Purelib: true\n"
+        "Tag: py3-none-any\n"
+        "\n"
+    ).encode("utf-8")
+
+
+def _normalize_wheel_metadata(wheel_path: Path, version: str) -> None:
+    """Rewrite the wheel as one cross-platform, byte-reproducible artifact."""
+    with zipfile.ZipFile(wheel_path, "r") as archive:
+        original = {name: archive.read(name) for name in archive.namelist()}
+
+    dist_info = f"printers-{version}.dist-info"
+    metadata_path = f"{dist_info}/METADATA"
+    wheel_metadata_path = f"{dist_info}/WHEEL"
+    top_level_path = f"{dist_info}/top_level.txt"
+    record_path = f"{dist_info}/RECORD"
+    expected = {
+        "printers_plugin.py",
+        metadata_path,
+        wheel_metadata_path,
+        top_level_path,
+        record_path,
+    }
+    if set(original) != expected:
+        raise ValueError(
+            "Wheel contents differ from the dependency-free plugin contract: "
+            f"{sorted(original)}"
+        )
+
+    payloads = {
+        "printers_plugin.py": original["printers_plugin.py"],
+        metadata_path: _canonical_core_metadata(version),
+        wheel_metadata_path: _canonical_wheel_file(),
+        top_level_path: b"printers_plugin\n",
+    }
+    rows = [
+        [name, _wheel_record_digest(payloads[name]), str(len(payloads[name]))]
+        for name in sorted(payloads)
+    ]
+    rows.append([record_path, "", ""])
     record_buffer = io.StringIO(newline="")
     csv.writer(record_buffer, lineterminator="\n").writerows(rows)
     payloads[record_path] = record_buffer.getvalue().encode("utf-8")
 
     temporary = wheel_path.with_suffix(wheel_path.suffix + ".tmp")
     try:
-        with zipfile.ZipFile(temporary, "w") as archive:
-            for entry in entries:
-                archive.writestr(entry, payloads[entry.filename])
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_STORED) as archive:
+            for name in sorted(payloads):
+                entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+                entry.compress_type = zipfile.ZIP_STORED
+                entry.create_system = 3
+                entry.external_attr = 0o100644 << 16
+                archive.writestr(entry, payloads[name])
         temporary.replace(wheel_path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def _build_wheel(source_bytes: bytes, version: str, output_root: Path) -> Path:
-    build_dir = output_root / "wheel-build"
-    if build_dir.exists():
-        shutil.rmtree(build_dir)
-    build_dir.mkdir(parents=True)
-    (build_dir / "printers_plugin.py").write_bytes(source_bytes)
-    shutil.copy2(ROOT / "pyproject.toml", build_dir / "pyproject.toml")
     wheels_out = output_root / "wheels"
     wheels_out.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheels_out)],
-        cwd=build_dir,
-        check=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="print-farm-wheel-") as temporary:
+        build_dir = Path(temporary)
+        (build_dir / "printers_plugin.py").write_bytes(source_bytes)
+        shutil.copy2(ROOT / "pyproject.toml", build_dir / "pyproject.toml")
+        subprocess.run(
+            [sys.executable, "-m", "build", "--wheel", "--outdir", str(wheels_out)],
+            cwd=build_dir,
+            check=True,
+        )
     wheel_path = wheels_out / f"printers-{version}-py3-none-any.whl"
-    _normalize_wheel_metadata(wheel_path)
+    _normalize_wheel_metadata(wheel_path, version)
     return wheel_path
 
 
@@ -203,7 +274,7 @@ def build(output_root: Path, wheel: bool = True) -> Path:
     release_bytes = _source_with_embedded_locales(source).encode("utf-8")
 
     package_dir = output_root / f"printers-{version}"
-    package_dir.mkdir(parents=True, exist_ok=True)
+    _reset_output_dir(package_dir)
     package_path = package_dir / "printers_plugin.py"
     package_path.write_bytes(release_bytes)
     package_locales = package_dir / LOCALES.name
@@ -257,13 +328,29 @@ def build(output_root: Path, wheel: bool = True) -> Path:
     return package_dir
 
 
+def stage_release_metadata(output_root: Path, wheel_path: Path, version: str) -> tuple[Path, Path]:
+    notes_path = output_root / "RELEASE_NOTES.md"
+    notes_path.write_text(
+        render_release_notes(version), encoding="utf-8", newline="\n"
+    )
+    relative_wheel = wheel_path.relative_to(output_root).as_posix()
+    digest = hashlib.sha256(wheel_path.read_bytes()).hexdigest()
+    checksum_path = output_root / "SHA256SUMS"
+    checksum_path.write_text(
+        f"{digest}  {relative_wheel}\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return notes_path, checksum_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the Print Farm OrcaSlicer plugin package")
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "dist",
-        help="Output root (default: plugins/printers/dist)",
+        default=None,
+        help="Output root (default: plugins/printers/dist/release-<current-version>)",
     )
     parser.add_argument(
         "--no-wheel",
@@ -276,10 +363,24 @@ def main() -> int:
         help="Write GitHub release notes from the current changelog section",
     )
     args = parser.parse_args()
-    package_dir = build(args.output.resolve(), wheel=not args.no_wheel)
+    version = current_version()
+    default_output = args.output is None
+    output_root = (
+        default_release_output_root()
+        if default_output
+        else args.output.resolve()
+    )
+    if default_output:
+        _reset_output_dir(output_root)
+    package_dir = build(output_root, wheel=not args.no_wheel)
+    if not args.no_wheel:
+        wheel_path = output_root / "wheels" / f"printers-{version}-py3-none-any.whl"
+        notes_path, checksum_path = stage_release_metadata(
+            output_root, wheel_path, version
+        )
+        print(notes_path)
+        print(checksum_path)
     if args.release_notes is not None:
-        source = SOURCE.read_text(encoding="utf-8")
-        version = extract_runtime_version(source)
         notes_path = args.release_notes.resolve()
         notes_path.parent.mkdir(parents=True, exist_ok=True)
         notes_path.write_text(

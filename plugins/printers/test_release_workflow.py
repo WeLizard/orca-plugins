@@ -18,6 +18,11 @@ def test_orcacloud_publish_uses_only_the_connected_release_event() -> None:
     assert "github.event.release.tag_name" in publish
     assert '--form-string "metadata=$metadata"' in publish
     assert '-F "metadata=$metadata"' not in publish
+    assert '--pattern "SHA256SUMS"' in publish
+    assert "GitHub wheel does not match SHA256SUMS" in publish
+    assert "Runtime plugin version does not match the GitHub release" in publish
+    assert "Wheel metadata version does not match the GitHub release" in publish
     assert "gh workflow run publish-orcacloud.yml" not in release
     assert "--draft" in release
     assert "--draft=false" not in release
+    assert "sha256sum --check SHA256SUMS" in release
