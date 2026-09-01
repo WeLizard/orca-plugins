@@ -1057,12 +1057,18 @@ class PluginStorageTest(unittest.TestCase):
             source,
         )
 
-    def test_main_print_action_allows_translated_labels_to_grow(self):
+    def test_card_actions_size_to_translated_text_and_wrap(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
 
-        self.assertIn('.row .print { width:auto; min-width:72px; }', source)
-        self.assertIn('.row .open { width:60px; }', source)
+        self.assertIn('.ctl-row { display:flex; flex-wrap:wrap;', source)
+        self.assertIn('.row { display:flex; flex-wrap:wrap;', source)
+        self.assertIn('width:max-content; max-width:100%; white-space:normal;', source)
+        self.assertIn('.row .print { min-width:72px; }', source)
+        self.assertIn('.row .open { min-width:60px; }', source)
+        self.assertIn('width:auto; min-width:126px; max-width:100%;', source)
+        self.assertIn('width:max-content; min-width:60px;', source)
         self.assertNotIn('.row .print, .row .open { width:60px; }', source)
+        self.assertNotIn('.ctl-slot button { width:60px;', source)
 
     def test_unavailable_select_control_is_visibly_muted(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")

@@ -2055,21 +2055,28 @@ PAGE = r"""<!DOCTYPE html>
   .fname { font-size:11px; color:var(--orca-muted,#a0a0a0); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .bar { height:6px; border-radius:3px; background:var(--orca-border,#3c3c4c); overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--orca-accent,#009688); }
-  /* Keep print controls and ordinary tile actions on separate fixed rows. A
-     printing tile can expose two extra controls without overflowing into the
-     next grid column or moving the ordinary actions. */
+  /* Keep print controls and ordinary tile actions on separate rows. Button
+     widths follow their localized labels; narrow cards wrap whole actions
+     instead of clipping text or overflowing into the next grid column. */
   .tile-actions { display:flex; flex-direction:column; gap:6px; margin-top:auto; min-width:0; }
-  .ctl-row { display:flex; justify-content:space-between; align-items:center; gap:6px; min-height:28px; }
-  .row { display:flex; gap:6px; align-items:center; min-width:0; }
+  .ctl-row { display:flex; flex-wrap:wrap; justify-content:space-between;
+             align-items:center; gap:6px; min-height:28px; }
+  .row { display:flex; flex-wrap:wrap; justify-content:flex-end;
+         gap:6px; align-items:center; min-width:0; }
   .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
   .row label.select-control.disabled { color:var(--orca-muted,#a0a0a0);
                                        opacity:.45; cursor:not-allowed; }
   .row label.select-control.disabled input { cursor:not-allowed; }
-  .row button { white-space:nowrap; padding-left:4px; padding-right:4px; }
-  .row .print { width:auto; min-width:72px; }
-  .row .open { width:60px; }
-  .ctl-slot { display:flex; gap:6px; width:126px; justify-content:flex-end; }
-  .ctl-slot button { width:60px; padding-left:4px; padding-right:4px; }
+  .row button { flex:0 0 auto; width:max-content; max-width:100%; white-space:normal;
+                padding-left:8px; padding-right:8px; }
+  .row .print { min-width:72px; }
+  .row .open { min-width:60px; }
+  .ctl-slot { display:flex; flex:0 0 auto; flex-wrap:wrap; gap:6px;
+              width:auto; min-width:126px; max-width:100%;
+              justify-content:flex-end; margin-left:auto; }
+  .ctl-slot button { flex:0 0 auto; width:max-content; min-width:60px;
+                     max-width:100%; white-space:normal;
+                     padding-left:8px; padding-right:8px; }
   .spacer { visibility:hidden; pointer-events:none; }
   .empty { color:var(--orca-muted,#a0a0a0); padding:24px; text-align:center; }
   #status { font-size:11px; color:var(--orca-muted,#a0a0a0); }
