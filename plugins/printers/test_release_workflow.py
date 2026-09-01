@@ -16,6 +16,8 @@ def test_orcacloud_publish_uses_only_the_connected_release_event() -> None:
     assert "workflow_dispatch:" not in publish
     assert "id-token: write" in publish
     assert "github.event.release.tag_name" in publish
+    assert '--form-string "metadata=$metadata"' in publish
+    assert '-F "metadata=$metadata"' not in publish
     assert "gh workflow run publish-orcacloud.yml" not in release
     assert "--draft" in release
     assert "--draft=false" not in release
