@@ -7,7 +7,7 @@
 # name = "Print Farm"
 # description = "Cross-vendor print farm dashboard: live status, temperatures, print progress and thumbnails, one click to each printer's web interface, and G-code delivery to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.8"
+# version = "0.0.9"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class.
@@ -303,7 +303,7 @@ def post_window(window, payload):
 # version from this (dynamic version), and build_package.py validates that the
 # PEP 723 `# version` comment matches it — so the manifest and the wheel can't
 # drift.
-PLUGIN_VERSION = "0.0.8"
+PLUGIN_VERSION = "0.0.9"
 
 ORCA_UI_LOCALES = (
     "ca", "cs", "de", "en", "es", "eu", "fr", "hu", "it", "ja", "ko",
@@ -2033,7 +2033,16 @@ PAGE = r"""<!DOCTYPE html>
   .tile .top { display:flex; align-items:center; gap:8px; }
   .dot { width:9px; height:9px; border-radius:50%; background:#888; flex:0 0 auto; }
   .dot.on { background:#3fbf6f; } .dot.off { background:#c0504d; }
-  .tile .name { font-weight:600; margin-right:auto; }
+  .name-wrap { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:4px; }
+  .tile .name { min-width:0; overflow:hidden; text-overflow:ellipsis;
+                white-space:nowrap; font-weight:600; }
+  .tile .remove { flex:0 0 auto; width:26px; height:26px; padding:5px;
+                  color:var(--orca-muted,#a0a0a0); border-color:transparent; }
+  .tile .remove:hover, .tile .remove:focus-visible {
+                  color:var(--orca-fg,#e0e0e0); border-color:var(--orca-border,#3c3c4c); }
+  .tile .remove svg { display:block; width:14px; height:14px; pointer-events:none; }
+  .tile .remove.armed { width:auto; min-width:58px; padding:4px 7px;
+                        color:#c0504d; border-color:#c0504d; }
   .src { font-size:10px; padding:1px 5px; border-radius:3px; border:1px solid var(--orca-border,#3c3c4c);
          color:var(--orca-muted,#a0a0a0); }
   .tile .state { font-size:11px; color:var(--orca-muted,#a0a0a0); text-transform:capitalize; }
@@ -2054,8 +2063,8 @@ PAGE = r"""<!DOCTYPE html>
   .row { display:flex; gap:6px; align-items:center; min-width:0; }
   .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
   .row button { white-space:nowrap; padding-left:4px; padding-right:4px; }
-  .row .print, .row .open { width:60px; }
-  .row .remove { width:68px; }
+  .row .print { width:auto; min-width:72px; }
+  .row .open { width:60px; }
   .ctl-slot { display:flex; gap:6px; width:126px; justify-content:flex-end; }
   .ctl-slot button { width:60px; padding-left:4px; padding-right:4px; }
   .spacer { visibility:hidden; pointer-events:none; }
@@ -2309,7 +2318,9 @@ function render(printers){
     var fname = s.filename ? '<div class="fname" title="' + esc(s.filename) + '">' + esc(s.filename) + '</div>' : '';
     tile.innerHTML =
       '<div class="top"><span class="dot ' + dotClass + '"></span>' +
-      '<span class="name">' + esc(p.name || p.url) + '</span>' +
+      '<span class="name-wrap"><span class="name" title="' + esc(p.name || p.url) + '">' + esc(p.name || p.url) + '</span>' +
+      '<button class="remove ghost" title="' + esc(t('remove')) + '" aria-label="' + esc(t('remove')) + '">' +
+      '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 4h10M6 4V2.5h4V4m-6 0 .6 9h6.8l.6-9M6.5 6.5v4M9.5 6.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button></span>' +
       '<span class="src">' + esc(typeLabel(p.type)) + '</span>' +
       '<span class="state">' + esc(stateText) + '</span></div>' +
       '<div class="body">' + thumb + '<div class="meta">' +
@@ -2340,8 +2351,7 @@ function render(printers){
       // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.
       (p.type === 'bambu'
         ? '<button class="open ghost spacer" disabled></button>'
-        : '<button class="open ghost">' + esc(t('open')) + '</button>') +
-      '<button class="remove ghost">' + esc(t('remove')) + '</button></div></div>';
+        : '<button class="open ghost">' + esc(t('open')) + '</button>') + '</div></div>';
     tile.querySelector('.sel').addEventListener('change', function(e){
       selected[p.url] = e.target.checked; updateSendBtn(); });
     // Stopping a print is destructive — the button arms on the first click and
@@ -2401,7 +2411,34 @@ function render(printers){
     var openBtn = tile.querySelector('.open');
     if (openBtn && !openBtn.disabled) openBtn.addEventListener('click', function(){
       orca.postMessage({ type:'open', url:p.url, name:p.name || p.url }); });
-    tile.querySelector('.remove').addEventListener('click', function(){ orca.postMessage({ type:'remove', id:p.id }); });
+    var removeBtn = tile.querySelector('.remove');
+    var removeIdleMarkup = removeBtn.innerHTML;
+    function resetRemove(){
+      if (removeBtn._resetTimer) clearTimeout(removeBtn._resetTimer);
+      removeBtn._resetTimer = null;
+      removeBtn._armed = false;
+      removeBtn.classList.remove('armed');
+      removeBtn.innerHTML = removeIdleMarkup;
+      removeBtn.title = t('remove');
+      removeBtn.setAttribute('aria-label', t('remove'));
+    }
+    removeBtn.addEventListener('click', function(){
+      if (!removeBtn._armed) {
+        removeBtn._armed = true;
+        removeBtn.classList.add('armed');
+        removeBtn.textContent = t('sure');
+        removeBtn.title = t('sure');
+        removeBtn.setAttribute('aria-label', t('sure'));
+        removeBtn._resetTimer = setTimeout(resetRemove, 3000);
+        return;
+      }
+      clearTimeout(removeBtn._resetTimer);
+      removeBtn.disabled = true;
+      orca.postMessage({ type:'remove', id:p.id });
+    });
+    removeBtn.addEventListener('blur', function(){
+      if (removeBtn._armed) resetRemove();
+    });
     grid.appendChild(tile);
   });
   updateSendBtn();

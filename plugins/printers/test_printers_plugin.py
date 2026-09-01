@@ -233,8 +233,9 @@ class PrintersOutboxTest(unittest.TestCase):
         notes = builder.render_release_notes(self.plugin.PLUGIN_VERSION)
 
         self.assertIn(f"## Print Farm {self.plugin.PLUGIN_VERSION}", notes)
-        self.assertIn("available-printer list", notes)
-        self.assertIn("LAN Bambu discovery", notes)
+        self.assertIn("printer removal", notes)
+        self.assertIn("translated labels", notes)
+        self.assertNotIn("available-printer list", notes)
         self.assertNotIn("OrcaCloud release delivery", notes)
         self.assertNotIn("connected GitHub release workflow", notes)
         self.assertNotIn("local print history", notes)
@@ -1034,6 +1035,33 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn('class="tile-actions"><div class="ctl-row">', source)
         self.assertIn('class="ctl-slot"', source)
         self.assertIn("class=\"ctl spacer\"", source)
+
+    def test_remove_is_quiet_in_the_header_and_requires_a_second_click(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('.tile .remove { flex:0 0 auto; width:26px; height:26px;', source)
+        self.assertIn('.tile .remove.armed { width:auto; min-width:58px;', source)
+        self.assertIn('<span class="name-wrap"><span class="name"', source)
+        self.assertIn('<button class="remove ghost"', source)
+        self.assertLess(
+            source.index('<button class="remove ghost"'),
+            source.index('<span class="src">'),
+        )
+        self.assertIn("if (!removeBtn._armed)", source)
+        self.assertIn("removeBtn.textContent = t('sure');", source)
+        self.assertIn("setTimeout(resetRemove, 3000)", source)
+        self.assertIn("removeBtn.addEventListener('blur'", source)
+        self.assertNotIn(
+            "tile.querySelector('.remove').addEventListener('click', function(){ orca.postMessage",
+            source,
+        )
+
+    def test_main_print_action_allows_translated_labels_to_grow(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('.row .print { width:auto; min-width:72px; }', source)
+        self.assertIn('.row .open { width:60px; }', source)
+        self.assertNotIn('.row .print, .row .open { width:60px; }', source)
 
     def test_orca_language_drives_page_and_native_messages(self):
         with mock.patch.object(
