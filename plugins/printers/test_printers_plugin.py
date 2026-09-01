@@ -233,7 +233,9 @@ class PrintersOutboxTest(unittest.TestCase):
         notes = builder.render_release_notes(self.plugin.PLUGIN_VERSION)
 
         self.assertIn(f"## Print Farm {self.plugin.PLUGIN_VERSION}", notes)
-        self.assertIn("OrcaCloud release delivery", notes)
+        self.assertIn("available-printer list", notes)
+        self.assertIn("LAN Bambu discovery", notes)
+        self.assertNotIn("OrcaCloud release delivery", notes)
         self.assertNotIn("connected GitHub release workflow", notes)
         self.assertNotIn("local print history", notes)
         self.assertNotIn("Made add, remove, refresh", notes)
@@ -749,27 +751,114 @@ class PluginStorageTest(unittest.TestCase):
 
     def test_network_discovery_runs_on_open_and_explicit_refresh(self):
         dashboard = self.plugin.PrintersDashboard()
-        discovered = [{"name": "Configured", "url": "http://printer"}]
+        dashboard._post = mock.Mock(return_value=True)
+        discovered = [{
+            "discovery_ref": "orca:configured",
+            "name": "Configured",
+            "url": "http://printer",
+            "type": "moonraker",
+            "apikey": "private-secret",
+        }]
 
         with mock.patch.object(
             self.plugin,
             "discover_orca_printers",
             return_value=discovered,
-        ), mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
+        ), mock.patch.object(
+            self.plugin,
+            "start_plugin_runtime",
+        ) as start_runtime, mock.patch.object(
+            self.plugin.ACTION_WORKER,
+            "submit",
+        ) as submit:
             dashboard.on_message({"type": "ready"})
+            start_runtime.assert_called_once_with()
+            dashboard._post.assert_called_once_with({
+                "available": [{
+                    "discovery_ref": "orca:configured",
+                    "name": "Configured",
+                    "url": "http://printer",
+                    "type": "moonraker",
+                }],
+            })
             submit.assert_called_once_with(
                 dashboard._refresh_worker,
                 discovered,
                 True,
             )
 
+            start_runtime.reset_mock()
+            dashboard._post.reset_mock()
             submit.reset_mock()
             dashboard.on_message({"type": "refresh"})
+            start_runtime.assert_called_once_with()
+            dashboard._post.assert_called_once()
             submit.assert_called_once_with(
                 dashboard._refresh_worker,
                 discovered,
                 True,
             )
+
+    def test_page_ready_reactivates_a_stopped_runtime(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        dashboard._post = mock.Mock(return_value=True)
+        refreshed = threading.Event()
+
+        with mock.patch.object(plugin, "refresh_ui_language"), mock.patch.object(
+            plugin,
+            "configure_plugin_storage",
+        ), mock.patch.object(
+            plugin,
+            "discover_orca_printers",
+            return_value=[],
+        ), mock.patch.object(
+            dashboard,
+            "_refresh_worker",
+            side_effect=lambda *_args: refreshed.set(),
+        ):
+            plugin.start_plugin_runtime()
+            plugin.stop_plugin_runtime()
+
+            dashboard.on_message({"type": "ready"})
+
+            self.assertTrue(refreshed.wait(1))
+            self.assertTrue(plugin._PLUGIN_RUNTIME_ACTIVE)
+            plugin.stop_plugin_runtime()
+
+    def test_orca_machine_presets_feed_the_available_picker(self):
+        plugin = _load_plugin()
+
+        class Preset:
+            name = "Voron 2.4 350"
+
+            @staticmethod
+            def config_value(key):
+                return {
+                    "print_host": "192.168.0.42:7125",
+                    "host_type": "moonraker",
+                    "printhost_apikey": "private-key",
+                }.get(key, "")
+
+        presets = types.SimpleNamespace(
+            size=lambda: 1,
+            preset=lambda index: Preset() if index == 0 else None,
+        )
+        bundle = types.SimpleNamespace(printers=presets)
+        with mock.patch.object(
+            plugin.orca.host,
+            "preset_bundle",
+            create=True,
+            return_value=bundle,
+        ):
+            discovered = plugin.discover_orca_printers()
+
+        self.assertEqual(len(discovered), 1)
+        self.assertEqual(discovered[0]["name"], "Voron 2.4 350")
+        self.assertEqual(discovered[0]["url"], "http://192.168.0.42:7125")
+        self.assertEqual(discovered[0]["type"], "moonraker")
+        self.assertEqual(discovered[0]["apikey"], "private-key")
+        self.assertTrue(discovered[0]["discovery_ref"].startswith("orca:"))
 
     def test_empty_network_discovery_clears_stale_picker_entries(self):
         dashboard = self.plugin.PrintersDashboard()

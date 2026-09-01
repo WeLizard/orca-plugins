@@ -4,6 +4,9 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
 ## Unreleased
 
+## 0.0.8
+- Restored the available-printer list after plugin lifecycle reloads: Orca-configured printers appear immediately and LAN Bambu discovery resumes automatically.
+
 ## 0.0.7
 - Fixed OrcaCloud release delivery; plugin behavior is unchanged from 0.0.6.
 

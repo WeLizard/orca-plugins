@@ -7,7 +7,7 @@
 # name = "Print Farm"
 # description = "Cross-vendor print farm dashboard: live status, temperatures, print progress and thumbnails, one click to each printer's web interface, and G-code delivery to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.7"
+# version = "0.0.8"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class.
@@ -247,11 +247,16 @@ def start_plugin_runtime():
     """Start process-wide resources from an audited lifecycle callback."""
     global _PLUGIN_RUNTIME_ACTIVE
     with _PLUGIN_RUNTIME_LOCK:
-        if _PLUGIN_RUNTIME_ACTIVE:
-            return False
+        was_active = _PLUGIN_RUNTIME_ACTIVE
+        # Keep the state flag and both worker generations in one critical
+        # section.  A page can become ready while a capability is being
+        # cancelled; previously that race could leave the flag active while
+        # both pools were stopped, so every refresh was silently rejected.
+        ACTION_WORKER.activate()
+        POLL_WORKERS.activate()
         _PLUGIN_RUNTIME_ACTIVE = True
-    ACTION_WORKER.activate()
-    POLL_WORKERS.activate()
+    if was_active:
+        return False
     refresh_ui_language()
     configure_plugin_storage()
     return True
@@ -263,9 +268,9 @@ def stop_plugin_runtime():
     with _PLUGIN_RUNTIME_LOCK:
         if not _PLUGIN_RUNTIME_ACTIVE:
             return False
+        ACTION_WORKER.shutdown()
+        POLL_WORKERS.shutdown()
         _PLUGIN_RUNTIME_ACTIVE = False
-    ACTION_WORKER.shutdown()
-    POLL_WORKERS.shutdown()
     return True
 
 
@@ -298,7 +303,7 @@ def post_window(window, payload):
 # version from this (dynamic version), and build_package.py validates that the
 # PEP 723 `# version` comment matches it — so the manifest and the wheel can't
 # drift.
-PLUGIN_VERSION = "0.0.7"
+PLUGIN_VERSION = "0.0.8"
 
 ORCA_UI_LOCALES = (
     "ca", "cs", "de", "en", "es", "eu", "fr", "hu", "it", "ja", "ko",
@@ -3006,8 +3011,22 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
     def _refresh_async(self, discover_network=False):
         # Capture host-owned preset state on the UI thread. Disk and LAN work
         # continue on the reusable coordinator.
+        # `ready` is also the recovery seam for a page that survived a host
+        # capability cancellation/reload.  start_plugin_runtime() is
+        # idempotent and reactivates stopped worker generations when needed.
+        start_plugin_runtime()
         discovered = self._capture_discovered_printers()
-        ACTION_WORKER.submit(self._refresh_worker, discovered, discover_network)
+        # Do not make Orca-owned preset choices depend on disk, LAN discovery,
+        # or polling.  The worker follows with the authoritative dashboard and
+        # de-duplicated picker snapshot; credentials remain Python-private.
+        self._post({
+            "available": [public_printer_record(item) for item in discovered]
+        })
+        return ACTION_WORKER.submit(
+            self._refresh_worker,
+            discovered,
+            discover_network,
+        )
 
     def _capture_discovered_printers(self):
         discovered = discover_orca_printers()
