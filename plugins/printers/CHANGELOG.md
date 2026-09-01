@@ -7,6 +7,7 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 ## 0.0.9
 - Moved printer removal away from the Open action, made it visually quieter, and added a second-click confirmation.
 - Widened the main Print action so translated labels fit without clipping.
+- Made unavailable Select controls visibly muted and explain why selection is disabled.
 
 ## 0.0.8
 - Restored the available-printer list after plugin lifecycle reloads: Orca-configured printers appear immediately and LAN Bambu discovery resumes automatically.

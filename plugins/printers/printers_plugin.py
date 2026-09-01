@@ -2062,6 +2062,9 @@ PAGE = r"""<!DOCTYPE html>
   .ctl-row { display:flex; justify-content:space-between; align-items:center; gap:6px; min-height:28px; }
   .row { display:flex; gap:6px; align-items:center; min-width:0; }
   .row label { display:flex; align-items:center; gap:4px; font-size:11px; margin-right:auto; }
+  .row label.select-control.disabled { color:var(--orca-muted,#a0a0a0);
+                                       opacity:.45; cursor:not-allowed; }
+  .row label.select-control.disabled input { cursor:not-allowed; }
   .row button { white-space:nowrap; padding-left:4px; padding-right:4px; }
   .row .print { width:auto; min-width:72px; }
   .row .open { width:60px; }
@@ -2345,7 +2348,9 @@ function render(printers){
     var printAttrs = selectable ? '' : ' disabled title="' + esc(printDisabledReason) + '"';
     tile.innerHTML +=
       '<div class="tile-actions"><div class="ctl-row"><button class="history ghost">' + esc(t('history')) + '</button>' + ctl + '</div>' +
-      '<div class="row"><label><input type="checkbox" class="sel"' +
+      '<div class="row"><label class="select-control' + (selectable ? '' : ' disabled') + '"' +
+      (selectable ? '' : ' aria-disabled="true" title="' + esc(printDisabledReason) + '"') +
+      '><input type="checkbox" class="sel"' +
       (selected[p.url] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> ' + esc(t('select')) + '</label>' +
       '<button class="print ghost"' + printAttrs + '>' + esc(t('print')) + '</button>' +
       // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.

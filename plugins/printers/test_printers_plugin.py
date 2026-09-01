@@ -235,6 +235,7 @@ class PrintersOutboxTest(unittest.TestCase):
         self.assertIn(f"## Print Farm {self.plugin.PLUGIN_VERSION}", notes)
         self.assertIn("printer removal", notes)
         self.assertIn("translated labels", notes)
+        self.assertIn("unavailable Select controls", notes)
         self.assertNotIn("available-printer list", notes)
         self.assertNotIn("OrcaCloud release delivery", notes)
         self.assertNotIn("connected GitHub release workflow", notes)
@@ -1062,6 +1063,15 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn('.row .print { width:auto; min-width:72px; }', source)
         self.assertIn('.row .open { width:60px; }', source)
         self.assertNotIn('.row .print, .row .open { width:60px; }', source)
+
+    def test_unavailable_select_control_is_visibly_muted(self):
+        source = PLUGIN_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('.row label.select-control.disabled {', source)
+        self.assertIn('opacity:.45; cursor:not-allowed;', source)
+        self.assertIn('class="select-control\' + (selectable ? \'\' : \' disabled\')', source)
+        self.assertIn('aria-disabled="true" title="', source)
+        self.assertIn("esc(printDisabledReason)", source)
 
     def test_orca_language_drives_page_and_native_messages(self):
         with mock.patch.object(
