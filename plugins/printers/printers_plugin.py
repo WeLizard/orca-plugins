@@ -7,7 +7,7 @@
 # name = "Print Farm"
 # description = "Cross-vendor print farm dashboard: live status, temperatures, print progress and thumbnails, one click to each printer's web interface, and G-code delivery to several printers at once."
 # author = "FilamentHub"
-# version = "0.0.6"
+# version = "0.0.7"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class.
@@ -298,7 +298,7 @@ def post_window(window, payload):
 # version from this (dynamic version), and build_package.py validates that the
 # PEP 723 `# version` comment matches it — so the manifest and the wheel can't
 # drift.
-PLUGIN_VERSION = "0.0.6"
+PLUGIN_VERSION = "0.0.7"
 
 ORCA_UI_LOCALES = (
     "ca", "cs", "de", "en", "es", "eu", "fr", "hu", "it", "ja", "ko",

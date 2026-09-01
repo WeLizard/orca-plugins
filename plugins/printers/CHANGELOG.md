@@ -4,6 +4,9 @@ Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
 ## Unreleased
 
+## 0.0.7
+- Fixed OrcaCloud release delivery; plugin behavior is unchanged from 0.0.6.
+
 ## 0.0.6
 - Restored OrcaCloud delivery through the connected GitHub release workflow; plugin behavior is unchanged from 0.0.5.
 

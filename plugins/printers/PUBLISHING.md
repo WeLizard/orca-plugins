@@ -25,6 +25,9 @@ staged package also keeps the standalone JSON files for review and translation.
 2. Confirm no other plugin directory currently declares the same release
    version.
 3. Create and push the exact Orca Cloud tag `vX.Y.Z`.
+   The tag must contain the current trusted-publishing workflow. Published tags
+   are immutable: if an older tag contains an invalid workflow, create a new
+   plugin version instead of repointing or republishing that tag.
 4. The Print Farm workflow tests and builds only `plugins/printers/`, creates
    the matching draft GitHub release and uploads the verified assets.
 5. After checking the draft assets, publish that GitHub release through the

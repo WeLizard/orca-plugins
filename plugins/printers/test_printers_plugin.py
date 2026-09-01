@@ -166,7 +166,7 @@ class PrintersOutboxTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             package = builder.build(pathlib.Path(temp), wheel=False)
 
-            self.assertEqual(package.name, "printers-0.0.6")
+            self.assertEqual(package.name, f"printers-{self.plugin.PLUGIN_VERSION}")
             staged_source = (package / "printers_plugin.py").read_text(encoding="utf-8")
             self.assertNotIn(builder.EMBEDDED_UI_COPY_TOKEN, staged_source)
             self.assertIn('_EMBEDDED_UI_COPY = {"ca":', staged_source)
@@ -230,10 +230,11 @@ class PrintersOutboxTest(unittest.TestCase):
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
 
-        notes = builder.render_release_notes("0.0.6")
+        notes = builder.render_release_notes(self.plugin.PLUGIN_VERSION)
 
-        self.assertIn("## Print Farm 0.0.6", notes)
-        self.assertIn("connected GitHub release workflow", notes)
+        self.assertIn(f"## Print Farm {self.plugin.PLUGIN_VERSION}", notes)
+        self.assertIn("OrcaCloud release delivery", notes)
+        self.assertNotIn("connected GitHub release workflow", notes)
         self.assertNotIn("local print history", notes)
         self.assertNotIn("Made add, remove, refresh", notes)
 
