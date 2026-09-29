@@ -4,6 +4,7 @@ import argparse
 import ast
 import base64
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -143,9 +144,31 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def build_standalone(destination: Path) -> None:
+    source = SOURCE.read_text(encoding='utf-8')
+    marker = 'EMBEDDED_WEB_UI = ""'
+    if source.count(marker) != 1:
+        raise ValueError('Standalone web archive marker is missing or ambiguous')
+    encoded = base64.b64encode((ASSETS / 'bumpmesh-web.json.gz').read_bytes()).decode('ascii')
+    # Adjacent literals make CPython repeatedly copy this large string at import.
+    payload = 'EMBEDDED_WEB_UI = (\n' + repr(encoded) + '\n)'
+    result = source.replace(marker, payload)
+    compile(result, str(destination), 'exec')
+    destination.write_text(result, encoding='utf-8', newline='\n')
+
+
 def validate_wheel(wheel: Path) -> None:
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
+        runtime = archive.read('bumpmesh_plugin.py').decode('utf-8')
+        embedded = re.search(r"(?ms)^EMBEDDED_WEB_UI = \(\n(.*?)\n\)", runtime)
+        if embedded is None:
+            raise ValueError('Wheel must contain the matching embedded BumpMesh application')
+        encoded = ''.join(line.strip().strip("'") for line in embedded[1].splitlines())
+        web = json.loads(gzip.decompress(base64.b64decode(encoded, validate=True)))
+        for required in ('html', 'main', 'workers', 'assets'):
+            if required not in web:
+                raise ValueError(f'Bundled web application is missing {required}')
         top_level_files = [name for name in names if name.endswith(".dist-info/top_level.txt")]
         if len(top_level_files) != 1:
             raise ValueError("Wheel must contain exactly one top_level.txt")
@@ -162,15 +185,14 @@ def validate_wheel(wheel: Path) -> None:
             raise ValueError("Wheel does not contain the BumpMesh tab icon")
 
 
-def build_wheel(version: str, output_root: Path, release_dir: Path) -> Path:
+def build_wheel(version: str, output_root: Path, release_dir: Path, runtime: Path) -> Path:
     build_dir = output_root / "wheel-build"
-    if build_dir.exists():
-        shutil.rmtree(build_dir)
-    build_dir.mkdir(parents=True)
-    shutil.copy2(SOURCE, build_dir / SOURCE.name)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(runtime, build_dir / SOURCE.name)
     shutil.copy2(ROOT / "pyproject.toml", build_dir / "pyproject.toml")
     shutil.copy2(LICENSE, build_dir / LICENSE.name)
-    shutil.copytree(ASSETS, build_dir / ASSETS.name)
+    (build_dir / ASSETS.name).mkdir(exist_ok=True)
+    shutil.copy2(PLUGIN_IMAGE, build_dir / ASSETS.name / PLUGIN_IMAGE.name)
     subprocess.run(
         [sys.executable, "-m", "build", "--wheel", "--outdir", str(release_dir)],
         cwd=build_dir,
@@ -197,18 +219,19 @@ def build(output_root: Path) -> Path:
         )
     extract_changelog_section(version)
 
-    for required in (PLUGIN_IMAGE, DESCRIPTION, CHANGELOG, LICENSE):
+    for required in (PLUGIN_IMAGE, ASSETS / 'bumpmesh-web.json.gz', DESCRIPTION, CHANGELOG, LICENSE):
         if not required.is_file():
             raise FileNotFoundError(f"Required publishing file is missing: {required}")
     if PLUGIN_IMAGE.stat().st_size > 2 * 1024 * 1024:
         raise ValueError("Plugin image exceeds the Orca Cloud 2 MB limit")
 
-    release_dir = output_root / f"plugin-hub-{version}"
-    if release_dir.exists():
-        shutil.rmtree(release_dir)
-    release_dir.mkdir(parents=True)
-
-    wheel = build_wheel(version, output_root, release_dir)
+    release_dir = output_root / f"bumpmesh-{version}"
+    release_dir.mkdir(parents=True, exist_ok=True)
+    standalone = release_dir / 'bumpmesh_plugin.py'
+    build_standalone(standalone)
+    wheels = output_root / 'wheels'
+    wheels.mkdir(exist_ok=True)
+    wheel = build_wheel(version, output_root, wheels, standalone)
     image = release_dir / "BumpMesh.png"
     description = release_dir / DESCRIPTION.name
     changelog = release_dir / CHANGELOG.name
@@ -241,12 +264,15 @@ def build(output_root: Path) -> Path:
         newline="\n",
     )
 
-    checksum_paths = [wheel, image, description, changelog, license_file, metadata_path]
+    checksum_paths = [standalone, image, description, changelog, license_file, metadata_path]
     (release_dir / "SHA256SUMS").write_text(
         "\n".join(f"{sha256(path)}  {path.name}" for path in checksum_paths) + "\n",
         encoding="utf-8",
         newline="\n",
     )
+    (output_root / 'RELEASE_NOTES.md').write_text(render_release_notes(version), encoding='utf-8', newline='\n')
+    (output_root / 'SHA256SUMS').write_text(
+        f'{sha256(wheel)}  wheels/{wheel.name}\n', encoding='utf-8', newline='\n')
     return release_dir
 
 
@@ -257,8 +283,8 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "dist",
-        help="Output root (default: plugins/bumpmesh/dist)",
+        default=None,
+        help="Output root (default: plugins/bumpmesh/dist/release-<current-version>)",
     )
     parser.add_argument(
         "--release-notes",
@@ -266,7 +292,9 @@ def main() -> int:
         help="Write GitHub release notes from the current changelog section",
     )
     args = parser.parse_args()
-    release_dir = build(args.output.resolve())
+    version = extract_runtime_version(SOURCE.read_text(encoding='utf-8'))
+    output = args.output.resolve() if args.output else ROOT / 'dist' / f'release-{version}'
+    release_dir = build(output)
     if args.release_notes is not None:
         source = SOURCE.read_text(encoding="utf-8")
         version = extract_runtime_version(source)
