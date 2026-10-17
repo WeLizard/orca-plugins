@@ -3,6 +3,7 @@
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
 ## Unreleased
+- Replace the previous tab icon with an original Print Farm mark showing three printers connected to a shared controller. Ensure updated wheel installs do not keep using a stale legacy SVG.
 
 ## 0.0.9
 - Moved printer removal away from the Open action, made it visually quieter, and added a second-click confirmation.
