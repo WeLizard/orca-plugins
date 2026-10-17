@@ -464,7 +464,22 @@ PACKAGED_ICON_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "printers.svg",
 )
-_ICON_SVG = b'''<?xml version="1.0" encoding="UTF-8"?><svg id="a" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"><line x1="4.5" y1="14.5" x2="10.5" y2="14.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><polyline points="8.5 10.5 7.5 11.5 6.5 10.5" style="fill:none; stroke:#fff; stroke-linecap:round; stroke-linejoin:round;"/><line x1="4.5" y1="9.5" x2="6" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><line x1="9.5" y1="9.5" x2="10.5" y2="9.5" style="fill:none; stroke:#fff; stroke-linecap:square; stroke-miterlimit:10;"/><rect x="6.5" y="8.5" width="2" height="2" rx=".27" ry=".27" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><rect x="1.5" y="6.5" width="12" height="11" rx="1" ry="1" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/><path d="M5.5,5v-1.5c0-.55.45-1,1-1h10c.55,0,1,.45,1,1v9c0,.55-.45,1-1,1h-1.5" style="fill:none; stroke:#fff; stroke-miterlimit:10;"/></svg>'''
+_ICON_SVG = b'''<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" fill="none">
+  <g stroke="#fff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- One controller, three independent 3D printers. -->
+    <path d="M10 2.15v2.15M3.4 4.3h13.2M3.4 4.3v2.25M10 4.3v2.25M16.6 4.3v2.25"/>
+    <rect x="0.8" y="6.6" width="5.2" height="10.6" rx="0.8"/>
+    <rect x="7.4" y="6.6" width="5.2" height="10.6" rx="0.8"/>
+    <rect x="14" y="6.6" width="5.2" height="10.6" rx="0.8"/>
+    <!-- Tiny gantries and beds remain legible at the native 20 px. -->
+    <path d="M2.1 9.45h2.6m-1.3 0v2M2.1 14.45h2.6M8.7 9.45h2.6m-1.3 0v2M8.7 14.45h2.6M15.3 9.45h2.6m-1.3 0v2M15.3 14.45h2.6"/>
+  </g>
+  <g fill="#fff">
+    <circle cx="10" cy="2.15" r="1.1"/>
+    <path d="M2.8 11.45h1.2l-.6 1.05zM9.4 11.45h1.2l-.6 1.05zM16 11.45h1.2l-.6 1.05z"/>
+  </g>
+</svg>'''
 
 
 def _temporary_path(path):
@@ -490,15 +505,26 @@ def write_bytes_atomic(path, payload):
 
 
 def ensure_icon():
-    for candidate in (PACKAGED_ICON_PATH, ICON_PATH):
-        if os.path.isfile(candidate):
-            return candidate
-    target = os.path.join(PLUGIN_STORAGE_DIR, "printers.svg")
+    """Use the Print Farm mark even after a wheel update left an older icon behind.
+
+    The wheel embeds Python only. Materialize the canonical, version-independent
+    SVG in private plugin storage instead of selecting a stale printers.svg
+    left in the installation directory by an older release.
+    """
+    target = os.path.join(PLUGIN_STORAGE_DIR, "print-farm-icon.svg")
     try:
+        if os.path.isfile(target):
+            with open(target, "rb") as existing:
+                if existing.read() == _ICON_SVG:
+                    return target
         write_bytes_atomic(target, _ICON_SVG)
+        return target
     except OSError:
+        # Source checkout and read-only installations can still use an asset.
+        for candidate in (PACKAGED_ICON_PATH, ICON_PATH):
+            if os.path.isfile(candidate):
+                return candidate
         return ""
-    return target if os.path.isfile(target) else ""
 
 
 def fallback_plugin_storage_dir():
