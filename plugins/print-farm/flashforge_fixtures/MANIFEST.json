@@ -1,0 +1,52 @@
+{
+  "provenance": "Hand-written from the /detail field names and examples in Parallel-7/flashforge-api-docs (docs commit f080a1110318a1818461800acb84d89049509761, wiki commit 199ecead9585d3bee16f3e8502afe0f63b6b6b3b, HTTP-REST-API.md, Adventurer-5M-Series.md, State-Machines.md, endpoints_5m_3.2.7.yaml / endpoints_ad5x_1.2.1.yaml). Serial/check code/MAC/IP/registration codes are obviously fake. Not a capture from a real printer. TCP texts are hand-written from Parallel-7 wiki TCP-Protocol.md / State-Machines.md examples (wiki commit 199ecead9585d3bee16f3e8502afe0f63b6b6b3b). No captured traffic from a real FlashForge printer exists in this repository; the captured/ directory may only receive real captures that carry model, firmware and capture-method metadata.",
+  "captured": [],
+  "synthetic_http": [
+    "auth_wrong_check_code",
+    "auth_wrong_serial",
+    "bad_parameters",
+    "busy_code_2",
+    "detail_5m_busy",
+    "detail_5m_completed",
+    "detail_5m_error",
+    "detail_5m_heating",
+    "detail_5m_lookalike_name",
+    "detail_5m_paused",
+    "detail_5m_printing",
+    "detail_5m_pro_printing",
+    "detail_5m_ready",
+    "detail_ad5x_ready",
+    "detail_bad_numbers",
+    "detail_creator5_pid",
+    "detail_empty",
+    "detail_guider4_pid",
+    "detail_missing",
+    "detail_no_pid",
+    "detail_no_status",
+    "detail_unmapped_status",
+    "file_missing_code_3",
+    "lan_mode_off",
+    "ok_envelope"
+  ],
+  "synthetic_tcp": [
+    "m105_hot",
+    "m105_new",
+    "m105_old",
+    "m115_5m",
+    "m115_5m_pro",
+    "m115_other_model",
+    "m119_empty_status",
+    "m119_paused",
+    "m119_printing",
+    "m119_ready",
+    "m27_idle",
+    "m27_printing",
+    "m601_failed",
+    "m601_ok",
+    "m602_ok"
+  ],
+  "notes": {
+    "pid": "Firmware reports pid as a hex string ('0023'); the 5M YAML types it integer. Fixtures use the hex-string form.",
+    "unconfirmed": "Real 5M / 5M Pro / AD5X wire traffic, TCP M115 Machine Type for AD5X, and every write path."
+  }
+}

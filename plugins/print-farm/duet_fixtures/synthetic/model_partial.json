@@ -1,0 +1,13 @@
+{
+ "_provenance": {
+  "kind": "synthetic",
+  "hardware": false,
+  "note": "partial model: no state.status",
+  "source_refs": [
+   "RepRapFirmware wiki: HTTP-requests, Object-Model-Documentation"
+  ]
+ },
+ "model": {
+  "state": {}
+ }
+}

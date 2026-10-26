@@ -1,0 +1,5 @@
+{
+  "provenance": "All files under synthetic/ are hand-written from the field names read in the 3D Vault creality-websocket plugin source (commit dc217534c74177048d715c68fc091fed33d565b9). No captured traffic from a real Ender 5 Max exists in the source or in this repository; a captured/ directory must only receive real captures with firmware/build metadata.",
+  "captured": [],
+  "synthetic": ["idle", "printing", "paused", "complete", "failed", "aborted", "unmapped_state", "no_filename_key", "no_state_key", "progress_out_of_range"]
+}

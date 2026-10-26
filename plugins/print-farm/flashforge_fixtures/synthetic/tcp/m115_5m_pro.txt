@@ -1,0 +1,9 @@
+CMD M115 Received.
+Machine Type: Flashforge Adventurer 5M Pro
+Machine Name: Adventurer 5M Pro
+Firmware: v3.1.5
+SN: SNTEST-FAKE-0001
+X: 220 Y: 220 Z: 220
+Tool Count: 1
+Mac Address:00:00:5E:00:53:01
+ok

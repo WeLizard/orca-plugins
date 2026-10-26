@@ -1,0 +1,16 @@
+{
+ "_provenance": {
+  "kind": "synthetic",
+  "hardware": false,
+  "note": "standalone RRF >= 3.5 with sessionKey=yes",
+  "source_refs": [
+   "RepRapFirmware wiki: HTTP-requests, Object-Model-Documentation"
+  ]
+ },
+ "reply": {
+  "err": 0,
+  "sessionTimeout": 8000,
+  "boardType": "duetwifi10",
+  "sessionKey": 4711
+ }
+}

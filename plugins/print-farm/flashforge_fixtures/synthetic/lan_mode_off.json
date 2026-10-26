@@ -1,0 +1,10 @@
+{
+  "_provenance": {
+    "kind": "synthetic",
+    "source": "Hand-written from the /detail field names and examples in Parallel-7/flashforge-api-docs (docs commit f080a1110318a1818461800acb84d89049509761, wiki commit 199ecead9585d3bee16f3e8502afe0f63b6b6b3b, HTTP-REST-API.md, Adventurer-5M-Series.md, State-Machines.md, endpoints_5m_3.2.7.yaml / endpoints_ad5x_1.2.1.yaml). Serial/check code/MAC/IP/registration codes are obviously fake. Not a capture from a real printer."
+  },
+  "response": {
+    "code": -2,
+    "message": "Lan mode error"
+  }
+}

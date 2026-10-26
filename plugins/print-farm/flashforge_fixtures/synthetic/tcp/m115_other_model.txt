@@ -1,0 +1,6 @@
+CMD M115 Received.
+Machine Type: Flashforge Adventurer 3
+Machine Name: Adventurer III
+Firmware: v1.0.0
+SN: SNTEST-FAKE-0001
+ok

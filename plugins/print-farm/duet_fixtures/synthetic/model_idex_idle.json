@@ -1,0 +1,105 @@
+{
+ "_provenance": {
+  "kind": "synthetic",
+  "hardware": false,
+  "note": "IDEX idle, both tools off",
+  "source_refs": [
+   "RepRapFirmware wiki: HTTP-requests, Object-Model-Documentation"
+  ]
+ },
+ "model": {
+  "state": {
+   "status": "idle",
+   "currentTool": -1
+  },
+  "directories": {
+   "gCodes": "0:/gcodes/"
+  },
+  "job": {
+   "file": {
+    "fileName": null,
+    "size": 0
+   },
+   "filePosition": 0
+  },
+  "heat": {
+   "bedHeaters": [
+    0
+   ],
+   "heaters": [
+    {
+     "current": 60.0,
+     "state": "active",
+     "active": 60,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 31.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 24.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 77.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 25.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    }
+   ]
+  },
+  "tools": [
+   {
+    "number": 0,
+    "name": "T0",
+    "heaters": [
+     2
+    ],
+    "state": "off",
+    "active": [
+     0
+    ],
+    "standby": [
+     0
+    ]
+   },
+   {
+    "number": 1,
+    "name": "T1",
+    "heaters": [
+     4
+    ],
+    "state": "off",
+    "active": [
+     0
+    ],
+    "standby": [
+     0
+    ]
+   }
+  ],
+  "move": {
+   "motionSystems": [
+    {
+     "currentTool": 0
+    }
+   ]
+  }
+ }
+}

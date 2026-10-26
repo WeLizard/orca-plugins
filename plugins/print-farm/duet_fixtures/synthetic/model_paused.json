@@ -1,0 +1,63 @@
+{
+ "_provenance": {
+  "kind": "synthetic",
+  "hardware": false,
+  "note": "paused single-tool job",
+  "source_refs": [
+   "RepRapFirmware wiki: HTTP-requests, Object-Model-Documentation"
+  ]
+ },
+ "model": {
+  "state": {
+   "status": "paused",
+   "currentTool": 0
+  },
+  "directories": {
+   "gCodes": "0:/gcodes/"
+  },
+  "job": {
+   "file": {
+    "fileName": "0:/gcodes/a.gcode",
+    "size": 100
+   },
+   "filePosition": 50
+  },
+  "heat": {
+   "bedHeaters": [
+    0
+   ],
+   "heaters": [
+    {
+     "current": 22.5,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 24.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    }
+   ]
+  },
+  "tools": [
+   {
+    "number": 0,
+    "name": "",
+    "heaters": [
+     1
+    ],
+    "state": "off",
+    "active": [
+     0
+    ],
+    "standby": [
+     0
+    ]
+   }
+  ]
+ }
+}

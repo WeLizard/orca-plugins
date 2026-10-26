@@ -1,0 +1,17 @@
+{
+ "_provenance": {
+  "kind": "synthetic",
+  "hardware": false,
+  "note": "DSF rr-emulation: isEmulated true, no sessionKey",
+  "source_refs": [
+   "DuetSoftwareFramework: RepRapFirmwareController.cs (rr_connect emulation), MachineController.cs"
+  ]
+ },
+ "reply": {
+  "apiLevel": 1,
+  "err": 0,
+  "isEmulated": true,
+  "sessionTimeout": 8000,
+  "boardType": "duet3mb6xd100"
+ }
+}

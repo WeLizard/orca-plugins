@@ -1,0 +1,4 @@
+CMD M119 Received.
+Endstop: X-max: 110 Y-max: 110 Z-min: 0
+MoveMode: READY
+ok

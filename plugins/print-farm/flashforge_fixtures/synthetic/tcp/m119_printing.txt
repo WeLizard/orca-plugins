@@ -1,0 +1,8 @@
+CMD M119 Received.
+Endstop: X-max: 110 Y-max: 110 Z-min: 0
+MachineStatus: BUILDING_FROM_SD
+MoveMode: MOVING
+Status: S:1 L:0 J:0 F:0
+LED: 1
+CurrentFile: Benchy.gcode
+ok

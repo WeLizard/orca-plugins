@@ -1,0 +1,4 @@
+CMD M27 Received.
+SD printing byte 45234/123456
+Layer: 23/100
+ok

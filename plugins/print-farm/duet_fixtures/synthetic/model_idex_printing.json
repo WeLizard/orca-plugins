@@ -1,0 +1,112 @@
+{
+ "_provenance": {
+  "kind": "synthetic",
+  "hardware": false,
+  "note": "IDEX, T0 active printing, T1 standby; heater indexes != tool numbers",
+  "source_refs": [
+   "RepRapFirmware wiki: HTTP-requests, Object-Model-Documentation"
+  ]
+ },
+ "model": {
+  "state": {
+   "status": "processing",
+   "currentTool": 0
+  },
+  "directories": {
+   "gCodes": "0:/gcodes/"
+  },
+  "job": {
+   "file": {
+    "fileName": "0:/gcodes/synthetic-part.gcode",
+    "size": 2000,
+    "numLayers": 40
+   },
+   "filePosition": 500,
+   "layer": 10,
+   "timesLeft": {
+    "file": 1500,
+    "filament": 1400,
+    "slicer": null
+   }
+  },
+  "heat": {
+   "bedHeaters": [
+    0
+   ],
+   "heaters": [
+    {
+     "current": 60.0,
+     "state": "active",
+     "active": 60,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 31.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 209.5,
+     "state": "active",
+     "active": 210,
+     "standby": 150,
+     "sensor": 0
+    },
+    {
+     "current": 77.0,
+     "state": "off",
+     "active": 0,
+     "standby": 0,
+     "sensor": 0
+    },
+    {
+     "current": 148.0,
+     "state": "standby",
+     "active": 0,
+     "standby": 140,
+     "sensor": 0
+    }
+   ]
+  },
+  "tools": [
+   {
+    "number": 0,
+    "name": "T0",
+    "heaters": [
+     2
+    ],
+    "state": "active",
+    "active": [
+     210
+    ],
+    "standby": [
+     150
+    ]
+   },
+   {
+    "number": 1,
+    "name": "T1",
+    "heaters": [
+     4
+    ],
+    "state": "standby",
+    "active": [
+     0
+    ],
+    "standby": [
+     140
+    ]
+   }
+  ],
+  "move": {
+   "motionSystems": [
+    {
+     "currentTool": 0
+    }
+   ]
+  }
+ }
+}
