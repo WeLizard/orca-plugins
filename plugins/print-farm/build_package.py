@@ -71,8 +71,8 @@ def extract_metadata(source: str) -> dict[str, object]:
         raise ValueError("Plugin version is missing")
     if re.fullmatch(r"\d+\.\d+\.\d+", version) is None:
         raise ValueError("Plugin Hub version must use numeric X.Y.Z format")
-    if metadata.get("dependencies") != []:
-        raise ValueError("The single-file package must remain dependency-free")
+    if metadata.get("dependencies") != ["keyring==25.7.0"]:
+        raise ValueError("The single-file package requires exactly keyring==25.7.0")
     return metadata
 
 
@@ -310,6 +310,8 @@ def _canonical_core_metadata(version: str) -> bytes:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
         "project"
     ]
+    if project.get("dependencies") != ["keyring==25.7.0"]:
+        raise ValueError("Project dependencies must match the pinned runtime dependency")
     authors = project.get("authors")
     if not isinstance(authors, list) or len(authors) != 1:
         raise ValueError("The wheel must declare exactly one project author")
@@ -329,6 +331,7 @@ def _canonical_core_metadata(version: str) -> bytes:
         f"Summary: {fields['Summary']}\n"
         f"Author: {fields['Author']}\n"
         f"Requires-Python: {fields['Requires-Python']}\n"
+        "Requires-Dist: keyring==25.7.0\n"
         "\n"
     ).encode("utf-8")
 
@@ -362,7 +365,7 @@ def _normalize_wheel_metadata(wheel_path: Path, version: str) -> None:
     }
     if set(original) != expected:
         raise ValueError(
-            "Wheel contents differ from the dependency-free plugin contract: "
+            "Wheel contents differ from the single-file plugin contract: "
             f"{sorted(original)}"
         )
 

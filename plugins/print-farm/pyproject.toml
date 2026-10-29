@@ -7,6 +7,7 @@ name = "printers"
 dynamic = ["version"]
 description = "Cross-vendor dashboard of networked 3D printers with live status, controls, multi-send and an OrcaSlicer output history."
 requires-python = ">=3.12"
+dependencies = ["keyring==25.7.0"]
 authors = [{ name = "FilamentHub" }]
 
 [tool.setuptools]

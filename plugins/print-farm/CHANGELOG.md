@@ -2,6 +2,20 @@
 
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
+## 0.1.0
+- Added per-printer Connection options: a separate Web UI address on the same host and an explicitly selected stock Snapmaker U1 camera mode. This camera runs only while its overlay is open, closes on cancellation or lease expiry, keeps keys out of the page and clears failed or expired frames. Tested on local emulators; hardware acceptance remains pending.
+- Embedded Web UI windows show a selectable address and browser instructions when the page cannot load. Feedback provides the fixed FilamentHub site address and directions to its existing Beta Feedback button; no printer data is sent.
+- Moonraker printers now show all discovered extruder temperatures and the active tool reported by the printer. Clicking a head shows its details without changing the physical tool. Missing head readings stay unknown. Tested with local fixtures; hardware acceptance remains pending.
+- Added Repetier-Server with explicit printer selection by name and slug, status and temperatures, and classic server-managed job upload/start/control. New or unknown connector modes stay read-only. Start requests may wait in the server queue; physical printing is confirmed only by status. Tested with local emulators, not hardware.
+- Newly entered printer keys use the system credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service). Existing plaintext keys can be moved with explicit confirmation; old backups remain. An unavailable or locked credential store blocks printer connections until you retry access.
+- Bambu connections now require you to confirm the printer's certificates before connecting: status and commands (MQTT) and file transfers (FTPS) are confirmed separately. Later connections check the saved certificates before sending an access code or file. A changed certificate blocks the connection until you explicitly confirm the replacement; a rejected operation is never replayed automatically. The first confirmation is a trust decision, not proof of the printer's identity.
+- Background work now reports a denied OrcaSlicer thread permission immediately, so a rejected printer command does not remain queued and a later retry can start normally.
+- LAN discovery still offers Bambu printers, but network announcements no longer save a printer name, serial or model for automatic slice matching. Matching uses a name you entered or an OrcaSlicer preset, or a serial/model observed through the configured printer connection; older unverified saved values are ignored for that purpose.
+- The cleanup timer can be retried after a permission denial without interrupting the dashboard.
+- Loading the plugin no longer starts a background thread, so OrcaSlicer's permission question about threads now appears once, when you first open Print Farm, instead of twice at start-up.
+- A Bambu printer whose certificate is not confirmed yet now says so on its card and highlights **Certificates…**, instead of silently showing the printer as offline.
+- The Feedback window has a **Copy** button next to the site address and confirms when the address is copied.
+
 ## 0.0.10
 - Removed the system `curl` fallback for Bambu uploads. Files already went to Bambu printers over the plugin's own FTPS client, so nothing changes for you; the plugin no longer starts any other program.
 - Security review of what the plugin does: the shipped plugin no longer contains dynamic code execution (the bundled helper modules are plain code now), indirect `os` calls, environment reads or `ftplib` loaded at start-up (it loads on the first Bambu upload). The build refuses a plugin that contains such constructs.

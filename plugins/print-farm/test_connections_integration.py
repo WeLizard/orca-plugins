@@ -183,13 +183,15 @@ class DuetStatusTest(_Base):
         pinned = self.current(printer)
         self.assertEqual(pinned["protocol"], "rrf")
         again = self.dashboard._add_manual({
-            **{k: pinned[k] for k in ("name", "url", "type", "apikey", "source")},
+            **{k: pinned[k] for k in ("name", "url", "type", "source")},
             "target_uuid": pinned["target_uuid"],
             "owner_scope_uuid": pinned["owner_scope_uuid"],
             "target_selector": pinned["target_selector"],
             "binding_revision": pinned["binding_revision"],
         })
         self.assertNotIn("protocol", again)
+        self.assertNotIn("apikey", again)
+        self.assertEqual(self.plugin.hydrate_credentials(again)["apikey"], PASSWORD)
 
     def test_wrong_password_is_an_authorization_denial_like_other_backends(self):
         emu = self.duet_emu("rrf")
@@ -515,7 +517,9 @@ class FlashForgeTest(_Base):
         self.assertEqual((entry["serial"], entry["apikey"]), (FF_SERIAL, long_code))
         self.assertEqual(entry["access_code"], "")
         stored = self.dashboard._add_manual(entry)
-        self.assertEqual((stored["serial"], stored["apikey"]), (FF_SERIAL, long_code))
+        self.assertNotIn("apikey", stored)
+        self.assertEqual((stored["serial"], self.plugin.hydrate_credentials(stored)["apikey"]),
+                         (FF_SERIAL, long_code))
 
     def test_status_is_read_through_the_real_path_and_reaches_the_dto_without_secrets(self):
         printer = self.printer()
@@ -597,8 +601,10 @@ class FlashForgeTest(_Base):
         for key in ("flashforgeErrAuth", "flashforgeErrLanMode", "flashforgeErrUnsupportedModel",
                     "flashforgeErrIdentity", "flashforgeErrCredentials"):
             self.assertIn(key, self.plugin.UI_COPY["en"])
-        for bad in (dict(printer, apikey="wrong-" + FF_CHECK),
-                    dict(printer, serial="SNWRONG-0000")):
+        hydrated = self.plugin.hydrate_credentials(printer)
+        legacy = {k: v for k, v in hydrated.items() if k != "credential_refs"}
+        for bad in (dict(legacy, apikey="wrong-" + FF_CHECK),
+                    dict(legacy, serial="SNWRONG-0000")):
             self.reply("detail_5m_ready")
             status = self.plugin.poll_printer(bad)
             self.assertEqual(status["error_code"], "authorization_denied")
@@ -612,7 +618,8 @@ class FlashForgeTest(_Base):
     def test_missing_credentials_are_reported_without_a_request(self):
         printer = self.printer()
         before = len(self.ff_cfg["requests"])
-        status = self.plugin.poll_printer(dict(printer, apikey=""))
+        legacy = {k: v for k, v in printer.items() if k != "credential_refs"}
+        status = self.plugin.poll_printer(dict(legacy, apikey=""))
         self.assertEqual(status["error_code"], "credentials_required")
         self.assertEqual(len(self.ff_cfg["requests"]), before)
 

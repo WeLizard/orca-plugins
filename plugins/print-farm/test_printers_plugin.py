@@ -101,6 +101,23 @@ def _load_plugin(*, lifecycle=False, pages=False, registered=None,
     return module
 
 
+def _trusted_bambu_card(testcase, plugin, card, certificate=b"synthetic Bambu TLS certificate"):
+    storage = tempfile.TemporaryDirectory(prefix="print-farm-bambu-tls-test-")
+    testcase.addCleanup(storage.cleanup)
+    patcher = mock.patch.object(plugin, "PRINTERS_FILE",
+                               str(pathlib.Path(storage.name) / "printers.json"))
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    printer = dict(card, type="bambu")
+    plugin._ensure_printer_identity(printer)
+    digest = hashlib.sha256(certificate).hexdigest()
+    printer["tls_pins"] = {"mqtt": digest, "ftps": digest}
+    printer["tls_trust_revision"] = 1
+    if not plugin.save_manual_printers([printer]):
+        raise AssertionError("test fixture could not save trusted Bambu record")
+    return printer
+
+
 def _fresh_status(plugin, backend, state, job_state=None):
     return plugin._finalize_status({
         "online": True,
@@ -147,6 +164,17 @@ class PrintersOutboxTest(unittest.TestCase):
         record = self.plugin.load_outbox_index()[0]
         self.assertFalse(record["host_handled"])
         self.assertEqual(record["host"], "File")
+
+    def test_execute_keeps_gcode_bytes_and_index_hash(self):
+        source = (b"; printer_settings_id = Voron 2.4 350\r\n"
+                  b"; printer_model = Voron 2.4\r\nG28\n\xff\x00\r\n")
+        self.gcode.write_bytes(source)
+        self.assertEqual(self.execute("File")[0], "success")
+        self.assertEqual(self.gcode.read_bytes(), source)
+        record = self.plugin.load_outbox_index()[0]
+        retained = pathlib.Path(self.plugin._safe_outbox_path(record["file"]))
+        self.assertEqual(retained.read_bytes(), source)
+        self.assertEqual(record["sha256"], hashlib.sha256(source).hexdigest())
 
     def test_slicer_temp_working_name_is_replaced_by_readable_name(self):
         temp = pathlib.Path(self.temp_dir.name) / ".48540.0.gcode"
@@ -608,18 +636,21 @@ class PrintersOutboxTest(unittest.TestCase):
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
 
-        notes = builder.render_release_notes(self.plugin.PLUGIN_VERSION)
+        current_version = self.plugin.PLUGIN_VERSION
+        previous_version = "9.8.7" if current_version != "9.8.7" else "9.8.6"
+        with tempfile.TemporaryDirectory() as temp:
+            changelog = pathlib.Path(temp) / "CHANGELOG.md"
+            changelog.write_text(
+                f"## {current_version}\n\nCurrent release marker.\n\n"
+                f"## {previous_version}\n\nPrevious release marker.\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(builder, "CHANGELOG", changelog):
+                notes = builder.render_release_notes(current_version)
 
-        self.assertIn(f"## Print Farm {self.plugin.PLUGIN_VERSION}", notes)
-        self.assertIn("Updated the Print Farm icon", notes)
-        self.assertNotIn("printer removal", notes)
-        self.assertNotIn("translated labels", notes)
-        self.assertNotIn("unavailable Select controls", notes)
-        self.assertNotIn("available-printer list", notes)
-        self.assertNotIn("OrcaCloud release delivery", notes)
-        self.assertNotIn("connected GitHub release workflow", notes)
-        self.assertNotIn("local print history", notes)
-        self.assertNotIn("Made add, remove, refresh", notes)
+        self.assertIn(f"## Print Farm {current_version}", notes)
+        self.assertIn("Current release marker.", notes)
+        self.assertNotIn("Previous release marker.", notes)
 
 
 class PluginStorageTest(unittest.TestCase):
@@ -984,7 +1015,7 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn("if (p.source === 'orca') return !activeRefs[p.discovery_ref];", source)
         self.assertIn("pendingAdoptRef ? p.discovery_ref === pendingAdoptRef", source)
 
-    def test_legacy_duplicate_picker_records_are_preserved_with_backup(self):
+    def test_legacy_duplicate_picker_records_are_preserved_without_plaintext_backup(self):
         with tempfile.TemporaryDirectory() as temp:
             store = pathlib.Path(temp) / "printers.json"
             store.write_text(json.dumps([
@@ -998,11 +1029,7 @@ class PluginStorageTest(unittest.TestCase):
             self.assertEqual([item["name"] for item in stored], ["First", "Latest"])
             self.assertNotEqual(stored[0]["target_uuid"], stored[1]["target_uuid"])
             backup = pathlib.Path(str(store) + ".identity-migration.bak")
-            self.assertTrue(backup.exists())
-            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), [
-                {"id": 1, "name": "First", "url": "http://printer"},
-                {"id": 2, "name": "Latest", "url": "http://printer/"},
-            ])
+            self.assertFalse(backup.exists())
 
     def test_same_server_targets_keep_distinct_case_sensitive_routes_and_identity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1411,16 +1438,19 @@ class PluginStorageTest(unittest.TestCase):
         ftp = object.__new__(self.plugin._implicit_ftps_class())
         ftp._prot_p = True
         ftp.host = "printer"
+        ftp._bambu_printer = self._bambu_printer()
         ftp.sock = types.SimpleNamespace(session="control-session")
         ftp.context = mock.Mock()
-        ftp.context.wrap_socket.return_value = "tls-data"
+        tls_data = mock.Mock()
+        tls_data.getpeercert.return_value = b"synthetic Bambu TLS certificate"
+        ftp.context.wrap_socket.return_value = tls_data
 
         with mock.patch.object(
             ftplib.FTP,
             "ntransfercmd",
             return_value=("raw-data", 123),
         ):
-            self.assertEqual(ftp.ntransfercmd("STOR job.gcode"), ("tls-data", 123))
+            self.assertEqual(ftp.ntransfercmd("STOR job.gcode"), (tls_data, 123))
 
         ftp.context.wrap_socket.assert_called_once_with(
             "raw-data",
@@ -1465,8 +1495,8 @@ class PluginStorageTest(unittest.TestCase):
         return source
 
     def _bambu_printer(self):
-        return {"url": "http://192.0.2.7", "type": "bambu",
-                "access_code": "code-1", "serial": "SERIAL1"}
+        return _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.0.2.7", "access_code": "code-1", "serial": "SERIAL1"})
 
     def test_bambu_send_uploads_over_native_ftps_then_publishes_start(self):
         events, fake = self._fake_ftps()
@@ -1746,11 +1776,9 @@ class PluginStorageTest(unittest.TestCase):
                     "type": "moonraker",
                 }],
             })
-            submit.assert_called_once_with(
-                dashboard._refresh_worker,
-                discovered,
-                True,
-            )
+            submit.assert_called_once()
+            self.assertEqual(submit.call_args.args[0].__wrapped__, dashboard._refresh_worker)
+            self.assertEqual(submit.call_args.args[1:], (discovered, True))
 
             start_runtime.reset_mock()
             dashboard._post.reset_mock()
@@ -1758,11 +1786,9 @@ class PluginStorageTest(unittest.TestCase):
             dashboard.on_message({"type": "refresh"})
             start_runtime.assert_called_once_with()
             dashboard._post.assert_called_once()
-            submit.assert_called_once_with(
-                dashboard._refresh_worker,
-                discovered,
-                True,
-            )
+            submit.assert_called_once()
+            self.assertEqual(submit.call_args.args[0].__wrapped__, dashboard._refresh_worker)
+            self.assertEqual(submit.call_args.args[1:], (discovered, True))
 
     def test_page_ready_reactivates_a_stopped_runtime(self):
         plugin = _load_plugin()
@@ -1932,13 +1958,12 @@ class PluginStorageTest(unittest.TestCase):
 
     def test_bambu_connection_reset_keeps_diagnostic_out_of_card_state(self):
         reset = ConnectionResetError(10054, "Connection reset by peer")
+        printer = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.168.0.42", "access_code": "local-code"})
         with mock.patch.object(
             self.plugin.socket, "create_connection", side_effect=reset
         ):
-            status = self.plugin.poll_bambu({
-                "url": "http://192.168.0.42",
-                "access_code": "local-code",
-            })
+            status = self.plugin.poll_bambu(printer)
 
         self.assertIs(status["online"], False)
         self.assertEqual(status["state"], "offline")
@@ -1946,27 +1971,28 @@ class PluginStorageTest(unittest.TestCase):
         self.assertNotIn("10054", status["error"])
         self.assertIn('title="\' + esc(s.error || stateText)', self.plugin.PAGE)
 
-    def test_bambu_accepts_its_self_signed_lan_certificate_other_types_stay_verified(self):
-        # Bambu LAN endpoints are always self-signed; verifying them by default
-        # made every Bambu card show "offline" (regression in the 0.0.10 candidate).
+    def test_bambu_self_signed_transport_requires_its_stored_certificate_pin(self):
         self.assertIs(self.plugin.ssl_ctx_for({"type": "bambu"}), self.plugin._SSL_INSECURE)
         self.assertIs(self.plugin.ssl_ctx_for({"type": "moonraker"}), self.plugin._SSL_VERIFY)
         self.assertIs(
             self.plugin.ssl_ctx_for({"type": "moonraker", "insecure": True}),
             self.plugin._SSL_INSECURE,
         )
+        printer = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://printer.local", "access_code": "code", "serial": "serial"})
         wrapped = mock.Mock()
+        wrapped.getpeercert.return_value = b"synthetic Bambu TLS certificate"
         raw = mock.Mock()
         raw.sendall = mock.Mock()
         context = mock.Mock()
         context.wrap_socket.return_value = wrapped
         wrapped.sendall = mock.Mock()
         wrapped.close = mock.Mock()
-        with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw), \
+        with mock.patch.object(self.plugin, "_SSL_INSECURE", context), \
+             mock.patch.object(self.plugin.socket, "create_connection", return_value=raw), \
              mock.patch.object(self.plugin, "_mqtt_read_packet", return_value=(0x20, b"\x00\x00")):
-            self.plugin._bambu_publish(
-                "printer.local", "code", "device/serial/request", {}, ssl_context=context
-            )
+            self.assertEqual(self.plugin._bambu_publish(
+                "printer.local", "code", "device/serial/request", {}, printer=printer), "")
         context.wrap_socket.assert_called_once_with(raw, server_hostname="printer.local")
 
     def test_only_end_to_end_backends_are_active(self):
@@ -1975,23 +2001,23 @@ class PluginStorageTest(unittest.TestCase):
         self.assertEqual(self.plugin.backend_for_type("bambu"), "bambu")
         self.assertEqual(self.plugin.backend_for_type("prusalink"), "prusalink")
         self.assertEqual(self.plugin.backend_for_type("duet"), "duet")
-        self.assertEqual(self.plugin.backend_for_type("repetier"), "unavailable")
+        self.assertEqual(self.plugin.backend_for_type("repetier"), "repetier")
         self.assertTrue(self.plugin.backend_is_active("duet"))
         self.assertTrue(self.plugin.backend_is_active("prusalink"))
-        self.assertFalse(self.plugin.backend_is_active("repetier"))
+        self.assertTrue(self.plugin.backend_is_active("repetier"))
 
         status = self.plugin.poll_printer({
             "url": "http://printer",
             "type": "repetier",
         })
-        self.assertIsNone(status["online"])
-        self.assertFalse(status["supported"])
-        self.assertEqual(status["state"], "not available yet")
+        self.assertFalse(status["online"])
+        self.assertTrue(status["supported"])
+        self.assertEqual(status["error_code"], "credential_unavailable")
 
     def test_planned_backends_are_visible_but_disabled(self):
         source = self.plugin.render_page()
         self.assertIn(
-            '<option value="repetier" disabled>Repetier — coming later</option>',
+            '<option value="repetier">Repetier</option>',
             source,
         )
         self.assertIn('<option value="prusalink">PrusaLink</option>', source)
@@ -2044,7 +2070,7 @@ class PluginStorageTest(unittest.TestCase):
         self.assertIn("var printAttrs = selectable", source)
         self.assertIn("t('printerBusy')", source)
         self.assertIn("function cardActionsHtml(parts)", source)
-        self.assertIn("'<div class=\"ctl-row\">' + parts.history + parts.ctl + '</div>'", source)
+        self.assertIn("'<div class=\"ctl-row\">' + parts.history + (parts.tls || '') + parts.ctl + '</div>'", source)
         self.assertIn('class="ctl-slot"', source)
         # An empty control slot or a hidden spacer button would leave a hole.
         self.assertNotIn("ctl spacer", source)
@@ -2848,7 +2874,9 @@ class PrintHistoryTest(unittest.TestCase):
         message = {"type": "print-history-all", "requestId": 19}
         with mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
             dashboard.on_message(message)
-        submit.assert_called_once_with(dashboard._post_print_history_all, message)
+        submit.assert_called_once()
+        self.assertEqual(submit.call_args.args[0].__wrapped__, dashboard._post_print_history_all)
+        self.assertEqual(submit.call_args.args[1:], (message,))
 
     def test_history_dialog_has_global_search_keyboard_and_late_response_guards(self):
         source = PLUGIN_PATH.read_text(encoding="utf-8")
@@ -3076,7 +3104,7 @@ class StartCompatibilityTest(unittest.TestCase):
             ("unknown", "startReasonProfileUnknown"))
         self.assertEqual(
             self.plugin.start_compatibility(self.manual(host_type="repetier"), gcode, None),
-            ("incompatible", "startReasonUnsupported"))
+            ("unknown", "startReasonProfileUnknown"))
         # Sliced 3MF is fine for a G-code backend (the plate is extracted).
         self.assertEqual(
             self.plugin.start_compatibility(self.manual(), sliced, "Metadata/plate_3.gcode")[0],
@@ -3726,8 +3754,10 @@ function files(n, prefix, base){ var out = []; for (var i = 0; i < n; i++)
         self.assertEqual(out["log"][0][0], "flex")
         self.assertIn("unassignedDeleteConfirm", out["log"][0][1])
         self.assertEqual((out["log"][0][2], out["log"][1][1], out["log"][2][0]), (0, 0, 1))
-        self.assertEqual(out["posted"], [{"type": "outbox-unassigned-drop", "file": "unassigned/2__b.gcode"},
-                                         {"type": "outbox-unassigned-drop", "file": "unassigned/1__a.gcode"}])
+        self.assertEqual(out["posted"], [
+            {"type": "outbox-unassigned-drop", "file": "unassigned/2__b.gcode", "requestId": 1},
+            {"type": "outbox-unassigned-drop", "file": "unassigned/1__a.gcode", "requestId": 2},
+        ])
 
     def test_copy_bound_to_a_printer_uses_that_printers_card_path(self):
         out = self.run_js("""
@@ -3753,9 +3783,9 @@ function files(n, prefix, base){ var out = []; for (var i = 0; i < n; i++)
                     "url": "http://ready", "connectionType": "moonraker", "name": "ready"}
         busy = {**identity, "targetUuid": "u2", "url": "http://busy", "name": "busy"}
         self.assertEqual(out["posted"], [
-            {**identity, "type": "outbox-send", "file": "u1/1__q.gcode", "start": False},
-            {**identity, "type": "outbox-drop", "file": "u1/1__q.gcode"},
-            {**busy, "type": "outbox-drop", "file": "u2/1__w.gcode"}])
+            {**identity, "type": "outbox-send", "file": "u1/1__q.gcode", "start": False, "requestId": 1},
+            {**identity, "type": "outbox-drop", "file": "u1/1__q.gcode", "requestId": 2},
+            {**busy, "type": "outbox-drop", "file": "u2/1__w.gcode", "requestId": 3}])
 
     def test_long_journal_is_capped_and_grows_on_request(self):
         out = self.run_js("""
@@ -3811,7 +3841,7 @@ function files(n, prefix, base){ var out = []; for (var i = 0; i < n; i++)
         self.assertEqual(out["asked"][0], "flex")
         self.assertEqual(out["asked"][1], 'outboxStorageCleanConfirm{"count":2,"size":"0 KB"}')
         self.assertEqual((out["asked"][2], out["afterCancel"]), (0, 0))
-        self.assertEqual(out["posted"], [{"type": "outbox-cleanup"}])
+        self.assertEqual(out["posted"], [{"type": "outbox-cleanup", "requestId": 1}])
         self.assertEqual(out["blocked"], [True, True])
         self.assertEqual(out["warn"], ['outboxStorageScanFailed{"paths":"p"}', "outboxStorageWarning"])
         self.assertEqual(out["warnButtons"], 0)
@@ -4125,14 +4155,16 @@ class BambuLanStatsTest(unittest.TestCase):
         packets = iter([(0x20, b"\x00\x00"), (0x90, b"\x00\x01\x00"),
                         (0x30, struct.pack("!H", len(topic)) + topic + payload)])
         fake = mock.MagicMock()
+        fake.getpeercert.return_value = b"synthetic Bambu TLS certificate"
         context = mock.MagicMock()
         context.wrap_socket.return_value = fake
+        printer = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.0.2.1", "access_code": "x", "serial": "SERIAL"})
         with mock.patch.object(self.plugin.socket, "create_connection", return_value=fake), \
              mock.patch.object(self.plugin, "ssl_ctx_for", return_value=context), \
              mock.patch.object(self.plugin, "_mqtt_read_packet",
                                side_effect=lambda *args: next(packets)):
-            status = self.plugin.poll_bambu({"url": "http://192.0.2.1", "access_code": "x",
-                                             "serial": "SERIAL"})
+            status = self.plugin.poll_bambu(printer)
         self.assertIs(status["online"], True)
         self.assertEqual(status["state"], "printing")
         self.assertEqual((status["remaining_minutes"], status["layer"], status["total_layers"]),
@@ -4221,7 +4253,8 @@ class SharedJobStatsTest(unittest.TestCase):
 
     def moonraker(self, objects):
         reply = {"result": {"status": objects}}
-        with mock.patch.object(self.plugin, "_get_json", return_value=reply) as get, \
+        with mock.patch.object(self.plugin, "_moonraker_extruders", return_value=["extruder"]), \
+             mock.patch.object(self.plugin, "_get_json", return_value=reply) as get, \
              mock.patch.object(self.plugin, "moonraker_thumbnail", return_value=""):
             status = self.plugin.poll_moonraker("http://192.0.2.1", None, {"X-Api-Key": "k"})
         self.assertEqual(get.call_count, 1)
@@ -4483,7 +4516,7 @@ class CameraDashboardTest(unittest.TestCase):
         with mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
             self.dashboard.on_message(dict(self.msg, type="camera-info", requestId=1))
         submit.assert_called_once()
-        self.assertEqual(submit.call_args.args[0], self.dashboard._post_camera_info)
+        self.assertEqual(submit.call_args.args[0].__wrapped__, self.dashboard._post_camera_info)
 
     def test_open_in_window_uses_only_the_checked_cached_address(self):
         opened = []
@@ -4720,7 +4753,7 @@ class UnassignedDropAllTest(unittest.TestCase):
         dash._refresh_worker.assert_called_once()
         with mock.patch.object(self.plugin.ACTION_WORKER, "submit") as submit:
             dash.on_message({"type": "outbox-unassigned-drop-all"})
-        self.assertEqual(submit.call_args.args[0], dash._drop_unassigned_and_refresh)
+        self.assertEqual(submit.call_args.args[0].__wrapped__, dash._drop_unassigned_and_refresh)
 
     def test_queued_files_expose_their_timestamp_for_sorting(self):
         public = self.plugin.public_printer_record({"queued": [
@@ -4807,7 +4840,8 @@ function statusControlReady(p, action){ return true; }
 """ + _page_slice("function stateKind(s){", "function statusControlReady(p, action){") \
             + _page_slice("function cardActionsHtml(parts){", "function render(printers){") + r"""
 function build(p, noCam){
-  var s = p.status, supported = true; noCamera = noCam ? {u: true} : {};
+  var s = p.status, supported = true;
+  var multiTool = Array.isArray(s.tools) && s.tools.length > 1; noCamera = noCam ? {u: true} : {};
   var tile = {innerHTML: ''};
 """ + _page_slice("    var kind = stateKind(s);", "    var selBox") + r"""
   return tile.innerHTML;
@@ -4842,10 +4876,31 @@ var out = {};
 out.moon = rowsOf(build(P('moonraker', 'standby'), false));
 out.bambu = rowsOf(build(P('bambu', 'idle'), false));""")
         self.assertEqual(out["moon"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "print", "cam", "open"]}])
+                         ["select-control", "history", "connection-options", "print", "cam", "open"]}])
         self.assertEqual(out["bambu"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "print", "cam"]}])
+                         ["select-control", "history", "connection-options", "print", "tls-trust", "cam"]}])
         self.assertFalse(out["moon"]["empty"] or out["bambu"]["empty"])
+
+    def test_feedback_page_offers_copy_with_confirmation_and_no_navigation(self):
+        plugin = _load_plugin()
+        page = plugin.render_feedback_page()
+        self.assertIn('id="copy"', page)
+        self.assertIn('value="https://filamenthub.ru"', page)
+        self.assertIn("default-src 'none'", page)
+        self.assertNotIn("<a ", page)
+        self.assertNotIn("http-equiv=\"refresh\"", page)
+        self.assertIn(plugin.ui_text("feedbackCopied"), page)
+
+    def test_bambu_card_highlights_certificates_only_when_trust_is_missing(self):
+        out = self.cards("""
+var needed = P('bambu', 'offline', false); needed.status.error_code = 'tls_trust_required';
+var fine = P('bambu', 'idle');
+var other = P('moonraker', 'offline', false); other.status.error_code = 'tls_trust_required';
+out.needed = /class="tls-trust primary"/.test(build(needed, false));
+out.fine = /class="tls-trust ghost"/.test(build(fine, false));
+out.other = tlsTrustNeeded(other, other.status);
+out.flag = tlsTrustNeeded(needed, needed.status);""")
+        self.assertEqual(out, {"needed": True, "fine": True, "other": False, "flag": True})
 
     def test_missing_camera_or_open_keeps_the_single_row_intact(self):
         out = self.cards("""
@@ -4853,11 +4908,11 @@ var u = P('moonraker', 'standby'); u.type = 'prusalink'; u.status.backend = 'pru
 out.nocam = rowsOf(build(P('moonraker', 'standby'), true));
 out.nocamOpen = rowsOf(build(P('bambu', 'standby'), true));
 out.nocamIdleOnlyOpen = rowsOf(build(u, false));""")
-        self.assertEqual(out["nocam"]["rows"][0]["items"], ["select-control", "history", "print", "open"])
+        self.assertEqual(out["nocam"]["rows"][0]["items"], ["select-control", "history", "connection-options", "print", "open"])
         self.assertEqual(out["nocamOpen"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "print"]}])
+                         ["select-control", "history", "connection-options", "print", "tls-trust"]}])
         self.assertEqual(out["nocamIdleOnlyOpen"]["rows"][0]["items"],
-                         ["select-control", "history", "print", "open"])
+                         ["select-control", "history", "connection-options", "print", "open"])
 
     def test_offline_card_keeps_the_disabled_actions_in_the_same_row(self):
         out = self.cards("""
@@ -4865,7 +4920,7 @@ var html = build(P('moonraker', 'offline', false), false);
 out.rows = rowsOf(html); out.disabledPrint = /<button class="print ghost" disabled/.test(html);""")
         self.assertEqual(len(out["rows"]["rows"]), 1)
         self.assertEqual(out["rows"]["rows"][0]["items"],
-                         ["select-control", "history", "print", "cam", "open"])
+                         ["select-control", "history", "connection-options", "print", "cam", "open"])
         self.assertTrue(out["disabledPrint"])
 
     def test_printing_keeps_history_and_stop_together_without_select_or_print(self):
@@ -4874,12 +4929,12 @@ out.moon = rowsOf(build(P('moonraker', 'printing'), false));
 out.paused = rowsOf(build(P('octoprint', 'paused'), false));
 out.bambu = rowsOf(build(P('bambu', 'printing'), true));""")
         self.assertEqual(out["moon"]["rows"], [
-            {"cls": "ctl-row", "items": ["history", "ctl-slot", "ctl", "ctl"]},
+            {"cls": "ctl-row", "items": ["history", "connection-options", "ctl-slot", "ctl", "ctl"]},
             {"cls": "row", "items": ["cam", "open"]}])
-        self.assertEqual(out["paused"]["rows"][0]["items"], ["history", "ctl-slot", "ctl", "ctl"])
+        self.assertEqual(out["paused"]["rows"][0]["items"], ["history", "connection-options", "ctl-slot", "ctl", "ctl"])
         # Nothing left for the second row: it is not drawn at all.
         self.assertEqual(out["bambu"]["rows"], [{"cls": "ctl-row",
-                                                  "items": ["history", "ctl-slot", "ctl", "ctl"]}])
+                                                  "items": ["history", "connection-options", "tls-trust", "ctl-slot", "ctl", "ctl"]}])
         for key in ("moon", "paused", "bambu"):
             self.assertFalse(out[key]["empty"])
 
@@ -4888,7 +4943,7 @@ out.bambu = rowsOf(build(P('bambu', 'printing'), true));""")
 var p = P('octoprint', 'printing'); statusControlReady = function(){ return false; };
 out.rows = rowsOf(build(p, true));""")
         self.assertEqual(len(out["rows"]["rows"]), 1)
-        self.assertEqual(out["rows"]["rows"][0]["items"], ["history", "open"])
+        self.assertEqual(out["rows"]["rows"][0]["items"], ["history", "connection-options", "open"])
 
     def test_row_css_pushes_actions_right_and_selection_left(self):
         page = _load_plugin().PAGE
@@ -5538,6 +5593,269 @@ class OutboxHintUiTest(unittest.TestCase):
         self.assertEqual(hidden, ["none", "", ""])
 
 
+class ThreadPermissionSafetyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = _load_plugin()
+
+    def test_denied_worker_start_never_queues_and_retry_runs_once(self):
+        pool = self.plugin.ReusableDaemonPool("denial-test", max_workers=1)
+        ran = []
+        with mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                pool.submit(lambda: ran.append("denied"))
+        self.assertTrue(pool._jobs.empty())
+        self.assertFalse(pool._workers)
+        pool.submit(lambda: ran.append("retry")).wait(2)
+        self.assertEqual(ran, ["retry"])
+        pool.shutdown()
+
+    def test_growth_denial_preserves_previously_accepted_job(self):
+        pool = self.plugin.ReusableDaemonPool("growth-test", max_workers=2)
+        entered, release = threading.Event(), threading.Event()
+        ran = []
+
+        def first():
+            entered.set()
+            release.wait(2)
+            ran.append("first")
+
+        accepted = pool.submit(first)
+        self.assertTrue(entered.wait(2))
+        with mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                pool.submit(lambda: ran.append("denied"))
+        release.set()
+        accepted.wait(2)
+        pool.submit(lambda: ran.append("retry")).wait(2)
+        self.assertEqual(ran, ["first", "retry"])
+        pool.shutdown()
+
+    def test_cleanup_timer_denial_keeps_clean_handle_and_retry(self):
+        plugin = self.plugin
+        plugin.stop_outbox_pruning()
+        with mock.patch.object(threading.Timer, "start", side_effect=PermissionError("denied")):
+            plugin.start_outbox_pruning()
+        self.assertIsNone(plugin._PRUNE_STOP["timer"])
+        with mock.patch.object(plugin, "_prune_tick"):
+            self.assertTrue(plugin._schedule_prune(plugin._PRUNE_STOP, 60))
+        plugin.stop_outbox_pruning()
+
+    def test_loader_thread_never_starts_a_thread_before_a_grant(self):
+        plugin = self.plugin
+        plugin.stop_outbox_pruning()
+        plugin._THREAD_GRANT_SEEN = False
+        started = []
+        real_start = threading.Timer.start
+
+        def record(timer):
+            started.append(timer)
+            return real_start(timer)
+
+        loader = threading.Thread(target=lambda: (
+            plugin.start_outbox_pruning(), plugin.start_outbox_pruning(),
+        ))
+        with mock.patch.object(threading.Timer, "start", record):
+            loader.start()
+            loader.join(2)
+            self.assertEqual(started, [])
+            self.assertIsNone(plugin._PRUNE_STOP["timer"])
+            with mock.patch.object(plugin, "_PLUGIN_RUNTIME_ACTIVE", True),                  mock.patch.object(plugin, "_prune_tick"):
+                plugin.resume_deferred_pruning()
+            self.assertEqual(len(started), 1)
+        self.assertTrue(plugin._THREAD_GRANT_SEEN)
+        plugin.stop_outbox_pruning()
+
+    def test_ui_poll_denial_resets_busy_state_and_retry_runs(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        plugin.ACTION_WORKER.activate()
+        ran = threading.Event()
+        with mock.patch.object(dashboard, "_post_status") as status, \
+             mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")):
+            dashboard.on_message({"type": "poll"})
+        self.assertFalse(dashboard._polling)
+        status.assert_called_once()
+        with mock.patch.object(dashboard, "_poll_dashboard",
+                               side_effect=lambda token: (ran.set(), dashboard._finish_dashboard_poll(token))):
+            dashboard.on_message({"type": "poll"})
+            self.assertTrue(ran.wait(2))
+        self.assertFalse(dashboard._polling)
+        plugin.ACTION_WORKER.shutdown()
+
+    def test_stop_ready_releases_discarded_batch_and_old_completion_cannot_release_new_poll(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        plugin.POLL_WORKERS = plugin.ReusableDaemonPool("poll-restart-test", max_workers=1)
+        plugin.ACTION_WORKER.activate()
+        plugin.POLL_WORKERS.activate()
+        plugin._PLUGIN_RUNTIME_ACTIVE = True
+        old_entered, new_entered = threading.Event(), threading.Event()
+        old_release, new_release, completed = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        batches = []
+
+        def poll(printer, batch, generation):
+            calls.append(printer["name"])
+            batches.append(batch)
+            try:
+                if len(calls) == 1:
+                    old_entered.set()
+                    old_release.wait(5)
+                elif len(calls) == 2:
+                    new_entered.set()
+                    new_release.wait(5)
+            finally:
+                batch.finish_one()
+
+        def finish(printers, on_complete, generation):
+            on_complete()
+            completed.set()
+
+        def restart(**kwargs):
+            plugin.ACTION_WORKER.activate()
+            plugin.POLL_WORKERS.activate()
+
+        self.addCleanup(plugin.ACTION_WORKER.shutdown)
+        self.addCleanup(plugin.POLL_WORKERS.shutdown)
+        self.addCleanup(old_release.set)
+        self.addCleanup(new_release.set)
+        with mock.patch.object(dashboard, "_post"), \
+             mock.patch.object(dashboard, "_page_settings", return_value={}), \
+             mock.patch.object(dashboard, "_refresh_async", side_effect=restart), \
+             mock.patch.object(dashboard, "_poll_into", side_effect=poll), \
+             mock.patch.object(dashboard, "_finish_poll_batch", side_effect=finish), \
+             mock.patch.object(plugin, "outbox_hint_visible", return_value=False), \
+             mock.patch.object(plugin, "dashboard_printers", return_value=[
+                 {"name": "first"}, {"name": "queued"}]):
+            dashboard.on_message({"type": "poll"})
+            self.assertTrue(old_entered.wait(2))
+            old_token = dashboard._poll_token
+            plugin.stop_plugin_runtime()
+            dashboard.on_message({"type": "ready"})
+            self.assertFalse(dashboard._polling)
+            dashboard.on_message({"type": "poll"})
+            old_release.set()
+            self.assertTrue(new_entered.wait(2))
+            self.assertNotEqual(old_token, dashboard._poll_token)
+            batches[0].finish_one()  # a late completion from the old batch
+            self.assertTrue(dashboard._polling)
+            completed.clear()
+            new_release.set()
+            self.assertTrue(completed.wait(2))
+            self.assertFalse(dashboard._polling)
+            self.assertEqual(calls, ["first", "first", "queued"])
+
+    def test_active_poll_denial_keeps_exact_action_status_and_finishes_batch(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        plugin.ACTION_WORKER.activate()
+        plugin.POLL_WORKERS.activate()
+        printer = {"name": "Duet", "url": "http://192.0.2.10", "type": "duet"}
+        posted = []
+        completed = []
+        dashboard._post = posted.append
+        dashboard._post_status("upload failed: authentication rejected")
+        with mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")), \
+             mock.patch.object(plugin, "attach_outbox"), \
+             mock.patch.object(plugin, "autoname_printers"):
+            dashboard._poll_and_push([printer], discover=True,
+                                     on_complete=lambda: completed.append(True))
+        self.assertEqual(completed, [True])
+        self.assertEqual([item["status"] for item in posted if "status" in item],
+                         ["upload failed: authentication rejected"])
+        self.assertEqual(printer["status"]["state"], "offline")
+        self.assertTrue(any("printers" in item for item in posted))
+        plugin.ACTION_WORKER.shutdown()
+        plugin.POLL_WORKERS.shutdown()
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node is not available")
+    def test_rejected_add_and_adopt_unlock_actual_page_controls(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        plugin.ACTION_WORKER.activate()
+        posted = []
+        discovered = {"name": "Preset", "url": "http://192.0.2.10",
+                      "type": "bambu", "discovery_ref": "orca:fixture"}
+        dashboard._discovered_printers = {"orca:fixture": discovered}
+        with mock.patch.object(dashboard, "_post", side_effect=posted.append), \
+             mock.patch.object(dashboard, "_post_status"), \
+             mock.patch.object(dashboard, "_capture_discovered_printers", return_value=[]), \
+             mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")):
+            dashboard.on_message({"type": "add", "name": "Manual", "url": "192.0.2.11",
+                                  "kind": "bambu", "access_code": "code"})
+            dashboard.on_message({"type": "adopt", "discoveryRef": "orca:fixture"})
+        failures = [item["adoptResult"] for item in posted if "adoptResult" in item]
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(all(item["ok"] is False for item in failures))
+        handler = _page_slice("  if (data.adoptResult) {", "  if (data.settings)")
+        script = (_FAKE_DOM_JS + "\nvar pendingFormAdd=true, pendingAdoptUrl='pending', pendingAdoptRef='ref';\n"
+                  "function setManualFormOpen(){} function renderAvailable(){}\n"
+                  "function receive(data){\n" + handler + "\n}\n"
+                  "document.getElementById('add').disabled=true;"
+                  "document.getElementById('f-adopt').disabled=true;"
+                  "receive(" + json.dumps({"adoptResult": failures[0]}) + ");\n"
+                  "console.log(JSON.stringify([pendingAdoptUrl,pendingAdoptRef,pendingFormAdd,"
+                  "document.getElementById('add').disabled,"
+                  "document.getElementById('f-adopt').disabled]));")
+        done = subprocess.run(["node", "-e", script], capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout), ["", "", False, False, False])
+        plugin.ACTION_WORKER.shutdown()
+
+    def test_rejected_history_camera_and_artifact_answer_page_protocol(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        plugin.ACTION_WORKER.activate()
+        posted = []
+        with mock.patch.object(dashboard, "_post", side_effect=posted.append), \
+             mock.patch.object(dashboard, "_post_status"), \
+             mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")):
+            dashboard.on_message({"type": "print-history-all", "requestId": 7})
+            dashboard.on_message({"type": "camera-info", "requestId": 8,
+                                  "targetUuid": "target"})
+            dashboard.on_message({"type": "artifact-begin", "filename": "a.gcode", "size": 1})
+        self.assertEqual(posted[0]["printHistory"]["requestId"], 7)
+        self.assertFalse(posted[0]["printHistory"]["available"])
+        self.assertEqual(posted[1]["cameraInfo"]["targetUuid"], "target")
+        self.assertFalse(posted[1]["cameraInfo"]["ok"])
+        self.assertTrue(posted[2]["artifactError"])
+        plugin.ACTION_WORKER.shutdown()
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node is not available")
+    def test_rejected_command_unlocks_only_its_button_for_retry(self):
+        plugin = _load_plugin()
+        dashboard = plugin.PrintersDashboard()
+        posted = []
+        printer = plugin._ensure_printer_identity({"name": "Printer", "type": "moonraker",
+                                                   "url": "http://192.0.2.10"})
+        with mock.patch.object(plugin, "resolve_printer_target", return_value=printer), \
+             mock.patch.object(plugin, "dashboard_printers", return_value=[printer]), \
+             mock.patch.object(dashboard, "_ensure_action_scheduler", return_value=(None, 0)), \
+             mock.patch.object(dashboard, "_post", side_effect=posted.append), \
+             mock.patch.object(dashboard, "_post_status"):
+            dashboard._submit_target_action(mock.Mock(), {"requestId": 1}, "cancel")
+        rejection = posted[0]
+        self.assertEqual(rejection, {"actionRejected": {"requestId": 1}})
+        helper = _page_slice("var actionRejectSequence = 0;", "function statusFresh(")
+        handler = _page_slice("  if (data.actionRejected", "  if (data.artifactBegin")
+        script = (_FAKE_DOM_JS + helper + "\nfunction receive(data){\n" + handler + "\n}\n"
+                  "var first=new El('button'), second=new El('button');\n"
+                  "sendRejectableAction(first,{type:'printer-cmd',action:'cancel'});\n"
+                  "sendRejectableAction(second,{type:'printer-cmd',action:'pause'});\n"
+                  "receive(" + json.dumps(rejection) + ");\n"
+                  "var afterReject=[first.disabled,second.disabled,posted.length];\n"
+                  "sendRejectableAction(first,{type:'printer-cmd',action:'cancel'});\n"
+                  "console.log(JSON.stringify([afterReject,first.disabled,second.disabled,"
+                  "posted.length,posted.map(function(x){return x.requestId;})]));")
+        done = subprocess.run(["node", "-e", script], capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout), [[False, True, 2], True, True, 3,
+                                                   [1, 2, 3]])
+
+
 class BambuModelCodeMatchTest(unittest.TestCase):
     SERIAL = "01P00A000000001"
 
@@ -5556,10 +5874,13 @@ class BambuModelCodeMatchTest(unittest.TestCase):
     def card(self, serial=None, code="N7", name="Card", kind="bambu", bound_serial=True, **extra):
         serial = self.SERIAL if serial is None else serial
         card = {"id": 1, "name": name, "url": "http://192.0.2.10", "type": kind,
-                "serial": serial}
+                "serial": serial, "binding_revision": 1}
         if code:
             card["model_code"] = code
             card["model_code_serial"] = serial if bound_serial else "OTHER"
+            card["model_code_source"] = "mqtt"
+            card["model_code_endpoint"] = self.plugin._endpoint_key(card["url"])
+            card["model_code_binding_revision"] = 1
         card.update(extra)
         return card
 
@@ -5609,7 +5930,9 @@ class BambuModelCodeMatchTest(unittest.TestCase):
 
     def test_exact_name_and_endpoint_beat_model(self):
         by_model = self.card()
-        named = self.card(serial="S2", code="", name="Bambu Lab P2S")
+        named = self.card(serial="S2", code="", name="Bambu Lab P2S",
+                          name_provenance="user", name_match_value="Bambu Lab P2S",
+                          name_match_binding_revision=1)
         self.assertIs(self.match({"printer_model": "Bambu Lab P2S"}, [by_model, named]), named)
         other = dict(by_model, serial="S3", model_code_serial="S3", url="http://192.0.2.77")
         record = {"printer_model": "Bambu Lab P2S",
@@ -5639,6 +5962,20 @@ class BambuModelCodeMatchTest(unittest.TestCase):
                 "printer_settings_id": "Bambu Lab P2S 0.6 nozzle"})
         self.assertEqual(record["target_uuid"], card["target_uuid"])
 
+    def test_outbox_copy_preserves_source_gcode_bytes(self):
+        card = self.plugin._ensure_printer_identity(self.card())
+        root = pathlib.Path(self.temp.name)
+        self.plugin.OUTBOX_DIR = str(root / "outbox")
+        self.plugin.OUTBOX_INDEX = str(root / "outbox_index.json")
+        gcode = root / "binary.gcode"
+        payload = b"; printer_model = Bambu Lab P2S\r\nG28\n\xff\x00\r\n"
+        gcode.write_bytes(payload)
+        with mock.patch.object(self.plugin, "dashboard_printers", return_value=[card]):
+            record = self.plugin.outbox_add(str(gcode), identity={
+                "printer_model": "Bambu Lab P2S"})
+        self.assertEqual(gcode.read_bytes(), payload)
+        self.assertEqual((root / "outbox" / record["file"]).read_bytes(), payload)
+
     # -- normalization ----------------------------------------------------
     def test_code_normalization(self):
         norm = self.plugin._normalize_model_code
@@ -5659,6 +5996,55 @@ class BambuModelCodeMatchTest(unittest.TestCase):
         self.assertEqual(names["192.0.2.10"], {"name": "Shop", "serial": self.SERIAL,
                                                "model_code": "BL-P001"})
 
+    def test_ssdp_rejects_location_redirect_and_oversized_payload(self):
+        forged = (b"DevName.bambu.com: Forged\r\nUSN: SERIAL\r\n"
+                  b"Location: http://192.0.2.99/device.xml\r\n")
+        valid = b"DevName.bambu.com: Hint\r\nUSN: SERIAL\r\n"
+        sock = mock.MagicMock()
+        sock.recvfrom.side_effect = [
+            (forged, ("192.0.2.10", 2021)),
+            (b"X" * 2049, ("192.0.2.10", 2021)),
+            (valid, ("192.0.2.10", 2021)), OSError(),
+        ]
+        with mock.patch.object(self.plugin.socket, "socket", return_value=sock):
+            found = self.plugin.ssdp_bambu_names(1.0)
+        self.assertEqual(list(found), ["192.0.2.10"])
+        self.assertEqual(found["192.0.2.10"]["name"], "Hint")
+
+    def test_ssdp_malformed_location_skips_only_that_packet(self):
+        broken = b"DevName.bambu.com: Bad\r\nLocation: http://[broken\r\n"
+        valid = b"DevName.bambu.com: Good\r\nUSN: SERIAL\r\n"
+        sock = mock.MagicMock()
+        sock.recvfrom.side_effect = [
+            (broken, ("192.0.2.10", 2021)),
+            (valid, ("192.0.2.11", 2021)), OSError(),
+        ]
+        with mock.patch.object(self.plugin.socket, "socket", return_value=sock):
+            found = self.plugin.ssdp_bambu_names(1.0)
+        self.assertEqual(list(found), ["192.0.2.11"])
+
+    def test_legacy_serial_needs_exact_provenance_before_matching(self):
+        card = self.card(code="")
+        record = {"match_serial": self.SERIAL}
+        self.assertIsNone(self.match(record, [card]))
+        card.update(serial_source="mqtt", serial_value=self.SERIAL,
+                    serial_endpoint=self.plugin._endpoint_key(card["url"]),
+                    serial_binding_revision=1)
+        self.assertIs(self.match(record, [card]), card)
+        self.assertIsNone(self.match(record, [dict(card, serial_value="OTHER")]))
+        self.assertIsNone(self.match(record, [dict(card, serial_binding_revision=2)]))
+        self.assertIsNone(self.match(record, [dict(card, url="http://192.0.2.99")]))
+        user_card = dict(card, serial_source="user")
+        self.assertIs(self.match(record, [user_card]), user_card)
+
+    def test_legacy_model_and_name_are_not_matchable(self):
+        card = self.card(name="Bambu Lab P2S")
+        self.assertIsNone(self.match({"printer_model": "Bambu Lab P2S"}, [
+            {key: value for key, value in card.items()
+             if not key.startswith("model_code_") and key != "model_code"}]))
+        self.assertIsNone(self.match({"printer_model": "Bambu Lab P2S"}, [
+            dict(card, model_code_source=None)]))
+
     def test_poll_bambu_remembers_printer_type_from_any_message(self):
         topic = b"device/%s/report" % self.SERIAL.encode()
 
@@ -5671,15 +6057,64 @@ class BambuModelCodeMatchTest(unittest.TestCase):
                         frame({"info": {"x": 1}}),
                         frame({"print": {"gcode_state": "IDLE", "nozzle_temper": 20}})])
         fake = mock.MagicMock()
+        fake.getpeercert.return_value = b"synthetic Bambu TLS certificate"
         context = mock.MagicMock()
         context.wrap_socket.return_value = fake
-        printer = {"url": "http://192.0.2.10", "access_code": "x", "serial": self.SERIAL}
+        printer = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.0.2.10", "access_code": "x", "serial": self.SERIAL})
         with mock.patch.object(self.plugin.socket, "create_connection", return_value=fake), \
              mock.patch.object(self.plugin, "ssl_ctx_for", return_value=context), \
              mock.patch.object(self.plugin, "_mqtt_read_packet",
                                side_effect=lambda *a: next(packets)):
             status = self.plugin.poll_bambu(printer)
         self.assertIs(status["online"], True)
+        self.assertEqual(printer["_seen_model_code"], "N7")
+
+    def test_wildcard_mqtt_ignores_other_serial_after_first_report(self):
+        def frame(serial, body):
+            topic = ("device/%s/report" % serial).encode()
+            return (0x30, struct.pack("!H", len(topic)) + topic + json.dumps(body).encode())
+
+        packets = iter([(0x20, b"\x00\x00"), (0x90, b"\x00\x01\x00"),
+                        frame(self.SERIAL, {"print": {"printer_type": "N7"}}),
+                        frame("OTHER", {"print": {"printer_type": "N2S"}}),
+                        frame(self.SERIAL, {"print": {
+                            "gcode_state": "IDLE", "nozzle_temper": 20}})])
+        fake, context = mock.MagicMock(), mock.MagicMock()
+        fake.getpeercert.return_value = b"synthetic Bambu TLS certificate"
+        context.wrap_socket.return_value = fake
+        printer = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.0.2.10", "access_code": "x", "serial": ""})
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=fake), \
+             mock.patch.object(self.plugin, "ssl_ctx_for", return_value=context), \
+             mock.patch.object(self.plugin, "_mqtt_read_packet",
+                               side_effect=lambda *a: next(packets)):
+            status = self.plugin.poll_bambu(printer)
+        self.assertTrue(status["online"])
+        self.assertEqual(printer["serial"], self.SERIAL)
+        self.assertEqual(printer["_seen_model_code"], "N7")
+
+    def test_fixed_serial_mqtt_ignores_wrong_topic(self):
+        def frame(serial, body):
+            topic = ("device/%s/report" % serial).encode()
+            return (0x30, struct.pack("!H", len(topic)) + topic + json.dumps(body).encode())
+
+        packets = iter([(0x20, b"\x00\x00"), (0x90, b"\x00\x01\x00"),
+                        frame("OTHER", {"print": {"printer_type": "N2S"}}),
+                        frame(self.SERIAL, {"print": {"printer_type": "N7"}}),
+                        frame(self.SERIAL, {"print": {
+                            "gcode_state": "IDLE", "nozzle_temper": 20}})])
+        fake, context = mock.MagicMock(), mock.MagicMock()
+        fake.getpeercert.return_value = b"synthetic Bambu TLS certificate"
+        context.wrap_socket.return_value = fake
+        printer = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.0.2.10", "access_code": "x", "serial": self.SERIAL})
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=fake), \
+             mock.patch.object(self.plugin, "ssl_ctx_for", return_value=context), \
+             mock.patch.object(self.plugin, "_mqtt_read_packet",
+                               side_effect=lambda *a: next(packets)):
+            status = self.plugin.poll_bambu(printer)
+        self.assertTrue(status["online"])
         self.assertEqual(printer["_seen_model_code"], "N7")
 
     def test_poll_status_does_not_depend_on_printer_type(self):
@@ -5694,37 +6129,40 @@ class BambuModelCodeMatchTest(unittest.TestCase):
                                return_value={"online": True, "state": "idle"}), \
              mock.patch.object(self.plugin, "persist_model_code") as persist:
             self.plugin.poll_printer(printer)
-        persist.assert_called_once_with(self.SERIAL, "N7")
+        persist.assert_called_once_with(printer, "N7")
         self.assertNotIn("_seen_model_code", printer)
 
     # -- persistence ------------------------------------------------------
-    def test_persist_sets_code_for_matching_serial_only(self):
+    def test_persist_sets_code_for_exact_card_only(self):
         self.save(self.card(code=""), self.card(serial="OTHER", code="", name="B"),
                   self.card(serial=self.SERIAL.lower(), code="", name="M", kind="moonraker"))
-        self.assertTrue(self.plugin.persist_model_code(self.SERIAL, "n7"))
+        first = self.stored()[0]
+        self.assertTrue(self.plugin.persist_model_code(first, "n7"))
         first, second, third = self.stored()
         self.assertEqual((first["model_code"], first["model_code_serial"]), ("N7", self.SERIAL))
         self.assertNotIn("model_code", second)
         self.assertNotIn("model_code", third)
-        self.assertFalse(self.plugin.persist_model_code(self.SERIAL, "N7"))
-        self.assertFalse(self.plugin.persist_model_code(self.SERIAL, "bad code"))
+        self.assertEqual(first["model_code_source"], "mqtt")
+        self.assertFalse(self.plugin.persist_model_code(first, "N7"))
+        self.assertFalse(self.plugin.persist_model_code(first, "bad code"))
 
     def test_disagreeing_code_clears_instead_of_overwriting(self):
         self.save(self.card(code=""))
-        self.plugin.persist_model_code(self.SERIAL, "N7")            # MQTT
-        self.plugin.persist_ssdp_model_codes({"1.1.1.1": {"serial": self.SERIAL.lower(),
-                                                          "model_code": "N2S"}})  # SSDP differs
+        self.plugin.persist_model_code(self.stored()[0], "N7")
+        self.plugin.persist_model_code(self.stored()[0], "N2S")
         card = self.stored()[0]
         self.assertNotIn("model_code", card)
         self.assertNotIn("model_code_serial", card)
         self.assertIsNone(self.match({"printer_model": "Bambu Lab P2S"}, [card]))
 
-    def test_ssdp_code_is_saved_by_usn_serial_not_by_ip(self):
+    def test_ssdp_code_never_enters_stored_matching_identity(self):
         self.save(self.card(code=""))
-        self.plugin.persist_ssdp_model_codes({"192.0.2.10": {"serial": "WRONG", "model_code": "N7"}})
+        with mock.patch.object(self.plugin, "ssdp_bambu_names", return_value={
+                "192.0.2.10": {"name": "Forged", "serial": self.SERIAL,
+                                 "model_code": "N7"}}):
+            self.plugin.autoname_printers(self.stored())
         self.assertNotIn("model_code", self.stored()[0])
-        self.plugin.persist_ssdp_model_codes({"198.51.100.1": {"serial": self.SERIAL, "model_code": "N7"}})
-        self.assertEqual(self.stored()[0]["model_code"], "N7")
+        self.assertNotEqual(self.stored()[0]["name"], "Forged")
 
     def test_changed_serial_invalidates_stored_code_and_new_code_replaces_it(self):
         self.save(self.card(code="N7"))
@@ -5732,7 +6170,7 @@ class BambuModelCodeMatchTest(unittest.TestCase):
         card["serial"] = "NEWSERIAL"
         self.assertIsNone(self.match({"printer_model": "Bambu Lab P2S"}, [card]))
         self.plugin.save_manual_printers([card])
-        self.plugin.persist_model_code("NEWSERIAL", "N2S")
+        self.plugin.persist_model_code(card, "N2S")
         self.assertEqual(self.stored()[0]["model_code_serial"], "NEWSERIAL")
 
     # -- dictionary -------------------------------------------------------
@@ -5751,6 +6189,390 @@ class BambuModelCodeMatchTest(unittest.TestCase):
         for name, code in self.plugin._BAMBU_MODEL_IDS.items():
             self.assertEqual(profiles.get(name), code, name)
         self.assertEqual(len(self.plugin._BAMBU_MODEL_IDS), 14)
+
+
+class BambuTlsTrustTest(unittest.TestCase):
+    def setUp(self):
+        self.plugin = _load_plugin()
+        self.card = _trusted_bambu_card(self, self.plugin, {
+            "url": "http://192.0.2.77", "serial": "SERIAL", "access_code": "secret"})
+
+    def identity(self):
+        card = self.card
+        return {"targetUuid": card["target_uuid"],
+                "ownerScope": card["owner_scope_uuid"],
+                "targetSelector": card["target_selector"],
+                "bindingRevision": card["binding_revision"],
+                "url": card["url"], "connectionType": "bambu"}
+
+    def probe(self, dashboard, posted, protocol="mqtt"):
+        dashboard._post = posted.append
+        dashboard._probe_tls_trust(dict(self.identity(), protocol=protocol))
+        return posted[-1]["tlsTrustResult"]["token"]
+
+    def test_dashboard_denies_embedded_frames_objects_and_base_replacement(self):
+        page = self.plugin.render_page()
+        self.assertIn("frame-src 'none'; object-src 'none'; base-uri 'none'", page)
+        self.assertNotIn("<iframe", page.casefold())
+        self.assertIn("<script>", page)  # existing inline dashboard remains allowed
+
+    def test_work_started_with_previous_page_epoch_is_silent(self):
+        dashboard, posted = self.plugin.PrintersDashboard(), []
+        dashboard._post = posted.append
+        epoch = dashboard._tls_epoch
+        dashboard._invalidate_tls_challenges()
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate") as probe:
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt"), page_epoch=epoch)
+            dashboard._confirm_tls_trust({"token": "old", "consent": True}, page_epoch=epoch)
+        self.assertEqual(posted, [])
+        probe.assert_not_called()
+
+    def test_tls_confirmation_preserves_only_valid_name_provenance(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                self.card.update(name="Printer", name_provenance="user",
+                                 name_match_value="Printer",
+                                 name_match_binding_revision=(
+                                     self.card["binding_revision"] if valid else 0))
+                self.plugin.save_manual_printers([self.card])
+                dashboard, posted = self.plugin.PrintersDashboard(), []
+                with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value="a" * 64), \
+                     mock.patch.object(dashboard, "_refresh_worker"):
+                    token = self.probe(dashboard, posted)
+                    dashboard._confirm_tls_trust({"token": token, "consent": True})
+                saved = self.plugin.load_manual_printers()[0]
+                self.assertEqual(self.plugin._name_is_matchable(saved), valid)
+                self.assertIsNone(self.plugin.resolve_printer_target([saved], self.identity()))
+
+    def test_connected_without_report_never_promotes_configured_serial(self):
+        for status in ({"online": True, "state": "connected"},
+                       {"online": True, "state": "idle"},
+                       {"online": False, "state": "offline"}):
+            with self.subTest(status=status):
+                self.card["_seen_verified_serial"] = "SERIAL"  # stale previous poll
+                with mock.patch.object(self.plugin, "poll_bambu", return_value=status), \
+                     mock.patch.object(self.plugin, "persist_verified_bambu_serial") as persist:
+                    self.plugin.poll_printer(self.card)
+                persist.assert_not_called()
+
+    def test_exact_report_evidence_promotes_serial_even_without_full_status(self):
+        def reported(printer):
+            printer["_seen_verified_serial"] = "SERIAL"
+            return {"online": True, "state": "connected"}
+        with mock.patch.object(self.plugin, "poll_bambu", side_effect=reported), \
+             mock.patch.object(self.plugin, "persist_verified_bambu_serial") as persist:
+            self.plugin.poll_printer(self.card)
+        persist.assert_called_once_with(self.card)
+        self.assertNotIn("_seen_verified_serial", self.card)
+
+    def test_mqtt_wrong_topic_or_invalid_report_cannot_verify_configured_serial(self):
+        for topic, message in (("device/OTHER/report", {"print": {"gcode_state": "IDLE"}}),
+                               ("device/SERIAL/report", {"info": {"value": 1}}),
+                               ("device/SERIAL/report", ["invalid", "report"])):
+            with self.subTest(topic=topic, message=message):
+                encoded = topic.encode()
+                packets = iter([(0x20, b"\x00\x00"), (0x90, b"\x00\x01\x00"),
+                                (0x30, struct.pack("!H", len(encoded)) + encoded +
+                                 json.dumps(message).encode())])
+                socket, context = mock.Mock(), mock.Mock()
+                socket.getpeercert.return_value = b"synthetic Bambu TLS certificate"
+                context.wrap_socket.return_value = socket
+                with mock.patch.object(self.plugin.socket, "create_connection", return_value=socket), \
+                     mock.patch.object(self.plugin, "ssl_ctx_for", return_value=context), \
+                     mock.patch.object(self.plugin.time, "monotonic", side_effect=[0, 1, 9]), \
+                     mock.patch.object(self.plugin, "_mqtt_read_packet", side_effect=lambda *args: next(packets)), \
+                     mock.patch.object(self.plugin, "persist_verified_bambu_serial") as persist:
+                    status = self.plugin.poll_printer(self.card)
+                self.assertEqual(status["state"], "connected")
+                persist.assert_not_called()
+
+    def test_changed_certificate_or_deleted_target_rejects_confirmation(self):
+        for changed in ("certificate", "deleted", "edited"):
+            with self.subTest(changed=changed):
+                self.plugin.save_manual_printers([self.card])
+                dashboard, posted = self.plugin.PrintersDashboard(), []
+                with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value="a" * 64):
+                    token = self.probe(dashboard, posted)
+                if changed == "deleted":
+                    self.plugin.save_manual_printers([])
+                elif changed == "edited":
+                    edited = dict(self.card, binding_revision=self.card["binding_revision"] + 1)
+                    self.plugin.save_manual_printers([edited])
+                with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value="b" * 64):
+                    dashboard._confirm_tls_trust({"token": token, "consent": True})
+                self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustStale")
+                for saved in self.plugin.load_manual_printers():
+                    self.assertEqual(saved["tls_pins"], self.card["tls_pins"])
+
+    def test_storage_switch_before_or_during_confirm_cannot_save_trust(self):
+        other = pathlib.Path(self.plugin.PLUGIN_STORAGE_DIR) / "other"
+        for during in (False, True):
+            with self.subTest(during=during):
+                dashboard, posted = self.plugin.PrintersDashboard(), []
+                with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value="a" * 64):
+                    token = self.probe(dashboard, posted)
+                original = self.plugin.PLUGIN_STORAGE_DIR
+                def observe(*args):
+                    self.plugin.PLUGIN_STORAGE_DIR = str(other)
+                    return "a" * 64
+                try:
+                    if not during:
+                        self.plugin.PLUGIN_STORAGE_DIR = str(other)
+                    with mock.patch.object(self.plugin, "_probe_bambu_certificate", side_effect=observe):
+                        dashboard._confirm_tls_trust({"token": token, "consent": True})
+                finally:
+                    self.plugin.PLUGIN_STORAGE_DIR = original
+                self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustStale")
+                self.assertEqual(self.plugin.load_manual_printers()[0]["tls_pins"], self.card["tls_pins"])
+
+    def test_inflight_probe_after_lifecycle_change_posts_no_challenge_or_error(self):
+        for boundary in ("close", "ready", "unload"):
+            with self.subTest(boundary=boundary):
+                dashboard, posted = self.plugin.PrintersDashboard(), []
+                dashboard._post = posted.append
+                def observe(*args):
+                    if boundary == "close":
+                        dashboard.on_close()
+                    elif boundary == "unload":
+                        dashboard.on_unload()
+                    else:
+                        with mock.patch.object(dashboard, "_refresh_async"):
+                            dashboard.on_message({"type": "ready"})
+                    return "a" * 64
+                with mock.patch.object(self.plugin, "_probe_bambu_certificate", side_effect=observe):
+                    dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt"))
+                self.assertEqual(posted, [])
+                self.assertEqual(dashboard._tls_challenges, {})
+
+    def test_inflight_confirmation_after_close_cannot_save_or_post(self):
+        dashboard, posted = self.plugin.PrintersDashboard(), []
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value="a" * 64):
+            token = self.probe(dashboard, posted)
+        posted.clear()
+        def observe(*args):
+            dashboard.on_close()
+            return "a" * 64
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", side_effect=observe):
+            dashboard._confirm_tls_trust({"token": token, "consent": True})
+        self.assertEqual(posted, [])
+        self.assertEqual(self.plugin.load_manual_printers()[0]["tls_pins"], self.card["tls_pins"])
+
+    def test_mqtt_and_ftps_certificates_are_independent(self):
+        self.card["tls_pins"]["ftps"] = hashlib.sha256(b"FTPS certificate").hexdigest()
+        self.plugin.save_manual_printers([self.card])
+        socket = mock.Mock()
+        socket.getpeercert.return_value = b"FTPS certificate"
+        self.plugin._verify_bambu_socket(self.card, "ftps", socket)
+        with self.assertRaises(self.plugin.BambuTlsError):
+            self.plugin._verify_bambu_socket(self.card, "mqtt", socket)
+
+    def test_missing_mqtt_pin_blocks_all_application_bytes_even_with_insecure_flag(self):
+        self.card["insecure"] = True
+        self.card["tls_pins"].pop("mqtt")
+        self.assertTrue(self.plugin.save_manual_printers([self.card]))
+        with mock.patch.object(self.plugin.socket, "create_connection") as connect:
+            status = self.plugin.poll_bambu(self.card)
+            publish = self.plugin._bambu_publish(
+                "192.0.2.77", "secret", "device/SERIAL/request", {}, printer=self.card)
+        self.assertEqual(status["error_code"], "tls_trust_required")
+        self.assertEqual(publish, "tls_trust_required")
+        connect.assert_not_called()
+
+    def test_certificate_probe_sends_no_mqtt_or_ftp_application_bytes(self):
+        raw, wrapped, context = mock.Mock(), mock.Mock(), mock.Mock()
+        wrapped.getpeercert.return_value = b"observed certificate"
+        context.wrap_socket.return_value = wrapped
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw) as connect, \
+             mock.patch.object(self.plugin, "_SSL_INSECURE", context):
+            mqtt = self.plugin._probe_bambu_certificate(self.card, "mqtt")
+            ftps = self.plugin._probe_bambu_certificate(self.card, "ftps")
+        self.assertEqual(mqtt, hashlib.sha256(b"observed certificate").hexdigest())
+        self.assertEqual(ftps, mqtt)
+        self.assertEqual([call.args[0][1] for call in connect.call_args_list], [8883, 990])
+        wrapped.sendall.assert_not_called()
+        raw.sendall.assert_not_called()
+        wrapped.close.assert_called()
+
+    def test_changed_mqtt_certificate_blocks_connect_and_command_bytes(self):
+        raw, wrapped, context = mock.Mock(), mock.Mock(), mock.Mock()
+        wrapped.getpeercert.return_value = b"another certificate"
+        context.wrap_socket.return_value = wrapped
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw), \
+             mock.patch.object(self.plugin, "_SSL_INSECURE", context):
+            status = self.plugin.poll_bambu(self.card)
+            result = self.plugin._bambu_publish(
+                "192.0.2.77", "secret", "device/SERIAL/request", {}, printer=self.card)
+        self.assertEqual(status["error_code"], "tls_certificate_changed")
+        self.assertEqual(result, "tls_certificate_changed")
+        wrapped.sendall.assert_not_called()
+        raw.sendall.assert_not_called()
+
+    def test_changed_ftps_control_certificate_blocks_credentials_and_stor(self):
+        temporary = tempfile.TemporaryDirectory(dir=self.plugin.PLUGIN_STORAGE_DIR)
+        self.addCleanup(temporary.cleanup)
+        source = pathlib.Path(temporary.name) / "job.gcode"
+        source.write_bytes(b"G28\r\n")
+        raw, wrapped, context = mock.Mock(), mock.Mock(), mock.Mock()
+        wrapped.getpeercert.return_value = b"another certificate"
+        context.wrap_socket.return_value = wrapped
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw), \
+             mock.patch.object(self.plugin, "_SSL_INSECURE", context):
+            result = self.plugin._bambu_send_file(
+                self.card, "job.gcode", str(source), True, False, None)
+        self.assertEqual(result["error_code"], "tls_certificate_changed")
+        self.assertEqual(result["journal_state"], "rejected")
+        wrapped.sendall.assert_not_called()
+        raw.sendall.assert_not_called()
+
+    def test_data_pin_mismatch_closes_channel_before_file_bytes(self):
+        import ftplib
+        ftp = object.__new__(self.plugin._implicit_ftps_class())
+        ftp._bambu_printer = self.card
+        ftp._prot_p = True
+        ftp.host = "192.0.2.77"
+        ftp.sock = types.SimpleNamespace(session="session")
+        data, wrapped = mock.Mock(), mock.Mock()
+        wrapped.getpeercert.return_value = b"another certificate"
+        ftp.context = mock.Mock()
+        ftp.context.wrap_socket.return_value = wrapped
+        with mock.patch.object(ftplib.FTP, "ntransfercmd", return_value=(data, None)):
+            with self.assertRaises(self.plugin.BambuTlsError):
+                ftp.ntransfercmd("STOR file.gcode")
+        wrapped.sendall.assert_not_called()
+        wrapped.close.assert_called_once()
+
+    def test_upload_path_rejects_data_certificate_before_streaming_file(self):
+        import ftplib
+        source = pathlib.Path(self.plugin.PLUGIN_STORAGE_DIR) / "data-pin-test.gcode"
+        source.write_bytes(b"G28\n")
+        ftp_class = self.plugin._implicit_ftps_class()
+        data, wrapped, context = mock.Mock(), mock.Mock(), mock.Mock()
+        wrapped.getpeercert.return_value = b"different data certificate"
+        context.wrap_socket.return_value = wrapped
+        def connect(ftp, host, port, timeout):
+            ftp.host = host
+            ftp.sock = mock.Mock(session="control-session")
+        def protect(ftp):
+            ftp._prot_p = True
+        with mock.patch.object(self.plugin, "ssl_ctx_for", return_value=context), \
+             mock.patch.object(ftp_class, "connect", connect), \
+             mock.patch.object(ftp_class, "login"), \
+             mock.patch.object(ftp_class, "prot_p", protect), \
+             mock.patch.object(ftp_class, "voidcmd", return_value="200 OK"), \
+             mock.patch.object(ftp_class, "quit"), \
+             mock.patch.object(ftplib.FTP, "ntransfercmd", return_value=(data, None)), \
+             mock.patch.object(self.plugin, "bambu_start_print") as start:
+            result = self.plugin._bambu_send_file(
+                self.card, source.name, str(source), True, False, None)
+        # STOR may already have created an empty remote file; keep its outcome
+        # uncertain even though the untrusted data channel receives no bytes.
+        self.assertEqual(result["error_code"], "unknown_outcome")
+        self.assertEqual(result["error_key"], "tlsCertificateChanged")
+        wrapped.sendall.assert_not_called()
+        data.sendall.assert_not_called()
+        wrapped.close.assert_called_once()
+        start.assert_not_called()
+
+    def test_probe_confirm_ignores_browser_pin_and_consumes_challenge(self):
+        dashboard = self.plugin.PrintersDashboard()
+        posted = []
+        dashboard._post = posted.append
+        observed = hashlib.sha256(b"new certificate").hexdigest()
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value=observed), \
+             mock.patch.object(dashboard, "_refresh_worker"):
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt", requestId=4))
+            challenge = posted[-1]["tlsTrustResult"]
+            self.assertEqual(challenge["old"], self.card["tls_pins"]["mqtt"])
+            self.assertEqual(challenge["observed"], observed)
+            dashboard._confirm_tls_trust({"token": challenge["token"], "consent": True,
+                                           "pin": "0" * 64, "requestId": 4})
+            self.assertTrue(posted[-1]["tlsTrustResult"]["saved"])
+            dashboard._confirm_tls_trust({"token": challenge["token"], "consent": True,
+                                           "requestId": 4})
+        self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustStale")
+        saved = self.plugin.load_manual_printers()[0]
+        self.assertEqual(saved["tls_pins"]["mqtt"], observed)
+        self.assertEqual(saved["tls_pins"]["ftps"], self.card["tls_pins"]["ftps"])
+        self.assertEqual(saved["binding_revision"], self.card["binding_revision"] + 1)
+        self.assertIsNone(self.plugin.resolve_printer_target([saved], self.identity()))
+
+    def test_pre_dispatch_pin_refusal_is_journal_rejected_not_unknown(self):
+        self.card["tls_pins"].pop("ftps")
+        self.assertTrue(self.plugin.save_manual_printers([self.card]))
+        temporary = tempfile.TemporaryDirectory(dir=self.plugin.PLUGIN_STORAGE_DIR)
+        self.addCleanup(temporary.cleanup)
+        source = pathlib.Path(temporary.name) / "job.gcode"
+        source.write_bytes(b"G28\n")
+        with mock.patch.object(self.plugin.socket, "create_connection") as connect:
+            result = self.plugin._bambu_send_file(
+                self.card, "job.gcode", str(source), True, False, None)
+        self.assertEqual(result["journal_state"], "rejected")
+        self.assertEqual(result["evidence_ref"], "tls:pre_dispatch")
+        connect.assert_not_called()
+        journal = mock.Mock()
+        dashboard = self.plugin.PrintersDashboard()
+        dashboard._journal_finish((journal, "operation"), result)
+        journal.report.assert_called_once_with(
+            "operation", "rejected", evidence_ref="tls:pre_dispatch")
+
+    def test_repeated_probe_messages_are_admitted_only_once_until_completion(self):
+        dashboard = self.plugin.PrintersDashboard()
+        posted = []
+        submitted = []
+        dashboard._post = posted.append
+        dashboard._submit_ui_work = lambda work, **kwargs: submitted.append(work)
+        message = dict(self.identity(), type="tls-probe", protocol="mqtt", requestId=1)
+        for _ in range(30):
+            dashboard.on_message(message)
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len([item for item in posted
+                              if item.get("tlsTrustResult", {}).get("error") == "tlsTrustBusy"]), 29)
+        dashboard.on_message({"type": "tls-close"})
+        dashboard.on_message(message)
+        self.assertEqual(len(submitted), 1)
+
+    def test_save_failure_preserves_old_pins_and_reports_error(self):
+        dashboard = self.plugin.PrintersDashboard()
+        posted = []
+        dashboard._post = posted.append
+        new = hashlib.sha256(b"new certificate").hexdigest()
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value=new):
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt"))
+            token = posted[-1]["tlsTrustResult"]["token"]
+            with mock.patch.object(self.plugin, "save_manual_printers", return_value=False):
+                dashboard._confirm_tls_trust({"token": token, "consent": True})
+        self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustSaveFailed")
+        self.assertEqual(self.plugin.load_manual_printers()[0]["tls_pins"], self.card["tls_pins"])
+
+    def test_edit_or_expiry_invalidates_challenge_without_changing_pins(self):
+        dashboard = self.plugin.PrintersDashboard()
+        posted = []
+        dashboard._post = posted.append
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate",
+                               return_value=hashlib.sha256(b"new").hexdigest()):
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt"))
+            token = posted[-1]["tlsTrustResult"]["token"]
+            dashboard._tls_challenges[token]["expires"] = time.monotonic() - 1
+            dashboard._confirm_tls_trust({"token": token, "consent": True})
+            self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustStale")
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt"))
+            token = posted[-1]["tlsTrustResult"]["token"]
+            dashboard._invalidate_tls_challenges()
+            dashboard._confirm_tls_trust({"token": token, "consent": True})
+        self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustStale")
+        self.assertEqual(self.plugin.load_manual_printers()[0]["tls_pins"], self.card["tls_pins"])
+
+    def test_wildcard_serial_learning_keeps_pins_but_stale_poll_cannot_retarget(self):
+        self.card["serial"] = ""
+        self.assertTrue(self.plugin.save_manual_printers([self.card]))
+        old = dict(self.card)
+        learned = dict(old, serial="LEARNED")
+        self.plugin.persist_discovered_serial(learned)
+        saved = self.plugin.load_manual_printers()[0]
+        self.assertEqual(saved["tls_pins"], old["tls_pins"])
+        self.assertEqual(self.plugin._bambu_pin(saved, "mqtt"), old["tls_pins"]["mqtt"])
+        self.plugin.persist_discovered_serial(dict(old, serial="WRONG"))
+        self.assertEqual(self.plugin.load_manual_printers()[0]["serial"], "LEARNED")
 
 
 if __name__ == "__main__":

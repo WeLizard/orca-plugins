@@ -89,6 +89,19 @@ class _WsHandler(socketserver.BaseRequestHandler):
         cfg["received"].append({"opcode": b0 & 0x0F, "masked": bool(b1 & 0x80), "payload": body})
         for out in cfg["reply"](body):
             self.request.sendall(out)
+        if cfg.get("expect_pong"):
+            # A real WebSocket peer consumes the Pong. Closing TCP with it
+            # unread can send RST and discard our just-written fragments.
+            first, second = self._recv_exact(2)
+            size = second & 0x7f
+            if size > 125 or not second & 0x80:
+                raise ConnectionError("invalid control reply")
+            mask = self._recv_exact(4)
+            payload = self._recv_exact(size)
+            cfg["pong"] = {"opcode": first & 0x0f,
+                           "payload": bytes(c ^ mask[i % 4] for i, c in enumerate(payload))}
+            if cfg.get("pong_received"):
+                cfg["pong_received"].set()
         if cfg.get("hold"):
             threading.Event().wait(cfg["hold"])
 
@@ -246,10 +259,14 @@ class CrealityAdapterTests(unittest.TestCase):
 
     def test_fragmented_message_and_ping_are_handled(self):
         body = json.dumps(fixture("printing")).encode()
+        self.cfg["expect_pong"] = True
+        self.cfg["pong_received"] = threading.Event()
         self.cfg["reply"] = lambda _b: [
             frame(0x9, b"hi"), frame(0x1, body[:10], fin=False), frame(0x0, body[10:])]
         result = self.poll()
-        self.assertEqual(result["state"], "printing")
+        self.assertEqual(result["state"], "printing", result)
+        self.assertTrue(self.cfg["pong_received"].wait(1))
+        self.assertEqual(self.cfg["pong"], {"opcode": 0xA, "payload": b"hi"})
 
     def test_fragment_total_over_limit_rejected(self):
         chunk = b"x" * (adapter.MAX_FRAME_BYTES - 1)

@@ -25,7 +25,11 @@ dashboard and printer data are unaffected.
 - Native `orca.pages.PagesPluginCapabilityBase` dashboard, with
   `create_window(...)` retained for hosts that do not expose Pages.
 - Polls each printer on a worker thread and pushes status to the page:
-  - **Moonraker** (Klipper): `/printer/objects/query` (temps, `print_stats`, progress).
+  - **Moonraker** (Klipper): discovers extruder objects and reads temperatures,
+    `print_stats` and progress. Multiple heads show their temperatures together;
+    the printer reports which head is active. Click a head to view its details
+    without changing the physical tool. Missing readings remain unknown.
+    Multihead display is tested with local fixtures, not hardware.
   - **OctoPrint**: `/api/printer` + `/api/job`.
   - **Bambu Lab LAN**: MQTT status/control plus FTPS upload.
   - **Duet / RepRapFirmware (standalone and DSF)**: status, T0/T1 tool
@@ -60,6 +64,14 @@ dashboard and printer data are unaffected.
     off until a model is confirmed on a real printer. The TCP fallback (port
     8899) is not used. Tested only against loopback emulators and synthetic
     fixtures; no real printer was contacted.
+- **Repetier-Server**: enter the server URL and API key, load its printers,
+  then select the exact name and slug before adding. Reads status and temperatures
+  for that printer. Classic server-managed jobs (0.90–1.4.x, with a reported
+  READY condition) support upload only, confirmed upload and start, pause, resume
+  and cancel. Newer or unknown connector modes remain read-only. A start request
+  may wait in the server queue; HTTP acceptance confirms neither physical printing
+  nor file verification. Resume may need another explicit action after reheating.
+  Verified with local emulators only; hardware acceptance remains pending.
 - Other OrcaSlicer host types remain visible as disabled planned integrations.
   They are not presented as working until status, control, and upload are
   implemented and can be tested.
@@ -67,10 +79,29 @@ dashboard and printer data are unaffected.
   `orca.host.plugin.storage()` when available and falls back to a stable
   directory outside the replaceable plugin package on older hosts.
 - Authenticated OctoPrint instances can be added with an API key. Credentials
-  remain in Python/private plugin storage; saved keys and Bambu access codes are
+  use the system credential store for new manual entries; saved keys and Bambu access codes are
   never sent back to the dashboard page.
-- **Open** → opens a sandboxed `<iframe>` restricted to that printer's exact
-  HTTP(S) origin (Mainsail/Fluidd/OctoPrint remain framable on the LAN).
+- For Bambu connections, open **Certificates…** on the card to read and confirm
+  the MQTT and FTPS certificates separately. This read sends no access code.
+  Subsequent connections require the saved certificate before credentials or
+  file contents are sent, including the FTPS data channel. A changed certificate
+  blocks that connection until you explicitly confirm the replacement; a failed
+  upload or print is never repeated by confirming it. First-time confirmation is
+  a trust decision on your network, not proof of the printer's identity.
+- **Connection** → optional Web UI address on the same printer host, with an
+  explicit port; the API endpoint stays unchanged. Relative camera URLs use
+  this Web UI address. **Open** keeps a sandboxed frame restricted to the
+  selected origin, plus a selectable address and browser instructions when
+  an embedded Web UI keeps loading. No external program is started.
+- **Stock Snapmaker U1 camera** is an explicit per-card camera mode. Only an
+  open overlay starts its authenticated websocket monitor and bounded JPEG
+  polling. Close, binding changes, runtime shutdown and an expired page lease
+  end the session. The display distinguishes capture time (when available)
+  from receipt time, and clears expired or failed frames. Verified on local
+  emulators only; hardware acceptance is pending.
+- **Feedback** shows the fixed site address `https://filamenthub.ru`, ready to
+  select and copy into a browser, with directions to its **Beta Feedback**
+  button. No printer data is sent and no browser process is launched.
 - Polls live status while the tab is open and exposes Pause / Resume / Stop when
   supported by the selected printer backend.
 - Keeps the latest 500 locally observed print records. The dashboard button
@@ -125,7 +156,7 @@ dashboard and printer data are unaffected.
 
 ## Files
 
-- `printers_plugin.py` — the dependency-free plugin runtime. The wheel embeds
+- `printers_plugin.py` — the single-file plugin runtime (keyring 25.7.0 is installed separately). The wheel embeds
   the focused helper modules and requires no additional user-installed Python
   packages.
 - `printers_locales/` — bundled interface translations for every current
@@ -135,3 +166,5 @@ dashboard and printer data are unaffected.
 - `description.md` — Orca Cloud listing text.
 - `CHANGELOG.md` — release notes owned by this plugin.
 - `build_package.py` / `PUBLISHING.md` — deterministic package and release workflow.
+
+Printer keys entered manually are saved in Windows Credential Manager, macOS Keychain or Linux Secret Service through keyring 25.7.0. OrcaSlicer needs dependency installation support and package access for the initial keyring installation; installation failure may prevent the plugin from loading. After loading, an unavailable system store blocks saving new keys and connections using stored keys while the dashboard remains available. Use **Retry access** after unlocking the system store. Existing plaintext keys remain until you confirm **Move keys**. Old backups are not removed and may still contain plaintext keys. Keys supplied by OrcaSlicer presets stay in memory. Stored keys are bound to their printer, endpoint and account storage; moving the JSON file alone does not move the keys.

@@ -185,7 +185,15 @@ class PrusaLinkAdapterTests(unittest.TestCase):
 
     def test_timeout_after_put_is_reported_as_unknown_and_not_retried(self):
         _Handler.delay_path = "/api/v1/files/local/part.gcode"
-        with mock.patch.object(adapter, "_TIMEOUT", 0.05):
+        original_request = adapter._request
+
+        def request(base, method, path, **kwargs):
+            if method == "PUT":
+                with mock.patch.object(adapter, "_TIMEOUT", 0.05):
+                    return original_request(base, method, path, **kwargs)
+            return original_request(base, method, path, **kwargs)
+
+        with mock.patch.object(adapter, "_request", side_effect=request):
             result = adapter.upload(
                 self.base, None, "secret-test-key", self.file_path, "part.gcode"
             )

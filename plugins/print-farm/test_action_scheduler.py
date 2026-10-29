@@ -1,10 +1,35 @@
 import threading
 import unittest
+from unittest import mock
 
 import action_scheduler
 
 
 class ActionSchedulerTests(unittest.TestCase):
+    def test_first_worker_permission_denial_leaves_no_scheduler(self):
+        with mock.patch.object(threading.Thread, "start", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                action_scheduler.ActionScheduler(max_workers=2)
+
+    def test_later_worker_denial_stops_started_workers(self):
+        original_start = threading.Thread.start
+        calls = 0
+        started = []
+
+        def start(worker):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise PermissionError("denied")
+            original_start(worker)
+            started.append(worker)
+
+        with mock.patch.object(threading.Thread, "start", start):
+            with self.assertRaises(PermissionError):
+                action_scheduler.ActionScheduler(max_workers=3)
+        self.assertEqual(len(started), 1)
+        self.assertFalse(started[0].is_alive())
+
     def setUp(self):
         self.schedulers = []
 

@@ -38,14 +38,18 @@ class ActionScheduler:
         self._stopping = False
         self._cancel_pending = False
         self._workers = []
-        for index in range(max_workers):
-            worker = threading.Thread(
-                target=self._run,
-                name="{}-{}".format(name, index + 1),
-                daemon=True,
-            )
-            self._workers.append(worker)
-            worker.start()
+        try:
+            for index in range(max_workers):
+                worker = threading.Thread(
+                    target=self._run,
+                    name="{}-{}".format(name, index + 1),
+                    daemon=True,
+                )
+                worker.start()
+                self._workers.append(worker)
+        except (PermissionError, RuntimeError):
+            self.shutdown(wait=True, cancel_pending=True)
+            raise
 
     def submit(self, target_id, action_id, callback, kind="upload"):
         """Queue one action and return a result with an explicit status.

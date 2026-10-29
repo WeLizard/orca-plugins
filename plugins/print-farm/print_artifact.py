@@ -132,7 +132,7 @@ def _parse_gcode_metadata(path: Path, size: int) -> dict[str, str]:
             continue
         key, value = raw_line[1:].decode("utf-8", "replace").split("=", 1)
         key = key.strip()
-        if key in {"printer_settings_id", "printer_model", "filament_type", "nozzle_diameter", "layer_height"}:
+        if key in {"printer_settings_id", "printer_model", "filament_type", "nozzle_diameter", "layer_height", "printhost_port", "host_type", "print_host"}:
             value = value.strip().strip('"')
             if value and len(value) <= 512:
                 metadata[key] = value
@@ -331,7 +331,7 @@ def _project_metadata(archive: zipfile.ZipFile, by_name: Mapping[str, zipfile.Zi
     if not isinstance(parsed, dict):
         return {}
     result: dict[str, str | list[str]] = {}
-    for key in ("printer_settings_id", "printer_model", "nozzle_diameter"):
+    for key in ("printer_settings_id", "printer_model", "nozzle_diameter", "printhost_port", "host_type", "print_host"):
         if key not in parsed:
             continue
         value = _sanitize_project_metadata(parsed[key], allow_list=(key == "nozzle_diameter"))

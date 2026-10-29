@@ -76,6 +76,19 @@ class ReleaseSourceGuardTest(unittest.TestCase):
     def test_shipped_plugin_has_no_forbidden_constructs(self):
         self.assertEqual(self.builder.release_source_violations(self.release), [])
 
+    def test_exact_dependency_matches_descriptor_project_and_wheel_metadata(self):
+        import tomllib
+        from email.parser import BytesParser
+        expected = ["keyring==25.7.0"]
+        source = self.builder.SOURCE.read_text(encoding="utf-8")
+        self.assertEqual(self.builder.extract_metadata(source)["dependencies"], expected)
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+        self.assertEqual(project["dependencies"], expected)
+        metadata = BytesParser().parsebytes(self.builder._canonical_core_metadata(self.builder.current_version()))
+        self.assertEqual(metadata.get_all("Requires-Dist"), expected)
+        self.assertIn("_pf_define_credentials", self.release)
+        self.assertNotIn("get_keyring(", self.release)
+
     def test_helpers_are_real_code_not_executed_strings(self):
         import ast
 
