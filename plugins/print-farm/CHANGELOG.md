@@ -2,7 +2,7 @@
 
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
-## 0.1.0
+## 0.1.1
 - Added per-printer Connection options: a separate Web UI address on the same host and an explicitly selected stock Snapmaker U1 camera mode. This camera runs only while its overlay is open, closes on cancellation or lease expiry, keeps keys out of the page and clears failed or expired frames. Tested on local emulators; hardware acceptance remains pending.
 - Embedded Web UI windows show a selectable address and browser instructions when the page cannot load. Feedback provides the fixed FilamentHub site address and directions to its existing Beta Feedback button; no printer data is sent.
 - Moonraker printers now show all discovered extruder temperatures and the active tool reported by the printer. Clicking a head shows its details without changing the physical tool. Missing head readings stay unknown. Tested with local fixtures; hardware acceptance remains pending.
