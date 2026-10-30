@@ -42,6 +42,17 @@ class _ExecutionResult:
         return ("failure", kind, message)
 
 
+class _MemoryCredentials:
+    def __init__(self):
+        self.values = {}
+
+    def set_password(self, service, user, value):
+        self.values[service, user] = value
+
+    def get_password(self, service, user):
+        return self.values.get((service, user))
+
+
 def _load_plugin(*, lifecycle=False, pages=False, registered=None,
                  initialize_test_storage=True):
     def capability_base(name, *, page=False):
@@ -88,6 +99,10 @@ def _load_plugin(*, lifecycle=False, pages=False, registered=None,
     # would block temp-directory cleanup. Tests that exercise recovery opt in.
     module._real_acquire_storage_owner = module._acquire_storage_owner
     module._acquire_storage_owner = lambda root: None
+    # Tests never reach the operating-system credential store: a developer
+    # machine would collect synthetic printer keys and CI runners have none.
+    credentials = _MemoryCredentials()
+    module._CREDENTIAL_VAULT = module._pf_credentials.Vault(lambda: credentials)
     if initialize_test_storage:
         test_storage = tempfile.TemporaryDirectory(prefix="print-farm-test-storage-")
         module._test_storage = test_storage
