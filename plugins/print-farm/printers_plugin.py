@@ -10275,16 +10275,69 @@ def host_capability_lifecycle_available():
     )
 
 
+_GRANTABLE_HOST = re.compile(r"[A-Za-z0-9.:-]+")
+MAX_LOAD_TIME_ORIGINS = 64
+
+
+def saved_printer_origins():
+    """Origins of saved printers, read without side effects for the load-time grant.
+
+    Orca reduces a network grant to scheme://host and applies it to the
+    printer's sockets too, so one dialog at start covers every saved printer.
+    """
+    try:
+        storage = getattr(getattr(getattr(orca, "host", None), "plugin", None), "storage", None)
+        root = storage() if callable(storage) else ""
+        if not isinstance(root, str) or not root:
+            return []
+        path = os.path.join(os.path.abspath(root), "printers.json")
+        with open(path, "r", encoding="utf-8") as fh:
+            cards = json.load(fh)
+    except Exception:
+        return []
+    origins = []
+    for card in cards if isinstance(cards, list) else []:
+        url = card.get("url") if isinstance(card, dict) else None
+        if not isinstance(url, str) or ("://" in url and not url.strip().lower().startswith(
+                ("http://", "https://"))):
+            continue
+        try:
+            parts = urllib.parse.urlsplit(normalize_url(url))
+            host = parts.hostname
+        except ValueError:
+            continue
+        if parts.scheme not in ("http", "https") or not host or not _GRANTABLE_HOST.fullmatch(host):
+            continue
+        origin = "%s://%s" % (parts.scheme, "[%s]" % host if ":" in host else host)
+        if origin not in origins:
+            origins.append(origin)
+    return origins[:MAX_LOAD_TIME_ORIGINS]
+
+
+def declare_host_permissions():
+    request = getattr(orca, "request_permissions", None)
+    if not callable(request):
+        return
+    origins = saved_printer_origins()
+    if origins:
+        try:
+            request(network=origins, threading=True)
+            return
+        except (TypeError, ValueError):
+            # An older host without network grants, or one rejecting an address:
+            # printers then ask on first use, as before.
+            pass
+    try:
+        request(threading=True)
+    except TypeError:
+        # Older hosts do not accept the threading permission argument.
+        pass
+
+
 @orca.plugin
 class PrintersPlugin(orca.base):
     def register_capabilities(self):
-        request = getattr(orca, "request_permissions", None)
-        if callable(request):
-            try:
-                request(threading=True)
-            except TypeError:
-                # Older hosts do not accept the threading permission argument.
-                pass
+        declare_host_permissions()
         if not host_capability_lifecycle_available():
             start_plugin_runtime()
         orca.register_capability(PrintersDashboard)
