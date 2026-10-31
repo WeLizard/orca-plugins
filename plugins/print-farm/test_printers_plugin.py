@@ -4893,7 +4893,7 @@ out.bambu = rowsOf(build(P('bambu', 'idle'), false));""")
         self.assertEqual(out["moon"]["rows"], [{"cls": "row", "items":
                          ["select-control", "history", "connection-options", "print", "cam", "open"]}])
         self.assertEqual(out["bambu"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "connection-options", "print", "tls-trust", "cam"]}])
+                         ["select-control", "history", "print", "tls-trust", "cam"]}])
         self.assertFalse(out["moon"]["empty"] or out["bambu"]["empty"])
 
     def test_feedback_page_offers_copy_with_confirmation_and_no_navigation(self):
@@ -4925,7 +4925,7 @@ out.nocamOpen = rowsOf(build(P('bambu', 'standby'), true));
 out.nocamIdleOnlyOpen = rowsOf(build(u, false));""")
         self.assertEqual(out["nocam"]["rows"][0]["items"], ["select-control", "history", "connection-options", "print", "open"])
         self.assertEqual(out["nocamOpen"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "connection-options", "print", "tls-trust"]}])
+                         ["select-control", "history", "print", "tls-trust"]}])
         self.assertEqual(out["nocamIdleOnlyOpen"]["rows"][0]["items"],
                          ["select-control", "history", "connection-options", "print", "open"])
 
@@ -4949,7 +4949,7 @@ out.bambu = rowsOf(build(P('bambu', 'printing'), true));""")
         self.assertEqual(out["paused"]["rows"][0]["items"], ["history", "connection-options", "ctl-slot", "ctl", "ctl"])
         # Nothing left for the second row: it is not drawn at all.
         self.assertEqual(out["bambu"]["rows"], [{"cls": "ctl-row",
-                                                  "items": ["history", "connection-options", "tls-trust", "ctl-slot", "ctl", "ctl"]}])
+                                                  "items": ["history", "tls-trust", "ctl-slot", "ctl", "ctl"]}])
         for key in ("moon", "paused", "bambu"):
             self.assertFalse(out[key]["empty"])
 

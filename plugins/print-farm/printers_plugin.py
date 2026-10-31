@@ -6432,8 +6432,10 @@ function render(printers){
       (selected[targetKey(p)] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> ' + esc(t('select')) + '</label>';
     var printHtml = hideSend ? '' :
       '<button class="print ghost"' + printAttrs + '>' + esc(t('print')) + '</button>';
+    // Bambu has neither a web page nor a selectable camera, so no connection options.
     var historyHtml = '<button class="history ghost">' + esc(t('history')) + '</button>' +
-      '<button class="connection-options ghost" type="button">' + esc(t('connectionOptions')) + '</button>';
+      (p.type === 'bambu' ? ''
+        : '<button class="connection-options ghost" type="button">' + esc(t('connectionOptions')) + '</button>');
     var tlsHtml = String(p.type || '').toLowerCase() === 'bambu'
       ? '<button class="tls-trust ' + (supported && tlsTrustNeeded(p, s) ? 'primary' : 'ghost') + '" type="button">' + esc(t('tlsTrustButton')) + '</button>' : '';
     tile.innerHTML += cardActionsHtml({select:selectHtml, history:historyHtml, print:printHtml,
@@ -6461,7 +6463,8 @@ function render(printers){
     var printBtn0 = tile.querySelector('.print');
     if (printBtn0) printBtn0.addEventListener('click', function(){ pickAndSend([targetKey(p)]); });
     tile.querySelector('.history').addEventListener('click', function(){ openPrintHistory(p); });
-    tile.querySelector('.connection-options').addEventListener('click', function(){ openConnectionOptions(p); });
+    var connectionButton = tile.querySelector('.connection-options');
+    if (connectionButton) connectionButton.addEventListener('click', function(){ openConnectionOptions(p); });
     var tlsBtn = tile.querySelector('.tls-trust');
     if (tlsBtn) tlsBtn.addEventListener('click', function(){ openTlsTrust(p); });
     // Outbox records may be local exports waiting for an action, or copies of a
@@ -6793,8 +6796,10 @@ function openConnectionOptions(p){
   var select = document.getElementById('connection-camera');
   select.options[0].textContent = t('cameraModeAuto');
   select.options[1].textContent = t('cameraModeU1');
-  select.options[1].disabled = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(p.type || '').toLowerCase()) < 0;
-  select.value = p.camera_mode || 'auto';
+  var klipper = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(p.type || '').toLowerCase()) >= 0;
+  select.options[1].disabled = !klipper;
+  select.closest('label').style.display = klipper ? '' : 'none';
+  select.value = klipper && p.camera_mode ? p.camera_mode : 'auto';
   document.getElementById('connection-options-help').textContent = t('connectionOptionsHelp');
   document.getElementById('connection-options-cancel').textContent = t('cancel');
   var save = document.getElementById('connection-options-save');
