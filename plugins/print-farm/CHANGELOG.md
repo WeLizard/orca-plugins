@@ -2,8 +2,22 @@
 
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
+## 0.1.2
+- The toolbar shows how many printers are printing, idle, or need attention. Click a count to filter the cards and click it again to show all printers.
+- Bambu cards show Certificates only when the status connection or a file transfer encounters a certificate that needs attention.
+- Removed the separate per-printer Connection button. Klipper camera mode is available from the camera overlay (including when automatic lookup finds no camera); the optional Web UI address editor is available from the embedded viewer.
+- The next G-code export uses the active preset settings for keeping and trimming slice copies, even when exports run seconds apart.
+- Print Farm ignores dashboard messages that have no object payload instead of raising an error in OrcaSlicer.
+- When OrcaSlicer asks for access to a printer, automatic status checks pause for that address to avoid repeated prompts. The card explains how to allow access. Click Refresh on the card to try that connection again.
+- Stock Snapmaker U1 camera snapshots now refresh up to four times per second while their image is loading normally, independently of the monitor keepalive. WebSocket authentication uses a one-shot token instead of the persistent API key. A slow or hidden page cannot accumulate queued frames; missing images keep a time-based startup grace. Verified on local emulators, not hardware.
+- OrcaSlicer receives one initial request for Bambu discovery (UDP port 2021) and background work. It may ask for an individual printer address when you first connect.
+- Printer requests (Moonraker, OctoPrint) no longer raise a question for every page or URL, and connections to a printer saved by name are covered the same way as one saved by address, including Bambu status, certificate check and FTPS transfer, the Creality status channel and the U1 camera.
+- File transfers and prepared uploads open their files by path, so OrcaSlicer no longer asks about unnamed files; the system credential store module loads at start instead of on first use.
+- Bambu LAN checks the Bambu CA and device serial automatically for MQTT and FTPS. **Read and trust** remains available for unrecognized certificates, and changed saved fingerprints still require replacement confirmation.
+- Printer Web UI windows have a compact address bar with Copy and optional loading help, leaving more room for the printer page.
+- Legacy import waits for explicit confirmation before creating runtime state, preserves nested slice folders and local settings state, and blocks stores whose scoped credentials or operation journal need a separate migration. Identical unassigned slices for different printer destinations stay separate. Clearing history applies only to the account in which it was requested.
+
 ## 0.1.1
-- On current OrcaSlicer builds, saved printers are included in the permission request when the plugin loads, so one dialog covers them instead of a prompt on each first connection. A printer added later still asks once.
 - Added per-printer Connection options: a separate Web UI address on the same host and an explicitly selected stock Snapmaker U1 camera mode. This camera runs only while its overlay is open, closes on cancellation or lease expiry, keeps keys out of the page and clears failed or expired frames. Tested on local emulators; hardware acceptance remains pending.
 - Embedded Web UI windows show a selectable address and browser instructions when the page cannot load. Feedback provides the fixed FilamentHub site address and directions to its existing Beta Feedback button; no printer data is sent.
 - Moonraker printers now show all discovered extruder temperatures and the active tool reported by the printer. Clicking a head shows its details without changing the physical tool. Missing head readings stay unknown. Tested with local fixtures; hardware acceptance remains pending.

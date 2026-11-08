@@ -151,7 +151,7 @@ def _number(value):
     return value
 
 
-def poll(base, ssl_context, apikey=""):
+def poll(base, ssl_context, apikey="", *, raise_if_access_denied=None):
     """Read PrusaLink telemetry; no mutating requests are sent."""
     try:
         version = _version(base, ssl_context)
@@ -217,6 +217,8 @@ def poll(base, ssl_context, apikey=""):
             "can_control": False,
         }
     except _AdapterError as exc:
+        if raise_if_access_denied is not None:
+            raise_if_access_denied(exc)
         if exc.code == "unauthorized":
             return _empty_status(error="auth_required")
         if exc.code == "timeout":

@@ -142,8 +142,9 @@ class _Session:
 # Public interface
 # --------------------------------------------------------------------------
 
-def poll(base: str, ssl_context: ssl.SSLContext | None, password: str = "", *, backend: str | None = None) -> dict:
-    """Return a normalized status. Never actuates; never raises."""
+def poll(base: str, ssl_context: ssl.SSLContext | None, password: str = "", *,
+         backend: str | None = None, raise_if_access_denied=None) -> dict:
+    """Return a normalized status. The optional callback can surface a host denial."""
     status = _empty_status()
     session = None
     try:
@@ -165,6 +166,8 @@ def poll(base: str, ssl_context: ssl.SSLContext | None, password: str = "", *, b
         status["can_start"] = idle
         return status
     except _AdapterError as exc:
+        if raise_if_access_denied is not None:
+            raise_if_access_denied(exc)
         status["error_code"] = exc.code
         if exc.code in _UNKNOWN_STATE_CODES:
             status["state"] = "unknown"

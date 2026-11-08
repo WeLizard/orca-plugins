@@ -193,6 +193,9 @@ _PAGE = r"""<!DOCTYPE html>
     form.appendChild(row);
   });
 
+  if (spec.permissionGuidance)
+    form.appendChild(el('div', {'class': 'row'}, spec.permissionGuidance));
+
   var clearBtn = null;
   if (spec.clear) {
     var row = el('div', {'class': 'row'});
@@ -226,10 +229,11 @@ _PAGE = r"""<!DOCTYPE html>
       }
     });
     ok.addEventListener('click', function(){
+      if (!spec.clear.scope) { closeBox(true); return; }
       var token = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
         : (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12));
       closeBox(true);
-      save({clear_history_token: token});
+      save({clear_history_token: spec.clear.scope + ':' + token});
       note.textContent = spec.clear.done;
     });
   }
@@ -254,6 +258,8 @@ _PAGE = r"""<!DOCTYPE html>
 def build_page(kind, text, language="en", clear=None):
     """HTML for the capability's settings tab, labels from `text(key, **values)`."""
     spec = {"kind": kind, "defaults": defaults(kind), "fields": fields(kind, text)}
+    if kind == DASHBOARD:
+        spec["permissionGuidance"] = text("networkPermissionRequired")
     if clear:
         spec["clear"] = clear
     payload = json.dumps(spec, ensure_ascii=False).replace("<", "\\u003c")

@@ -7,7 +7,7 @@
 # name = "Print Farm"
 # description = "Cross-vendor print farm dashboard: live status, temperatures, print progress and thumbnails, one click to each printer's web interface, and G-code delivery to several printers at once."
 # author = "FilamentHub"
-# version = "0.1.1"
+# version = "0.1.2"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class.
@@ -47,6 +47,7 @@ import base64
 import hashlib
 import hmac
 import html
+import http.client
 import ipaddress
 import io
 import json
@@ -68,6 +69,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+import weakref
 
 import orca
 
@@ -403,7 +405,8 @@ def start_plugin_runtime():
         refresh_ui_language()
         if not configure_plugin_storage():
             return False
-        recover_interrupted_operations()
+        if not (_LEGACY_IMPORT_SOURCE or _LEGACY_IMPORT_BLOCKED):
+            recover_interrupted_operations()
         # Keep the state flag and both worker generations in one critical
         # section.  A page can become ready while a capability is being
         # cancelled; previously that race could leave the flag active while
@@ -413,7 +416,8 @@ def start_plugin_runtime():
         CAMERA_WORKER.activate()
         _PLUGIN_RUNTIME_EPOCH += 1
         _PLUGIN_RUNTIME_ACTIVE = True
-        start_outbox_pruning()
+        if not (_LEGACY_IMPORT_SOURCE or _LEGACY_IMPORT_BLOCKED):
+            start_outbox_pruning()
     return True
 
 
@@ -473,7 +477,7 @@ def post_window(window, payload):
 # version from this (dynamic version), and build_package.py validates that the
 # PEP 723 `# version` comment matches it — so the manifest and the wheel can't
 # drift.
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 
 ORCA_UI_LOCALES = (
     "ca", "cs", "de", "en", "es", "eu", "fr", "hu", "it", "ja", "ko",
@@ -642,16 +646,31 @@ def transport_error_code(exc):
         if 500 <= exc.code <= 599:
             return "server_error"
         return "http_error"
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    # OrcaSlicer reports audit denials as PermissionError with a fixed message.
+    # A generic OS permission error or a printer's HTTP 403 has a different cause.
+    if isinstance(reason, PermissionError) and re.match(
+            r'^Plugin attempted audited operation "(?:urllib\.Request|http\.client\.[^"]+|socket\.[^"]+)"'
+            r' without permission(?:$|:)', str(reason)):
+        return "network_permission_denied"
     if isinstance(exc, (TimeoutError, socket.timeout)):
         return "timeout"
     if isinstance(exc, urllib.error.URLError):
-        reason = getattr(exc, "reason", None)
         return "timeout" if isinstance(reason, (TimeoutError, socket.timeout)) else "network_error"
     if isinstance(exc, (ValueError, json.JSONDecodeError)):
         return "invalid_response"
     if isinstance(exc, (ConnectionError, OSError)):
         return "network_error"
     return "request_failed"
+
+
+def _raise_network_permission_denial(exc):
+    """Surface an Orca audit denial wrapped by a standalone status adapter."""
+    # Some adapters suppress displayed chaining with "from None". Python
+    # still retains the underlying transport error in __context__.
+    for error in (exc, exc.__cause__ or exc.__context__):
+        if transport_error_code(error) == "network_permission_denied":
+            raise error from None
 
 
 def safe_transport_error(exc):
@@ -665,6 +684,7 @@ def safe_transport_error(exc):
         "http_error": "printer rejected the request",
         "timeout": "printer request timed out",
         "network_error": "printer could not be reached",
+        "network_permission_denied": "printer access blocked by OrcaSlicer",
         "invalid_response": "printer returned incomplete or invalid data",
         "request_failed": "printer request failed",
     }
@@ -702,6 +722,10 @@ _LEGACY_IMPORT_SOURCE = ""
 _LEGACY_IMPORT_BLOCKED = False
 _LEGACY_PREVIEW_TOKEN = ""
 _LEGACY_PREVIEW_BINDING = None
+_LEGACY_STATE_NAMES = ("printers.json", "print_history.json", "outbox_index.json",
+                       "outbox", "settings_state.json", "outbox-legacy-recovery")
+_LEGACY_UNSUPPORTED_NAMES = ("operations.sqlite3", "operations.sqlite3-wal",
+                             "operations.sqlite3-shm", "incoming")
 
 
 def _optional_regular_file(path):
@@ -796,17 +820,15 @@ def configure_plugin_storage():
         target_root = fallback_root
     if not target_root:
         return False
-    target_state_exists = any(os.path.lexists(os.path.join(target_root, name)) for name in (
-        "printers.json", "print_history.json", "outbox_index.json", "outbox",
-    ))
+    target_state_exists = any(os.path.lexists(os.path.join(target_root, name))
+                              for name in _LEGACY_STATE_NAMES + _LEGACY_UNSUPPORTED_NAMES)
     legacy_roots = []
     for candidate in (fallback_root, PLUGIN_DIR):
         if candidate and os.path.abspath(candidate) != os.path.abspath(target_root):
-            if any(os.path.lexists(os.path.join(candidate, name)) for name in (
-                "printers.json", "print_history.json", "outbox_index.json", "outbox",
-            )):
+            if any(os.path.lexists(os.path.join(candidate, name))
+                   for name in _LEGACY_STATE_NAMES + _LEGACY_UNSUPPORTED_NAMES):
                 legacy_roots.append(os.path.abspath(candidate))
-    if len(legacy_roots) > 1:
+    if len(legacy_roots) > 1 and not target_state_exists:
         _LEGACY_IMPORT_BLOCKED = True
     elif legacy_roots and not target_state_exists:
         _LEGACY_IMPORT_SOURCE = legacy_roots[0]
@@ -829,7 +851,7 @@ def configure_plugin_storage():
         target_outbox = os.path.join(target_root, "outbox")
         OUTBOX_DIR = target_outbox
         OUTBOX_INDEX = os.path.join(target_root, "outbox_index.json")
-        _STORAGE_DENIED = False
+        _STORAGE_DENIED = bool(_LEGACY_IMPORT_SOURCE or _LEGACY_IMPORT_BLOCKED)
     return True
 
 
@@ -839,6 +861,15 @@ def legacy_import_preview(issue_token=True):
         return {"available": False, "blocked": bool(_LEGACY_IMPORT_BLOCKED)}
     try:
         summary = {"available": True, "printers": 0, "history": 0, "outbox": 0}
+        if any(os.path.lexists(os.path.join(_LEGACY_IMPORT_SOURCE, name))
+               for name in _LEGACY_UNSUPPORTED_NAMES):
+            raise ValueError("legacy state requires a scoped journal migration")
+        digest = _legacy_state_digest(_LEGACY_IMPORT_SOURCE, _LEGACY_STATE_NAMES)
+        settings_path = os.path.join(_LEGACY_IMPORT_SOURCE, "settings_state.json")
+        if os.path.lexists(settings_path):
+            with open(settings_path, "r", encoding="utf-8") as stream:
+                if not isinstance(json.load(stream), dict):
+                    raise ValueError("invalid legacy settings state")
         for name, key in (("printers.json", "printers"), ("print_history.json", "history"),
                           ("outbox_index.json", "outbox")):
             path = os.path.join(_LEGACY_IMPORT_SOURCE, name)
@@ -853,6 +884,8 @@ def legacy_import_preview(issue_token=True):
                 for item in value for credential in ("apikey", "access_code")
             ):
                 raise ValueError("invalid legacy credential")
+            if key == "printers" and any(item.get("credential_refs") for item in value):
+                raise ValueError("legacy credentials require scoped migration")
             if key == "history" and any(not item.get("id") for item in value):
                 raise ValueError("invalid legacy history")
             if key == "outbox" and not all(isinstance(item.get("file"), str) for item in value):
@@ -862,18 +895,11 @@ def legacy_import_preview(issue_token=True):
         if os.path.lexists(outbox):
             if not os.path.isdir(outbox) or os.path.islink(outbox):
                 raise ValueError("invalid legacy outbox")
-            entries = list(os.scandir(outbox))
-            if any(not entry.is_file(follow_symlinks=False)
-                   or os.path.basename(entry.name) != entry.name for entry in entries):
-                raise ValueError("unsafe legacy outbox entry")
-            summary["outbox_files"] = len(entries)
+            summary["outbox_files"] = sum(len(files) for _, _, files in os.walk(outbox))
         else:
             summary["outbox_files"] = 0
         if issue_token:
             global _LEGACY_PREVIEW_TOKEN, _LEGACY_PREVIEW_BINDING
-            digest = _legacy_state_digest(_LEGACY_IMPORT_SOURCE,
-                                          ("printers.json", "print_history.json",
-                                           "outbox_index.json", "outbox"))
             _LEGACY_PREVIEW_TOKEN = uuid.uuid4().hex
             _LEGACY_PREVIEW_BINDING = (_LEGACY_IMPORT_SOURCE, PLUGIN_STORAGE_DIR, digest)
             summary["confirmation"] = _LEGACY_PREVIEW_TOKEN
@@ -884,24 +910,23 @@ def legacy_import_preview(issue_token=True):
 
 def import_legacy_storage(confirmation):
     """Import one validated legacy snapshot into this plugin's empty local store."""
-    global _LEGACY_IMPORT_SOURCE, _LEGACY_IMPORT_BLOCKED
+    global _LEGACY_IMPORT_SOURCE, _LEGACY_IMPORT_BLOCKED, _STORAGE_DENIED
+    global _PRINTERS_STORE_DAMAGED, _HISTORY_STORE_DAMAGED, _OUTBOX_STORE_DAMAGED
     global _LEGACY_PREVIEW_TOKEN, _LEGACY_PREVIEW_BINDING
     binding = _LEGACY_PREVIEW_BINDING
     if (not isinstance(confirmation, str) or not confirmation
             or confirmation != _LEGACY_PREVIEW_TOKEN or binding is None
-            or _STORAGE_DENIED or not _LEGACY_IMPORT_SOURCE
+            or not _LEGACY_IMPORT_SOURCE
             or binding[:2] != (_LEGACY_IMPORT_SOURCE, PLUGIN_STORAGE_DIR)):
         return False
     _LEGACY_PREVIEW_TOKEN = ""
     _LEGACY_PREVIEW_BINDING = None
     preview = legacy_import_preview(issue_token=False)
     if (not preview.get("available") or preview.get("blocked")
-            or _legacy_state_digest(_LEGACY_IMPORT_SOURCE,
-                                    ("printers.json", "print_history.json",
-                                     "outbox_index.json", "outbox")) != binding[2]):
+            or _legacy_state_digest(_LEGACY_IMPORT_SOURCE, _LEGACY_STATE_NAMES) != binding[2]):
         return False
     target = PLUGIN_STORAGE_DIR
-    state_names = ("printers.json", "print_history.json", "outbox_index.json", "outbox")
+    state_names = _LEGACY_STATE_NAMES
     if any(os.path.lexists(os.path.join(target, name)) for name in state_names):
         return False
     if os.path.isdir(target) and os.listdir(target):
@@ -920,7 +945,7 @@ def import_legacy_storage(confirmation):
             if not os.path.lexists(source):
                 continue
             destination = os.path.join(stage, name)
-            if name == "outbox":
+            if os.path.isdir(source):
                 shutil.copytree(source, destination, symlinks=True)
             else:
                 shutil.copy2(source, destination)
@@ -945,7 +970,7 @@ def import_legacy_storage(confirmation):
                 if not os.path.lexists(source):
                     continue
                 destination = os.path.join(backup_stage, name)
-                if name == "outbox":
+                if os.path.isdir(source):
                     shutil.copytree(source, destination, symlinks=True)
                 else:
                     shutil.copy2(source, destination)
@@ -972,6 +997,12 @@ def import_legacy_storage(confirmation):
         os.replace(stage, target)
         _LEGACY_IMPORT_SOURCE = ""
         _LEGACY_IMPORT_BLOCKED = False
+        _STORAGE_DENIED = False
+        _PRINTERS_STORE_DAMAGED = False
+        _HISTORY_STORE_DAMAGED = False
+        _OUTBOX_STORE_DAMAGED = False
+        recover_interrupted_operations()
+        start_outbox_pruning()
         return True
     except (OSError, ValueError, shutil.Error):
         if os.path.isdir(stage):
@@ -1003,12 +1034,126 @@ _SSL_INSECURE.check_hostname = False
 _SSL_INSECURE.verify_mode = ssl.CERT_NONE
 
 
+# Public Bambu LAN CA bundle from OrcaSlicer 2.5.0 (resources/cert/printer.cer).
+# Embed it so the plugin does not read OrcaSlicer's protected certificate paths.
+_SSL_BAMBU_CA = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_SSL_BAMBU_CA.check_hostname = False  # The certificate names the serial, not the LAN address.
+_SSL_BAMBU_CA.load_verify_locations(cadata="""-----BEGIN CERTIFICATE-----
+MIIFfzCCA2egAwIBAgIUXtzR6tRiL/RHBRXOoyFU0+XrliowDQYJKoZIhvcNAQEL
+BQAwRjELMAkGA1UEBhMCQ04xITAfBgNVBAoMGEJCTCBUZWNobm9sb2dpZXMgQ28u
+IEx0ZDEUMBIGA1UEAwwLQkJMIENBMiBSU0EwIBcNMjUwNjE3MDEzODA4WhgPMjA1
+MDA2MTcwMTM4MDhaMEYxCzAJBgNVBAYTAkNOMSEwHwYDVQQKDBhCQkwgVGVjaG5v
+bG9naWVzIENvLiBMdGQxFDASBgNVBAMMC0JCTCBDQTIgUlNBMIICIjANBgkqhkiG
+9w0BAQEFAAOCAg8AMIICCgKCAgEAo4550G4c42gTKzQqixwKT089RizIdZpyOcGA
+679rPaOdWsMqVwnYPP2FpMqXKkjFbedE+SpGloi2NKCuiPNVRbq9PHOOZwTs7YLo
+bOwf53FJuO6vRFpzFfX1tlc9zlFqJvZnYO9NgHpMysidocWcgrDN/SIDywgPB5CV
+bYg3Vvzua9fwZx9e5KT9xd5IpTqdTrWS47jQOVKLhdQCbJFIlMrblOwLBAx+fHok
+wqh6tkI6Ktuyyjw8Dysebi1ndWjKtZ2mW47r8xZ/J+z3EZqcyJMY6MRtx/zb1jBF
+uHtkjrb5Kv1DMzSKlkaNJIbvC+Mk+hI97W+SjLSRuIdC7+oJUzWaSzgu9cjXCVfm
+q8t4IL/35hP69PK95LgLectIrP96CYAT/aVMG19FrFW0QWEyfT+kzG4jkumfPbHq
+Y2nNkEN0+tjj3h4WdzrWgQEojK/lhfcRFVkts74+aZoMpQP+vmL17CKmSzXk5o/e
+K21xgxJdzMbdztfTpibiXk0abfOpN+1VR+3NYa+bROAKNyGaReEGsyW2bjcjNx51
+5Vqzj3SVxhMSp5vfF9E4A1jE99M/l9jQDM6RzkT0lMccGAd5tUSdNvDlrqtQaQiK
+v/ZsXPgXLTWfOpvaLNEgwdMgZMuhjpkwvAZyoYfeF9kyydjDh7bvrX//cz/VopAU
+lxUtQtMCAwEAAaNjMGEwHQYDVR0OBBYEFNVJgQad1sNTN0jxVkwbJ/XM1an1MB8G
+A1UdIwQYMBaAFNVJgQad1sNTN0jxVkwbJ/XM1an1MA8GA1UdEwEB/wQFMAMBAf8w
+DgYDVR0PAQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4ICAQBFZDKMJfp/N4gBeFHh
+MiFehaUyMS6e9mzrTfMLJLJoj6Jopa9V9jIfcCEBGZuRThqFcATV+UdFHSINpUcH
+upcCYnazTRC4dn1hnxnQ1ojQcHxdGp9xGw/YclAKD97d8bPShfBMT1to9zbMK7T5
+L8zgqg01YIOKjQk0Hcd0+0iUr6m8zQ5P8Rl3QXqAyeWgqmYQrrjTWwPsgdfHNXKX
+vDrx7/cqry5lKU802hUplKMBxelv4W8407Ytj1lfJOwvxqxxsFU5jSwcUG3zo2vk
+QtjRs8m5BKup5K1OPYkkPu7Ld89X0XpU073/dNDG11uxb1eDKrtNP6vZuZjNE2Pq
+8HCoI1EtP+ItyqtUMvHi6Z2zsmlA25broVioeUKxjlIecpQ9JR/FhDu9CWNF/nDW
+LSORNaMMzgsMSzI+HCiUhqN+qMIvVP6rzGTJzwqz/lc5Lf+ZPCnGA9WJTT4uPIhf
+ufbZmnUJ35WuWKHxovDsqBh88zQ9sZ+ei4Hi4vVzOhUgfG3aLoSQEYqRoqaboANh
+wCwzyuW2Rv54u5QSBbd6Gx1OpvsWmLPWd2/iL2kISl5wfmLGVydvSJa+rbOfuAy7
+ycVQacVDQCAnbhoVrQy7+454QsKSW3ZV6BcyRrorewCyCYgd7nyxflxHZTBEykXX
+haGNe/KFNvJBMOIuIUzknRRmiQ==
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIB8zCCAZmgAwIBAgIUe61jGQ4RzIC8k+sNuqbI/CaNqPIwCgYIKoZIzj0EAwIw
+RjELMAkGA1UEBhMCQ04xITAfBgNVBAoMGEJCTCBUZWNobm9sb2dpZXMgQ28uIEx0
+ZDEUMBIGA1UEAwwLQkJMIENBMiBFQ0MwIBcNMjUwNjE3MDEzODM1WhgPMjA1MDA2
+MTcwMTM4MzVaMEYxCzAJBgNVBAYTAkNOMSEwHwYDVQQKDBhCQkwgVGVjaG5vbG9n
+aWVzIENvLiBMdGQxFDASBgNVBAMMC0JCTCBDQTIgRUNDMFkwEwYHKoZIzj0CAQYI
+KoZIzj0DAQcDQgAEpKTF7wRSty4DXpGJzgCPwRh8ghLlxUC3qJbyEgLqTvJgbiwY
+APPHK7kVbVmerkqhHOT4QeWRlTG3dOQGLA2VpaNjMGEwHQYDVR0OBBYEFKuRpsjY
+REOyIKH7HwOE6jhGBd6NMB8GA1UdIwQYMBaAFKuRpsjYREOyIKH7HwOE6jhGBd6N
+MA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0gA
+MEUCIErBiUm3VdtP3rz4kb8aLpI5p+BzL7M9vElBGWWJxpHMAiEA3r5tJWVGwuxi
+YCrB1c40KYFRFyahGrhOJZAj/YhRdnU=
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIEeTCCA2GgAwIBAgIUOq+lNIaC2xsswkFqj5JPyVBl45cwDQYJKoZIhvcNAQEL
+BQAwQjELMAkGA1UEBhMCQ04xIjAgBgNVBAoMGUJCTCBUZWNobm9sb2dpZXMgQ28u
+LCBMdGQxDzANBgNVBAMMBkJCTCBDQTAeFw0yNTA2MTcwMjAxMjdaFw0zNTA2MTUw
+MjAxMjdaMEYxCzAJBgNVBAYTAkNOMSEwHwYDVQQKDBhCQkwgVGVjaG5vbG9naWVz
+IENvLiBMdGQxFDASBgNVBAMMC0JCTCBDQTIgUlNBMIICIjANBgkqhkiG9w0BAQEF
+AAOCAg8AMIICCgKCAgEAo4550G4c42gTKzQqixwKT089RizIdZpyOcGA679rPaOd
+WsMqVwnYPP2FpMqXKkjFbedE+SpGloi2NKCuiPNVRbq9PHOOZwTs7YLobOwf53FJ
+uO6vRFpzFfX1tlc9zlFqJvZnYO9NgHpMysidocWcgrDN/SIDywgPB5CVbYg3Vvzu
+a9fwZx9e5KT9xd5IpTqdTrWS47jQOVKLhdQCbJFIlMrblOwLBAx+fHokwqh6tkI6
+Ktuyyjw8Dysebi1ndWjKtZ2mW47r8xZ/J+z3EZqcyJMY6MRtx/zb1jBFuHtkjrb5
+Kv1DMzSKlkaNJIbvC+Mk+hI97W+SjLSRuIdC7+oJUzWaSzgu9cjXCVfmq8t4IL/3
+5hP69PK95LgLectIrP96CYAT/aVMG19FrFW0QWEyfT+kzG4jkumfPbHqY2nNkEN0
++tjj3h4WdzrWgQEojK/lhfcRFVkts74+aZoMpQP+vmL17CKmSzXk5o/eK21xgxJd
+zMbdztfTpibiXk0abfOpN+1VR+3NYa+bROAKNyGaReEGsyW2bjcjNx515Vqzj3SV
+xhMSp5vfF9E4A1jE99M/l9jQDM6RzkT0lMccGAd5tUSdNvDlrqtQaQiKv/ZsXPgX
+LTWfOpvaLNEgwdMgZMuhjpkwvAZyoYfeF9kyydjDh7bvrX//cz/VopAUlxUtQtMC
+AwEAAaNjMGEwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0O
+BBYEFNVJgQad1sNTN0jxVkwbJ/XM1an1MB8GA1UdIwQYMBaAFI80QmjcZ06PxCKe
+xXxJ5avdRL4eMA0GCSqGSIb3DQEBCwUAA4IBAQAvS8tyfagaGsFf9YncA2ko/Na5
+9BVF+8TlUo+32oznwIVpS1AhSgLP6rNVekXNFKbuP5htudLQ17ZRBJI/UMVyYEDq
+IN7xv7Zj+zJwF6W6haYrjb2Vk8igw1XvNULZfvVNNKIkvJUiVqEslWrC+k74crk/
+Wv8ChVf+zqvfIN6LV3esaGRL02J3AprQGb7DDhR1EefQMScDkNpGJMUmvCmfknrl
+iK8qgvQN1SWO7JRf6fNKHsN1ZQvyP0pgLWxpT3V0/0/WttqX3cMGuJF+jVUzm/Nh
+xYhFewG8vc3KzTjnwQApMA6CW554FOJWFyOD2jn5yJLT3Vue+aYDQRp4bKMx
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIICrjCCAZagAwIBAgIUOq+lNIaC2xsswkFqj5JPyVBl45gwDQYJKoZIhvcNAQEL
+BQAwQjELMAkGA1UEBhMCQ04xIjAgBgNVBAoMGUJCTCBUZWNobm9sb2dpZXMgQ28u
+LCBMdGQxDzANBgNVBAMMBkJCTCBDQTAeFw0yNTA2MTcwMjAxNDdaFw0zNTA2MTUw
+MjAxNDdaMEYxCzAJBgNVBAYTAkNOMSEwHwYDVQQKDBhCQkwgVGVjaG5vbG9naWVz
+IENvLiBMdGQxFDASBgNVBAMMC0JCTCBDQTIgRUNDMFkwEwYHKoZIzj0CAQYIKoZI
+zj0DAQcDQgAEpKTF7wRSty4DXpGJzgCPwRh8ghLlxUC3qJbyEgLqTvJgbiwYAPPH
+K7kVbVmerkqhHOT4QeWRlTG3dOQGLA2VpaNjMGEwDwYDVR0TAQH/BAUwAwEB/zAO
+BgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFKuRpsjYREOyIKH7HwOE6jhGBd6NMB8G
+A1UdIwQYMBaAFI80QmjcZ06PxCKexXxJ5avdRL4eMA0GCSqGSIb3DQEBCwUAA4IB
+AQCg6PjUSSZV+4bvejcVMvgXmKzfD95osWn0ctnoMBxPDa+m+Gg+BcLT2IlFAe3E
+KYMvu4T295WQc92rjKYqW6cirFppng9uEFW2mZLimxaSmutsTftE3sbMVMJ/SLYN
+PV7TFv6mcBSIFWXwmBOIpbh4BUcVfONTvdSfIqfyAVxsq4xzc2nc6hPBpAm21Ayj
+ToC1ev/TbDJ8VllFZiEVmWWlIP3aNzAm8S2mOpxPB2WnanaZHSrvXLFhstyzwrjD
+yO1/isOZ7wtr7rcuTJdEvvvCimOZlkfRhaDoTew9tQ0E2FVpzzSinw02qmQ1xIE9
+5/H5ZzJSPkpeAHWEPnKkxg0v
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIDZTCCAk2gAwIBAgIUV1FckwXElyek1onFnQ9kL7Bk4N8wDQYJKoZIhvcNAQEL
+BQAwQjELMAkGA1UEBhMCQ04xIjAgBgNVBAoMGUJCTCBUZWNobm9sb2dpZXMgQ28u
+LCBMdGQxDzANBgNVBAMMBkJCTCBDQTAeFw0yMjA0MDQwMzQyMTFaFw0zMjA0MDEw
+MzQyMTFaMEIxCzAJBgNVBAYTAkNOMSIwIAYDVQQKDBlCQkwgVGVjaG5vbG9naWVz
+IENvLiwgTHRkMQ8wDQYDVQQDDAZCQkwgQ0EwggEiMA0GCSqGSIb3DQEBAQUAA4IB
+DwAwggEKAoIBAQDL3pnDdxGOk5Z6vugiT4dpM0ju+3Xatxz09UY7mbj4tkIdby4H
+oeEdiYSZjc5LJngJuCHwtEbBJt1BriRdSVrF6M9D2UaBDyamEo0dxwSaVxZiDVWC
+eeCPdELpFZdEhSNTaT4O7zgvcnFsfHMa/0vMAkvE7i0qp3mjEzYLfz60axcDoJLk
+p7n6xKXI+cJbA4IlToFjpSldPmC+ynOo7YAOsXt7AYKY6Glz0BwUVzSJxU+/+VFy
+/QrmYGNwlrQtdREHeRi0SNK32x1+bOndfJP0sojuIrDjKsdCLye5CSZIvqnbowwW
+1jRwZgTBR29Zp2nzCoxJYcU9TSQp/4KZuWNVAgMBAAGjUzBRMB0GA1UdDgQWBBSP
+NEJo3GdOj8QinsV8SeWr3US+HjAfBgNVHSMEGDAWgBSPNEJo3GdOj8QinsV8SeWr
+3US+HjAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQABlBIT5ZeG
+fgcK1LOh1CN9sTzxMCLbtTPFF1NGGA13mApu6j1h5YELbSKcUqfXzMnVeAb06Htu
+3CoCoe+wj7LONTFO++vBm2/if6Jt/DUw1CAEcNyqeh6ES0NX8LJRVSe0qdTxPJuA
+BdOoo96iX89rRPoxeed1cpq5hZwbeka3+CJGV76itWp35Up5rmmUqrlyQOr/Wax6
+itosIzG0MfhgUzU51A2P/hSnD3NDMXv+wUY/AvqgIL7u7fbDKnku1GzEKIkfH8hm
+Rs6d8SCU89xyrwzQ0PR853irHas3WrHVqab3P+qNwR0YirL0Qk7Xt/q3O1griNg2
+Blbjg3obpHo9
+-----END CERTIFICATE-----
+""")
+
+
 def ssl_ctx_for(printer):
     printer = printer or {}
-    # Bambu LAN brokers and FTPS servers always present a self-signed
-    # certificate, so default CA verification can never succeed for them; this
-    # is how 0.0.9 behaved. Other TLS endpoints stay verified unless the user
-    # opts out per printer.
+    # Bambu's explicit fingerprint path verifies the peer after the handshake.
+    # The automatic vendor-CA path selects its own context below.
     if printer.get("insecure") or backend_for_type(printer.get("type")) == "bambu":
         return _SSL_INSECURE
     return _SSL_VERIFY
@@ -1023,13 +1168,40 @@ class BambuTlsError(Exception):
 _BAMBU_TLS_ERRORS = {
     "tls_trust_required": "tlsTrustRequired",
     "tls_certificate_changed": "tlsCertificateChanged",
+    "tls_identity_mismatch": "tlsProbeFailed",
     "tls_probe_failed": "tlsProbeFailed",
     "tls_trust_stale": "tlsTrustStale",
     "tls_trust_save_failed": "tlsTrustSaveFailed",
     "tls_trust_busy": "tlsTrustBusy",
+    "tls_permission_required": "tlsPermissionRequired",
 }
 _BAMBU_TLS_PORTS = {"mqtt": 8883, "ftps": 990}
 _BAMBU_TARGET_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+def _is_ip_literal(host):
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _connect_tcp(host, port, timeout):
+    """A TCP connection that OrcaSlicer can attribute to the host the user saved.
+
+    The host asks the user before a plugin connects. For a host name,
+    ``socket.create_connection`` reports the address the name resolved to, which
+    no saved permission names; ``http.client`` reports the name itself and the
+    host covers the connection it opens. Literal addresses connect directly.
+    """
+    if _is_ip_literal(host):
+        return socket.create_connection((host, port), timeout=timeout)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    connection.connect()
+    raw, connection.sock = connection.sock, None
+    connection.close()
+    return raw
 
 
 def _bambu_target_lock(printer):
@@ -1053,12 +1225,16 @@ def _stored_bambu_record(printer):
     return matches[0] if len(matches) == 1 else None
 
 
-def _bambu_pin(printer, protocol):
+def _bambu_pin(printer, protocol, *, required=True):
     record = _stored_bambu_record(printer)
     if record is None:
         raise BambuTlsError("tls_trust_stale")
-    pins = record.get("tls_pins")
-    pin = pins.get(protocol) if isinstance(pins, dict) else None
+    pins = record.get("tls_pins", {})
+    if not isinstance(pins, dict):
+        raise BambuTlsError("tls_trust_required")
+    if protocol not in pins and not required:
+        return None
+    pin = pins.get(protocol)
     if not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{64}", pin):
         raise BambuTlsError("tls_trust_required")
     return pin
@@ -1071,10 +1247,40 @@ def _bambu_peer_fingerprint(sock):
     return hashlib.sha256(certificate).hexdigest()
 
 
-def _verify_bambu_socket(printer, protocol, sock):
-    expected = _bambu_pin(printer, protocol)
-    if not hmac.compare_digest(expected, _bambu_peer_fingerprint(sock)):
-        raise BambuTlsError("tls_certificate_changed")
+def _bambu_tls_context(printer, protocol):
+    if _bambu_pin(printer, protocol, required=False):
+        return ssl_ctx_for(printer)
+    return _SSL_BAMBU_CA
+
+
+def _wrap_bambu_socket(context, raw, host, **kwargs):
+    try:
+        return context.wrap_socket(raw, server_hostname=host, **kwargs)
+    except ssl.SSLCertVerificationError as exc:
+        if context is _SSL_BAMBU_CA:
+            code = "tls_trust_required" if exc.verify_code in {2, 18, 19, 20, 21} else "tls_probe_failed"
+            raise BambuTlsError(code) from exc
+        raise
+
+
+def _verify_bambu_socket(printer, protocol, sock, context=None):
+    pin = _bambu_pin(printer, protocol, required=context is not _SSL_BAMBU_CA)
+    if pin:
+        if not hmac.compare_digest(pin, _bambu_peer_fingerprint(sock)):
+            raise BambuTlsError("tls_certificate_changed")
+        return ""
+    return _bambu_certificate_serial(printer, sock)
+
+
+def _bambu_certificate_serial(printer, sock):
+    names = [value for group in sock.getpeercert().get("subject", ())
+             for key, value in group if key == "commonName"]
+    if len(names) != 1 or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", names[0]):
+        raise BambuTlsError("tls_trust_required")
+    expected_serial = (printer.get("serial") or "").strip()
+    if expected_serial and names[0].casefold() != expected_serial.casefold():
+        raise BambuTlsError("tls_identity_mismatch")
+    return names[0]
 
 
 def _probe_bambu_certificate(printer, protocol, timeout=5):
@@ -1086,12 +1292,25 @@ def _probe_bambu_certificate(printer, protocol, timeout=5):
         host = urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname
         if not host:
             raise BambuTlsError("tls_probe_failed")
-        raw = socket.create_connection((host, _BAMBU_TLS_PORTS[protocol]), timeout=timeout)
+        raw = _connect_tcp(host, _BAMBU_TLS_PORTS[protocol], timeout)
         raw.settimeout(timeout)
-        sock = _SSL_INSECURE.wrap_socket(raw, server_hostname=host)
+        if (printer.get("serial") or "").strip():
+            try:
+                sock = _SSL_BAMBU_CA.wrap_socket(raw, server_hostname=host)
+            except ssl.SSLCertVerificationError:
+                # A legacy certificate is readable for explicit trust only.
+                raw.close()
+                raw = _connect_tcp(host, _BAMBU_TLS_PORTS[protocol], timeout)
+                raw.settimeout(timeout)
+            else:
+                _bambu_certificate_serial(printer, sock)
+        if sock is None:
+            sock = _SSL_INSECURE.wrap_socket(raw, server_hostname=host)
         return _bambu_peer_fingerprint(sock)
     except BambuTlsError:
         raise
+    except PermissionError as exc:
+        raise BambuTlsError("tls_permission_required") from exc
     except (OSError, ssl.SSLError, ValueError) as exc:
         raise BambuTlsError("tls_probe_failed") from exc
     finally:
@@ -1474,6 +1693,13 @@ def normalize_url(url):
     return url
 
 
+def _poll_host(printer):
+    try:
+        return urllib.parse.urlsplit(normalize_url(printer.get("url"))).hostname
+    except ValueError:
+        return None
+
+
 # OrcaSlicer exposes many print_host types. Keep the real type for display, but
 # only map transports that this plugin implements end-to-end: status, controls,
 # and upload. The remaining types stay in the product target list and UI as
@@ -1623,18 +1849,80 @@ def private_credential(value):
     return value
 
 
-class _RejectRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+class _HttpResponse:
+    """The part of a urllib response the plugin reads, over one http.client exchange."""
+
+    def __init__(self, connection, response):
+        self._connection = connection
+        self._response = response
+        self.status = self.code = response.status
+        self.headers = response.msg
+
+    def read(self, amt=None):
+        return self._response.read() if amt is None else self._response.read(amt)
+
+    def getcode(self):
+        return self.status
+
+    def close(self):
+        try:
+            self._response.close()
+        finally:
+            self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
 
 
 def _urlopen_no_redirect(request, **kwargs):
-    """Refuse every redirect so origin-bound credentials never migrate."""
+    """Send one urllib Request without following any redirect.
+
+    Origin-bound credentials never migrate: every status outside 2xx, redirects
+    included, raises HTTPError. The exchange goes through http.client rather than
+    urllib.request on purpose. OrcaSlicer asks the user before a plugin reaches
+    a host, and urllib reports the whole URL (path and query) to that check, so
+    each new URL would be a new question; http.client reports only the host.
+    """
+    timeout = kwargs.pop("timeout", HTTP_TIMEOUT)
     context = kwargs.pop("context", None)
-    handlers = [_RejectRedirects()]
-    if context is not None:
-        handlers.append(urllib.request.HTTPSHandler(context=context))
-    return urllib.request.build_opener(*handlers).open(request, **kwargs)
+    parts = urllib.parse.urlsplit(request.full_url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise urllib.error.URLError("unsupported URL")
+    options = {"timeout": timeout}
+    if parts.scheme == "https":
+        connection_type = http.client.HTTPSConnection
+        options["context"] = context
+    else:
+        connection_type = http.client.HTTPConnection
+    headers = {"Connection": "close"}
+    headers.update(dict(urllib.request.OpenerDirector().addheaders))
+    headers.update(request.header_items())
+    headers = {name.title(): value for name, value in headers.items()}
+    connection = connection_type(parts.hostname, parts.port, **options)
+    try:
+        try:
+            connection.request(request.get_method(), request.selector or "/",
+                               body=request.data, headers=headers)
+        except OSError as exc:
+            raise urllib.error.URLError(exc) from exc
+        response = connection.getresponse()
+    except BaseException:
+        connection.close()
+        raise
+    if not 200 <= response.status < 300:
+        try:
+            body = response.read(64 * 1024)
+        except (OSError, http.client.HTTPException):
+            body = b""
+        finally:
+            connection.close()
+        raise urllib.error.HTTPError(request.full_url, response.status, response.reason,
+                                     response.msg, io.BytesIO(body))
+    return _HttpResponse(connection, response)
 
 
 def _public_number(value):
@@ -2308,22 +2596,21 @@ def _poll_bambu_connection(printer, timeout):
     if not code:
         return _bambu_offline("needs access code")
     try:
-        _bambu_pin(printer, "mqtt")
+        context = _bambu_tls_context(printer, "mqtt")
     except BambuTlsError as exc:
         return _bambu_offline(exc)
 
     deadline = time.monotonic() + timeout
     try:
-        raw = socket.create_connection((host, BAMBU_MQTT_PORT), timeout=timeout)
+        raw = _connect_tcp(host, BAMBU_MQTT_PORT, timeout)
     except Exception as exc:
         return _bambu_offline(exc)
     sock = None
     trusted = False
     try:
-        # Bambu LAN uses self-signed certificates; ssl_ctx_for keeps its
-        # existing compatibility policy for this printer type.
-        sock = ssl_ctx_for(printer).wrap_socket(raw, server_hostname=host)
-        _verify_bambu_socket(printer, "mqtt", sock)
+        sock = _wrap_bambu_socket(context, raw, host)
+        certificate_serial = _verify_bambu_socket(printer, "mqtt", sock, context)
+        topic_serial = serial or certificate_serial
         trusted = True
         # CONNECT: protocol "MQTT" v4, flags user+pass+clean-session, 60s keepalive.
         var = _mqtt_field(b"MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
@@ -2339,7 +2626,7 @@ def _poll_bambu_connection(printer, timeout):
         # Without a serial, subscribe to the wildcard: the broker allows it, and
         # the first report's topic (device/<serial>/report) reveals the serial —
         # so IP + access code are enough and nobody retypes 15-char serials.
-        report = ("device/%s/report" % serial if serial else "device/+/report").encode("utf-8")
+        report = ("device/%s/report" % topic_serial if topic_serial else "device/+/report").encode("utf-8")
         # SUBSCRIBE (packet id 1) to the report topic at QoS 0.
         sub = struct.pack("!H", 1) + _mqtt_field(report) + b"\x00"
         sock.sendall(b"\x82" + _mqtt_len(len(sub)) + sub)
@@ -2352,8 +2639,8 @@ def _poll_bambu_connection(printer, timeout):
             pub = _mqtt_field(request) + push
             sock.sendall(b"\x30" + _mqtt_len(len(pub)) + pub)
 
-        if serial:
-            send_pushall(serial)
+        if topic_serial:
+            send_pushall(topic_serial)
 
         while time.monotonic() < deadline:
             header, packet = _mqtt_read_packet(sock, deadline)
@@ -2369,7 +2656,7 @@ def _poll_bambu_connection(printer, timeout):
             if (len(parts) != 3 or parts[0] != "device" or not parts[1]
                     or parts[2] != "report"):
                 continue
-            if serial and parts[1].casefold() != serial.casefold():
+            if topic_serial and parts[1].casefold() != topic_serial.casefold():
                 continue
             try:
                 msg = json.loads(packet[2 + topic_len:].decode("utf-8", "replace"))
@@ -2382,7 +2669,9 @@ def _poll_bambu_connection(printer, timeout):
                 if not serial:
                     serial = parts[1]
                     printer["serial"] = serial  # caller persists the discovery
-                    send_pushall(serial)
+                    if not topic_serial:
+                        send_pushall(serial)
+                        topic_serial = serial
                 printer["_seen_verified_serial"] = serial
                 seen = _normalize_model_code(info.get("printer_type"))
                 if seen:
@@ -2545,10 +2834,10 @@ def _implicit_ftps_class():
                     self.host = host or self.host
                     self.port = port or self.port
                     self.timeout = timeout
-                    raw = socket.create_connection((self.host, self.port), self.timeout)
+                    raw = _connect_tcp(self.host, self.port, self.timeout)
                     try:
-                        self.sock = self.context.wrap_socket(raw, server_hostname=self.host)
-                        _verify_bambu_socket(self._bambu_printer, "ftps", self.sock)
+                        self.sock = _wrap_bambu_socket(self.context, raw, self.host)
+                        _verify_bambu_socket(self._bambu_printer, "ftps", self.sock, self.context)
                     except Exception:
                         (self.sock if getattr(self, "sock", None) is not None else raw).close()
                         raise
@@ -2563,19 +2852,45 @@ def _implicit_ftps_class():
                     # pinned TLS identity for this transfer.
                     return self.sock.getpeername()[0], port
 
+                def _named_passive_transfer(self, cmd, rest):
+                    # ftplib would open the data connection to the control
+                    # peer's address; for a printer saved by name, OrcaSlicer
+                    # has a permission for the name only. Same exchange as
+                    # ftplib's passive branch, connected through the name.
+                    _address, port = self.makepasv()
+                    conn = _connect_tcp(self.host, port, self.timeout)
+                    try:
+                        if rest is not None:
+                            self.sendcmd("REST %s" % rest)
+                        resp = self.sendcmd(cmd)
+                        if resp[0] == "2":
+                            resp = self.getresp()
+                        if resp[0] != "1":
+                            raise ftplib.error_reply(resp)
+                    except BaseException:
+                        conn.close()
+                        raise
+                    return conn, (ftplib.parse150(resp) if resp[:3] == "150" else None)
+
                 def ntransfercmd(self, cmd, rest=None):
                     # Bambu's vsftpd requires the data connection to reuse the
                     # control channel's TLS session. FTP_TLS wraps a new session
                     # by default.
-                    conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+                    if self.passiveserver and not _is_ip_literal(self.host):
+                        conn, size = self._named_passive_transfer(cmd, rest)
+                    else:
+                        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
                     if self._prot_p:
-                        kwargs = {"server_hostname": self.host}
+                        kwargs = {}
                         session = getattr(self.sock, "session", None)
                         if session is not None:
                             kwargs["session"] = session
                         try:
-                            conn = self.context.wrap_socket(conn, **kwargs)
-                            _verify_bambu_socket(self._bambu_printer, "ftps", conn)
+                            conn = _wrap_bambu_socket(self.context, conn, self.host, **kwargs)
+                            _verify_bambu_socket(self._bambu_printer, "ftps", conn, self.context)
+                            if self.context is _SSL_BAMBU_CA and not hmac.compare_digest(
+                                    _bambu_peer_fingerprint(self.sock), _bambu_peer_fingerprint(conn)):
+                                raise BambuTlsError("tls_certificate_changed")
                         except Exception:
                             conn.close()
                             raise
@@ -2603,21 +2918,23 @@ def _bambu_publish_locked(host, code, topic, payload, timeout, printer):
     if printer.get("credential_refs"):
         code = printer.get("access_code") or printer.get("apikey") or ""
     try:
-        _bambu_pin(printer, "mqtt")
+        context = _bambu_tls_context(printer, "mqtt")
+        if context is _SSL_BAMBU_CA and not (printer.get("serial") or "").strip():
+            return "tls_trust_stale"
     except BambuTlsError as exc:
         return exc.code
     if urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname != host:
         return "tls_trust_stale"
     deadline = time.monotonic() + timeout
     try:
-        raw = socket.create_connection((host, BAMBU_MQTT_PORT), timeout=timeout)
+        raw = _connect_tcp(host, BAMBU_MQTT_PORT, timeout)
     except Exception as exc:
         return str(exc)
     sock = None
     trusted = False
     try:
-        sock = ssl_ctx_for(printer).wrap_socket(raw, server_hostname=host)
-        _verify_bambu_socket(printer, "mqtt", sock)
+        sock = _wrap_bambu_socket(context, raw, host)
+        _verify_bambu_socket(printer, "mqtt", sock, context)
         trusted = True
         var = _mqtt_field(b"MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
         creds = _mqtt_field(b"orca-printers-pub") + _mqtt_field(b"bblp") + _mqtt_field(code.encode("utf-8"))
@@ -2673,6 +2990,11 @@ def bambu_start_print(host, code, serial, remote_path, use_ams, plate_entry=None
 # themselves over SSDP (UDP 2021) with a DevName header; Moonraker exposes the
 # Klipper host name. Placeholder names get replaced once and persisted.
 # --------------------------------------------------------------------------- #
+# The address the listener binds. OrcaSlicer asks about a bound address by its
+# text, so load time declares exactly str() of this tuple (declare_host_permissions).
+BAMBU_DISCOVERY_ADDRESS = ("0.0.0.0", 2021)
+
+
 def ssdp_bambu_names(duration=3.0):
     """Passively collect Bambu SSDP announcements: ip -> {name, serial, model_code}.
     Printers NOTIFY every few seconds, so a short listen window is enough."""
@@ -2682,7 +3004,7 @@ def ssdp_bambu_names(duration=3.0):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # OrcaSlicer's own Bambu discovery may hold the port; share it.
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("", 2021))
+        sock.bind(BAMBU_DISCOVERY_ADDRESS)
     except OSError:
         return names
     try:
@@ -2807,14 +3129,9 @@ _SETTINGS_STATE_LOCK = threading.Lock()
 _HISTORY_TOKEN_SEEN = None  # last processed clear-history token (memory copy)
 
 
-def plugin_settings(kind, fresh=False):
-    """Validated settings for "outbox" or "dashboard"; defaults on any failure."""
-    now = time.monotonic()
+def _read_plugin_settings(kind):
     with _SETTINGS_LOCK:
-        cached = _SETTINGS_CACHE.get(kind)
         owner = _SETTINGS_OWNERS.get(kind)
-    if cached is not None and not fresh and now - cached[0] < _SETTINGS_TTL:
-        return dict(cached[1])
     raw = None
     getter = getattr(owner, "get_config", None)
     if callable(getter):
@@ -2822,7 +3139,17 @@ def plugin_settings(kind, fresh=False):
             raw = getter()
         except Exception:
             raw = None
-    values = _pf_settings.normalize(kind, raw)
+    return _pf_settings.normalize(kind, raw)
+
+
+def plugin_settings(kind, fresh=False):
+    """Validated settings for "outbox" or "dashboard"; defaults on any failure."""
+    now = time.monotonic()
+    with _SETTINGS_LOCK:
+        cached = _SETTINGS_CACHE.get(kind)
+    if cached is not None and not fresh and now - cached[0] < _SETTINGS_TTL:
+        return dict(cached[1])
+    values = _read_plugin_settings(kind)
     with _SETTINGS_LOCK:
         _SETTINGS_CACHE[kind] = (now, values)
     return dict(values)
@@ -2833,9 +3160,10 @@ def _settings_state_path():
 
 
 def _processed_history_token():
+    scope = _history_clear_scope()
     with _SETTINGS_STATE_LOCK:
-        if _HISTORY_TOKEN_SEEN is not None:
-            return _HISTORY_TOKEN_SEEN
+        if isinstance(_HISTORY_TOKEN_SEEN, tuple) and _HISTORY_TOKEN_SEEN[0] == scope:
+            return _HISTORY_TOKEN_SEEN[1]
     try:
         with open(_settings_state_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -2855,8 +3183,16 @@ def _mark_history_token(token):
     except OSError:
         return False
     with _SETTINGS_STATE_LOCK:
-        _HISTORY_TOKEN_SEEN = token
+        _HISTORY_TOKEN_SEEN = (_history_clear_scope(), token)
     return True
+
+
+def _history_clear_scope(root=None):
+    if root is None and _STORAGE_DENIED:
+        return ""
+    root = PLUGIN_STORAGE_DIR if root is None else root
+    return (hashlib.sha256(os.path.normcase(os.path.realpath(root)).encode("utf-8")).hexdigest()[:24]
+            if root else "")
 
 
 def apply_history_clear_request(settings=None):
@@ -2870,6 +3206,12 @@ def apply_history_clear_request(settings=None):
         settings = plugin_settings(_pf_settings.DASHBOARD)
     token = settings.get("clear_history_token") or ""
     if not token or token == _processed_history_token():
+        return False
+    scope = _history_clear_scope()
+    if not scope or not token.startswith(scope + ":"):
+        # Capability config is global; old or another account's commands must
+        # never clear the history in the currently selected account.
+        _mark_history_token(token)
         return False
     with _HISTORY_LOCK:
         if token == _processed_history_token():
@@ -3081,6 +3423,10 @@ def outbox_add(gcode_path, output_name="", host="", identity=None):
         for existing in index:
             if (existing.get("sha256") == source_digest
                     and (existing.get("target_uuid") or None) == (wanted_target or None)
+                    and (wanted_target or all(
+                        (existing.get(key) or "") == (record.get(key) or "")
+                        for key in ("match_endpoint", "match_serial", "printer_settings_id",
+                                    "printer_model", "host_type", "repetier_slug")))
                     and (not (record.get("host_type") == "repetier" or record.get("repetier_slug"))
                          or all(existing.get(key) == record.get(key) for key in
                                 ("host_type", "repetier_slug", "match_url")))):
@@ -3984,7 +4330,10 @@ class PrintersOutbox(
             post = getattr(orca.slicing, "psGCodePostProcess", None)
         if step is not None and post is not None and step != post:
             return orca.ExecutionResult.skipped(ui_text("outboxWrongStep"))
-        if not plugin_settings(_pf_settings.OUTBOX)["keep_copies"]:
+        # OrcaSlicer resolves preset overrides for the current export. Read
+        # one snapshot here without putting it into the dashboard's cache.
+        settings = _read_plugin_settings(_pf_settings.OUTBOX)
+        if not settings["keep_copies"]:
             return orca.ExecutionResult.skipped(ui_text("outboxCopiesOff"))
         path = getattr(ctx, "gcode_path", "") or ""
         if not path or not os.path.exists(path):
@@ -3999,7 +4348,7 @@ class PrintersOutbox(
             return orca.ExecutionResult.skipped(
                 "%s: %s" % (ui_text("outboxWriteFailed"), exc))
         try:
-            keep = plugin_settings(_pf_settings.OUTBOX)["keep_last"]
+            keep = settings["keep_last"]
             if keep:
                 prune_outbox_keep_last(keep, record)
         except Exception:
@@ -4057,7 +4406,8 @@ def _poll_creality(printer, base):
         ws = _pf_creality.ws_base(base, creality_ws_port(printer))
     except ValueError:
         ws = ""
-    status = dict(_pf_creality.poll(ws, None, ""))
+    status = dict(_pf_creality.poll(
+        ws, None, "", raise_if_access_denied=_raise_network_permission_denial))
     # Read-only for now: the adapter keeps its write gate closed because the
     # upload target is not verified on hardware. That is a reason shown on the
     # card, not a failure of the status read.
@@ -4075,7 +4425,8 @@ def _poll_flashforge(printer, base, ctx):
     model is verified on hardware, which is a card reason, not a poll failure."""
     status = dict(_pf_flashforge.poll(
         base, ctx, printer.get("apikey", ""),
-        serial_number=str(printer.get("serial") or "")))
+        serial_number=str(printer.get("serial") or ""),
+        raise_if_access_denied=_raise_network_permission_denial))
     status["upload_ready"] = status.get("upload_ready") is True
     status["can_control"] = False
     status["can_start"] = False
@@ -4108,17 +4459,21 @@ def _poll_backend(kind, printer, base, ctx):
     if kind == "octoprint":
         return poll_octoprint(base, ctx, printer.get("apikey", ""))
     if kind == "repetier":
-        return _adapter_auth_code(_pf_repetier.poll(base, ctx, printer.get("apikey", ""),
-                                 slug=printer.get("repetier_slug", "")))
+        return _adapter_auth_code(_pf_repetier.poll(
+            base, ctx, printer.get("apikey", ""), slug=printer.get("repetier_slug", ""),
+            raise_if_access_denied=_raise_network_permission_denial))
     if kind == "duet":
         return _adapter_auth_code(dict(_pf_duet.poll(
-            base, ctx, printer.get("apikey", ""), backend=_duet_pin(printer))))
+            base, ctx, printer.get("apikey", ""), backend=_duet_pin(printer),
+            raise_if_access_denied=_raise_network_permission_denial)))
     if kind == "crealityprint":
         return _poll_creality(printer, base)
     if kind == "flashforge":
         return _poll_flashforge(printer, base, ctx)
     if kind in _ADAPTER_BACKENDS:
-        return _ADAPTER_BACKENDS[kind].poll(base, ctx, printer.get("apikey", ""))
+        return _ADAPTER_BACKENDS[kind].poll(
+            base, ctx, printer.get("apikey", ""),
+            raise_if_access_denied=_raise_network_permission_denial)
     raise ValueError("unsupported pinned backend")
 
 
@@ -4139,7 +4494,11 @@ def _status_device_health(state):
 def _finalize_status(status, backend, *, authorization=None, transport_online=None):
     result = dict(status or {})
     online = result.get("online")
-    auth_denied = result.get("error_code") == "authorization_denied"
+    code = result.get("error_code")
+    auth_denied = code == "authorization_denied"
+    if code == "network_permission_denied":
+        online = transport_online = None
+        result["state"] = "unknown"
     if auth_denied:
         online = True
     if transport_online is None:
@@ -4159,7 +4518,9 @@ def _finalize_status(status, backend, *, authorization=None, transport_online=No
     result["observed_at"] = time.time()
     result["freshness"] = "fresh" if online is True else "unknown"
     if result.get("error") or result.get("error_code"):
-        result["error"] = ui_text("genericError")
+        error_key = ("networkPermissionRequired" if code == "network_permission_denied"
+                     else _BAMBU_TLS_ERRORS.get(code, "genericError"))
+        result["error"] = ui_text(error_key)
         result.setdefault("error_code", "request_failed")
     else:
         result["error"] = ""
@@ -4168,6 +4529,10 @@ def _finalize_status(status, backend, *, authorization=None, transport_online=No
 
 def _poll_failure_status(backend, exc):
     code, _safe_message = safe_transport_error(exc)
+    return _transport_failure_status(backend, code)
+
+
+def _transport_failure_status(backend, code):
     auth_denied = code == "authorization_denied"
     return _finalize_status({
         "online": True if auth_denied else False,
@@ -4462,17 +4827,24 @@ def status_can_control(status, action, printer=None):
 
 def _legacy_state_digest(root, names):
     digest = hashlib.sha256()
+    def validate(path):
+        info = os.stat(path, follow_symlinks=False)
+        if (stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & 0x400
+                or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))):
+            raise ValueError("unsafe legacy state entry")
     for name in names:
         path = os.path.join(root, name)
         if not os.path.lexists(path):
             continue
         digest.update(name.encode("utf-8"))
-        if os.path.islink(path):
-            raise ValueError("symlink in legacy state")
+        validate(path)
         if os.path.isdir(path):
             for current, directories, files in os.walk(path, followlinks=False):
-                if any(os.path.islink(os.path.join(current, item)) for item in directories + files):
-                    raise ValueError("symlink in legacy state")
+                directories.sort()
+                for item in directories + files:
+                    validate(os.path.join(current, item))
+                digest.update(os.path.relpath(current, root).replace(os.sep, "/").encode("utf-8"))
                 for filename in sorted(files):
                     item_path = os.path.join(current, filename)
                     relative = os.path.relpath(item_path, root).replace(os.sep, "/")
@@ -4999,14 +5371,17 @@ def _bambu_send_file_locked(printer, filename, file_path, start, use_ams, plate_
     if not host or not code or (start and not serial):
         return operation_error("errorNeedsBambuCredentials")
     try:
-        _bambu_pin(printer, "ftps")
+        context = _bambu_tls_context(printer, "ftps")
+        if context is _SSL_BAMBU_CA and not serial:
+            return {**operation_error("errorNeedsBambuCredentials"),
+                    "journal_state": "rejected", "evidence_ref": "tls:pre_dispatch"}
     except BambuTlsError as exc:
         return {"ok": False, "error_key": _BAMBU_TLS_ERRORS[exc.code],
                 "error_values": {}, "error_code": exc.code,
                 "journal_state": "rejected", "evidence_ref": "tls:pre_dispatch"}
     extension = ".3mf" if filename.lower().endswith(".3mf") else ".gcode"
     remote = "pf-" + uuid.uuid4().hex + extension
-    ftp = _implicit_ftps_class()(context=ssl_ctx_for(printer))
+    ftp = _implicit_ftps_class()(context=context)
     ftp._bambu_printer = printer
     store_attempted = False
     control_trusted = False
@@ -5267,7 +5642,13 @@ PAGE = r"""<!DOCTYPE html>
   #bar { flex:0 0 auto; display:flex; flex-direction:column; gap:7px; padding:8px 12px;
          border-bottom:1px solid var(--orca-border,#3c3c4c); }
   .bar-main, .manual-form { display:flex; align-items:center; gap:7px; min-width:0; }
-  .bar-main { width:100%; }
+  .bar-main { width:100%; flex-wrap:wrap; }
+  #fleet-summary { display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; }
+  #fleet-summary[hidden], .tile[hidden] { display:none; }
+  #fleet-summary button { white-space:nowrap; }
+  #fleet-summary button[aria-pressed="true"] {
+    background:var(--orca-accent,#009688); border-color:var(--orca-accent,#009688); color:#fff;
+  }
   #bar input:not([type="checkbox"]), #bar select { font:inherit; font-size:12px; padding:4px 8px;
          background:var(--orca-bg,#1e1e2e); color:var(--orca-fg,#e0e0e0);
          border:1px solid var(--orca-border,#3c3c4c); border-radius:4px; }
@@ -5492,6 +5873,11 @@ PAGE = r"""<!DOCTYPE html>
           <path d="M1 1.5 6 6.5 11 1.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
         </svg>
       </span>
+      <div id="fleet-summary" hidden>
+        <button class="ghost" type="button" data-fleet-filter="printing" aria-pressed="false"></button>
+        <button class="ghost" type="button" data-fleet-filter="idle" aria-pressed="false"></button>
+        <button class="ghost" type="button" data-fleet-filter="attention" aria-pressed="false"></button>
+      </div>
       <button id="manual-toggle" class="ghost" type="button" aria-expanded="false">
         <span id="manual-toggle-text">Add</span>
         <svg class="disclosure-icon" viewBox="0 0 12 8" aria-hidden="true" focusable="false">
@@ -5534,8 +5920,6 @@ __TYPE_OPTIONS__
       <div id="connection-options-title" style="font-weight:600;margin-bottom:12px"></div>
       <label style="display:flex;flex-direction:column;gap:5px;margin-bottom:12px"><span id="connection-webui-label"></span>
         <input id="connection-webui" type="text" autocomplete="off" style="width:min(48ch,100%);box-sizing:border-box" placeholder="http://192.168.0.42"></label>
-      <label style="display:flex;flex-direction:column;gap:5px;margin-bottom:12px"><span id="connection-camera-label"></span>
-        <select id="connection-camera" style="width:max-content;max-width:100%"><option value="auto"></option><option value="snapmaker_u1"></option></select></label>
       <p id="connection-options-help" style="font-size:12px;margin:0 0 12px"></p>
       <div style="display:flex;gap:8px;justify-content:flex-end"><button id="connection-options-cancel" class="ghost"></button><button id="connection-options-save"></button></div>
     </section>
@@ -5576,15 +5960,17 @@ __TYPE_OPTIONS__
         <div id="tls-intro" class="history-note"></div>
         <select id="tls-protocol" style="width:max-content;max-width:100%;box-sizing:border-box">
           <option value="mqtt"></option><option value="ftps"></option></select>
+        <details id="tls-details"><summary id="tls-details-label"></summary>
         <div id="tls-address" style="overflow-wrap:anywhere"></div>
         <div><span id="tls-current-label"></span><br><code id="tls-current"
           style="overflow-wrap:anywhere;word-break:break-all"></code></div>
         <div><span id="tls-observed-label"></span><br><code id="tls-observed"
           style="overflow-wrap:anywhere;word-break:break-all"></code></div>
+        </details>
         <div id="tls-note" class="history-note" role="status"></div>
         <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end">
-          <button id="tls-probe" class="ghost" type="button"></button>
-          <button id="tls-confirm" type="button" disabled></button>
+          <button id="tls-probe" type="button"></button>
+          <button id="tls-confirm" type="button" style="display:none" hidden disabled></button>
         </div>
       </div>
     </section>
@@ -5619,6 +6005,9 @@ __TYPE_OPTIONS__
       </div>
       <div class="cam-view"><img id="cam-img" alt="" referrerpolicy="no-referrer"></div>
       <div id="cam-note" class="history-note" role="status" aria-live="polite"></div>
+      <label id="cam-mode-wrap" style="display:none;align-items:center;gap:8px"><span id="cam-mode-label"></span>
+        <select id="cam-mode"><option value="auto"></option><option value="snapmaker_u1"></option></select>
+        <button id="cam-mode-save" class="ghost" type="button"></button></label>
       <div class="cam-actions"><button id="cam-window" class="ghost" type="button" style="display:none"></button></div>
     </section>
   </div>
@@ -5746,6 +6135,7 @@ var grid = document.getElementById('grid');
 var sendBtn = document.getElementById('send');
 var fileInput = document.getElementById('file');
 var current = [];
+var ftpsTrustIssues = Object.create(null);
 window.lastUnassignedOutbox = [];
 var selected = {};   // owner scope + target UUID + binding revision -> true
 var expandedQueues = {};  // target binding -> true
@@ -5818,11 +6208,15 @@ function targetIdentity(p){ return { targetUuid:p.target_uuid, ownerScope:p.owne
   targetSelector:p.target_selector, bindingRevision:p.binding_revision, url:p.url,
   connectionType:p.type, name:p.name || p.url }; }
 
-var tlsDialogCard = null, tlsDialogToken = null, tlsDialogRequest = 0;
+var tlsDialogCard = null, tlsDialogToken = null, tlsDialogRequest = 0, tlsDialogPending = false;
 function clearTlsChallenge(){
   tlsDialogToken = null;
+  tlsDialogPending = false;
   tlsDialogRequest += 1;
+  document.getElementById('tls-probe').disabled = false;
   document.getElementById('tls-confirm').disabled = true;
+  document.getElementById('tls-confirm').hidden = true;
+  document.getElementById('tls-confirm').style.display = 'none';
   document.getElementById('tls-current').textContent = t('tlsTrustNoPin');
   document.getElementById('tls-observed').textContent = '';
   document.getElementById('tls-address').textContent = '';
@@ -5833,10 +6227,12 @@ function closeTlsTrust(){
   clearTlsChallenge(); tlsDialogCard = null;
   document.getElementById('tls-modal').style.display = 'none';
 }
-function openTlsTrust(p){
+function openTlsTrust(p, initialProtocol){
   clearTlsChallenge(); tlsDialogCard = p;
   document.getElementById('tls-title').textContent = t('tlsTrustTitle');
   document.getElementById('tls-intro').textContent = t('tlsTrustIntro');
+  document.getElementById('tls-details-label').textContent = t('tlsTrustDetails');
+  document.getElementById('tls-details').open = false;
   document.getElementById('tls-current-label').textContent = t('tlsTrustCurrent');
   document.getElementById('tls-observed-label').textContent = t('tlsTrustObserved');
   document.getElementById('tls-close').textContent = t('close');
@@ -5846,7 +6242,7 @@ function openTlsTrust(p){
   var protocol = document.getElementById('tls-protocol');
   protocol.options[0].textContent = t('tlsTrustMqtt');
   protocol.options[1].textContent = t('tlsTrustFtps');
-  protocol.value = 'mqtt';
+  protocol.value = initialProtocol || 'mqtt';
   document.getElementById('tls-modal').style.display = 'flex';
 }
 document.getElementById('tls-close').addEventListener('click', closeTlsTrust);
@@ -5856,13 +6252,18 @@ document.getElementById('tls-probe').addEventListener('click', function(){
   clearTlsChallenge();
   var msg = targetIdentity(tlsDialogCard);
   msg.type = 'tls-probe'; msg.protocol = document.getElementById('tls-protocol').value;
+  msg.consent = true;
   msg.requestId = tlsDialogRequest;
   document.getElementById('tls-note').textContent = t('tlsTrustWorking');
+  tlsDialogPending = true;
+  document.getElementById('tls-probe').disabled = true;
   orca.postMessage(msg);
 });
 document.getElementById('tls-confirm').addEventListener('click', function(){
   if (!tlsDialogCard || !tlsDialogToken) return;
   var token = tlsDialogToken; tlsDialogToken = null;
+  tlsDialogPending = true;
+  document.getElementById('tls-probe').disabled = true;
   this.disabled = true;
   document.getElementById('tls-note').textContent = t('tlsTrustWorking');
   orca.postMessage({type:'tls-confirm', token:token, consent:true,
@@ -5925,6 +6326,10 @@ function printerBusy(p){
 function tlsTrustNeeded(p, s){
   return String(s.backend || p.type || '').toLowerCase() === 'bambu' &&
     /^tls_(trust_required|certificate_changed|trust_stale)$/.test(s.error_code || '');
+}
+function tlsIssueProtocol(p, s){
+  if (tlsTrustNeeded(p, s)) return 'mqtt';
+  return p.type === 'bambu' && ftpsTrustIssues[targetKey(p)] ? 'ftps' : '';
 }
 function statusControlReady(p, action){
   var s = p.status || {};
@@ -6319,6 +6724,43 @@ function bindToolDetails(tile, p, tools){
 }
 // </tool-details>
 
+function fleetStatus(p){
+  var s = p.status || {};
+  var state = String(s.job_state || s.state || '').trim().toLowerCase();
+  var kind = stateKind({state:state});
+  if (tlsIssueProtocol(p, s) || s.online === false || s.authorization === 'rejected' ||
+      s.error_code === 'network_permission_denied' || s.device_health === 'error' ||
+      s.device_health === 'disconnected' || Number(s.print_error) ||
+      /^(offline|error|failed|aborted|halted|shutdown|cancelled)$/.test(state) ||
+      kind === 'paused') return 'attention';
+  if (s.online !== true) return '';
+  if (kind === 'printing') return 'printing';
+  return /^(idle|standby|operational|ready|complete|completed|finished)$/.test(state) ? 'idle' : '';
+}
+
+var fleetSummary = document.getElementById('fleet-summary');
+var fleetFilter = '';
+function applyFleetFilter(){
+  var counts = {printing:0, idle:0, attention:0};
+  Array.prototype.forEach.call(grid.querySelectorAll('.tile'), function(tile){
+    var status = tile.dataset.fleetStatus;
+    if (status) counts[status]++;
+    tile.hidden = !!fleetFilter && fleetFilter !== status;
+  });
+  var labels = {printing:'fleetPrinting', idle:'fleetIdle', attention:'fleetAttention'};
+  Array.prototype.forEach.call(fleetSummary.querySelectorAll('button'), function(button){
+    var filter = button.dataset.fleetFilter;
+    button.textContent = t(labels[filter]) + ' ' + counts[filter];
+    button.setAttribute('aria-pressed', String(filter === fleetFilter));
+  });
+}
+fleetSummary.addEventListener('click', function(event){
+  var filter = event.target.dataset.fleetFilter;
+  if (!filter) return;
+  fleetFilter = fleetFilter === filter ? '' : filter;
+  applyFleetFilter();
+});
+
 function render(printers){
   pruneToolDetails(printers);
   renderCredentialNotice(printers);
@@ -6327,6 +6769,8 @@ function render(printers){
     if (list) queueScrollPositions[tile.dataset.targetUuid] = list.scrollTop;
   });
   current = printers;
+  fleetSummary.hidden = !printers.length;
+  if (!printers.length) fleetFilter = '';
   grid.innerHTML = '';
   updateStorageNotices();
   if (!printers.length){ grid.innerHTML = '<div class="empty">' + esc(t('noPrinters')) + '</div>'; return; }
@@ -6347,9 +6791,14 @@ function render(printers){
     };
     var stateKey = stateLabels[String(rawState).toLowerCase()];
     var stateText = stateKey ? t(stateKey) : rawState;
+    if (supported && s.error_code === 'tls_trust_required' && tlsTrustNeeded(p, s)) {
+      stateText = t('tlsTrustRequired');
+      dotClass = '';
+    }
     var tile = document.createElement('div'); tile.className = 'tile';
     tile.dataset.printerUrl = p.url;
     tile.dataset.targetUuid = targetKey(p);
+    tile.dataset.fleetStatus = fleetStatus(p);
     var multiTool = Array.isArray(s.tools) && s.tools.length > 1;
     var toolRow = '';
     if (multiTool) {
@@ -6373,9 +6822,13 @@ function render(printers){
         credentials_required:'flashforgeErrCredentials'}[s.error_code];
       if (hintKey) fname += '<div class="fname" role="status">' + esc(t(hintKey)) + '</div>';
     }
-    var tlsNeeded = supported && tlsTrustNeeded(p, s);
-    if (tlsNeeded) fname += '<div class="fname tls-needed" role="status">' + esc(s.error || t('tlsTrustRequired')) +
+    var tlsProtocol = supported && tlsIssueProtocol(p, s);
+    if (tlsProtocol) fname += '<div class="fname tls-needed" role="status">' +
+      esc(tlsProtocol === 'mqtt' ? (s.error || t('tlsTrustRequired')) : ftpsTrustIssues[targetKey(p)]) +
       ' — «' + esc(t('tlsTrustButton')) + '»</div>';
+    var networkAccessDenied = supported && s.error_code === 'network_permission_denied';
+    if (networkAccessDenied)
+      fname += '<div class="ctl-note" role="status">' + esc(s.error) + '</div>';
     if (supported && s.backend === 'repetier' && (s.upload_reason || s.control_reason))
       fname += '<div class="ctl-note">' + esc(t(s.upload_reason || s.control_reason)) + '</div>';
     var jobKind = stateKind(s);
@@ -6408,7 +6861,7 @@ function render(printers){
         esc(t('controlsUnverified')) + '">' + esc(t('stop')) + '</button>';
     // No controls, no container: an empty slot would leave a hole in the card.
     if (ctl) ctl = '<span class="ctl-slot">' + ctl + '</span>';
-    var printDisabledReason = !supported
+    var printDisabledReason = networkAccessDenied ? s.error : !supported
       ? t('integrationUnavailable')
       : (s.upload_reason === 'writable_target_unverified' || s.upload_reason === 'hardware_unverified' ? t('uploadUnverifiedHardware')
         : (busy || (s.online === true && /^state_/.test(s.upload_reason || '')) ? t('printerBusy')
@@ -6417,7 +6870,9 @@ function render(printers){
     // While a job runs or is paused, selecting and Print... cannot apply, so they
     // are left out rather than shown disabled. Other reasons keep their explanation.
     var hideSend = printerBusy(p);
-    var camHtml = CAMERA_TYPES.indexOf(String(p.type || '').toLowerCase()) >= 0 && !noCamera[p.target_uuid]
+    var klipperCamera = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(p.type || '').toLowerCase()) >= 0;
+    var camHtml = CAMERA_TYPES.indexOf(String(p.type || '').toLowerCase()) >= 0 &&
+      (!noCamera[p.target_uuid] || klipperCamera)
       ? '<button class="cam ghost" type="button" data-uuid="' + esc(p.target_uuid) + '" title="' +
         esc(t('cameraButton')) + '" aria-label="' + esc(t('cameraButton')) + '">' +
         '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 5h2.2l1-1.5h5.6L11.8 5H14v7.5H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><circle cx="8" cy="8.6" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>'
@@ -6432,12 +6887,11 @@ function render(printers){
       (selected[targetKey(p)] ? ' checked' : '') + (selectable ? '' : ' disabled') + '> ' + esc(t('select')) + '</label>';
     var printHtml = hideSend ? '' :
       '<button class="print ghost"' + printAttrs + '>' + esc(t('print')) + '</button>';
-    // Bambu has neither a web page nor a selectable camera, so no connection options.
-    var historyHtml = '<button class="history ghost">' + esc(t('history')) + '</button>' +
-      (p.type === 'bambu' ? ''
-        : '<button class="connection-options ghost" type="button">' + esc(t('connectionOptions')) + '</button>');
-    var tlsHtml = String(p.type || '').toLowerCase() === 'bambu'
-      ? '<button class="tls-trust ' + (supported && tlsTrustNeeded(p, s) ? 'primary' : 'ghost') + '" type="button">' + esc(t('tlsTrustButton')) + '</button>' : '';
+    if (networkAccessDenied)
+      printHtml += '<button class="retry-network ghost" type="button">' + esc(t('refresh')) + '</button>';
+    var historyHtml = '<button class="history ghost">' + esc(t('history')) + '</button>';
+    var tlsHtml = tlsProtocol
+      ? '<button class="tls-trust primary" type="button">' + esc(t('tlsTrustButton')) + '</button>' : '';
     tile.innerHTML += cardActionsHtml({select:selectHtml, history:historyHtml, print:printHtml,
       tls:tlsHtml, cam:camHtml, open:openHtml, ctl:ctl});
     if (multiTool && s.backend === 'moonraker') bindToolDetails(tile, p, s.tools);
@@ -6462,11 +6916,13 @@ function render(printers){
     });
     var printBtn0 = tile.querySelector('.print');
     if (printBtn0) printBtn0.addEventListener('click', function(){ pickAndSend([targetKey(p)]); });
+    var retryNetwork = tile.querySelector('.retry-network');
+    if (retryNetwork) retryNetwork.addEventListener('click', function(){
+      var identity = targetIdentity(p); identity.type = 'retry-network'; orca.postMessage(identity);
+    });
     tile.querySelector('.history').addEventListener('click', function(){ openPrintHistory(p); });
-    var connectionButton = tile.querySelector('.connection-options');
-    if (connectionButton) connectionButton.addEventListener('click', function(){ openConnectionOptions(p); });
     var tlsBtn = tile.querySelector('.tls-trust');
-    if (tlsBtn) tlsBtn.addEventListener('click', function(){ openTlsTrust(p); });
+    if (tlsBtn) tlsBtn.addEventListener('click', function(){ openTlsTrust(p, tlsProtocol); });
     // Outbox records may be local exports waiting for an action, or copies of a
     // file Orca has already handed to a print host. Never offer a duplicate send
     // for the latter. Print arms on first click; × drops the retained copy.
@@ -6513,6 +6969,7 @@ function render(printers){
     grid.appendChild(tile);
     if (qList) qList.scrollTop = queueScrollPositions[targetKey(p)] || 0;
   });
+  applyFleetFilter();
   updateSendBtn();
 }
 
@@ -6778,28 +7235,21 @@ document.addEventListener('keydown', function(event){
 });
 
 // <connection-options>
-var connectionOptionsTarget = null, connectionOptionsSequence = 0, connectionOptionsOpener = null;
+var connectionOptionsTarget = null, connectionOptionsSequence = 0, connectionOptionsOpener = null, connectionOptionsScope = 'webui';
 function closeConnectionOptions(){
   connectionOptionsTarget = null;
   document.getElementById('connection-options').style.display = 'none';
   if (connectionOptionsOpener && document.contains(connectionOptionsOpener)) connectionOptionsOpener.focus();
   connectionOptionsOpener = null;
 }
-function openConnectionOptions(p){
+function openConnectionOptions(p, scope){
+  connectionOptionsScope = scope || 'webui';
   connectionOptionsOpener = document.activeElement;
   connectionOptionsTarget = targetIdentity(p);
   connectionOptionsTarget.requestId = ++connectionOptionsSequence;
   document.getElementById('connection-options-title').textContent = t('connectionOptions');
   document.getElementById('connection-webui-label').textContent = t('webuiAddress');
   document.getElementById('connection-webui').value = p.webui_url || '';
-  document.getElementById('connection-camera-label').textContent = t('cameraMode');
-  var select = document.getElementById('connection-camera');
-  select.options[0].textContent = t('cameraModeAuto');
-  select.options[1].textContent = t('cameraModeU1');
-  var klipper = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(p.type || '').toLowerCase()) >= 0;
-  select.options[1].disabled = !klipper;
-  select.closest('label').style.display = klipper ? '' : 'none';
-  select.value = klipper && p.camera_mode ? p.camera_mode : 'auto';
   document.getElementById('connection-options-help').textContent = t('connectionOptionsHelp');
   document.getElementById('connection-options-cancel').textContent = t('cancel');
   var save = document.getElementById('connection-options-save');
@@ -6811,9 +7261,8 @@ document.getElementById('connection-options-cancel').addEventListener('click', c
 document.getElementById('connection-options-save').addEventListener('click', function(){
   if (!connectionOptionsTarget) return;
   this.disabled = true;
-  var request = Object.assign({}, connectionOptionsTarget, {type:'connection-options-save',
-    webui_url:document.getElementById('connection-webui').value.trim(),
-    camera_mode:document.getElementById('connection-camera').value});
+  var request = Object.assign({}, connectionOptionsTarget, {type:'connection-options-save'});
+  request.webui_url = document.getElementById('connection-webui').value.trim();
   orca.postMessage(request);
 });
 document.getElementById('connection-options').addEventListener('click', function(event){
@@ -6873,6 +7322,11 @@ function camFail(key, withWindow){
 }
 function closeCamera(restoreFocus){
   var state = camState;
+  if (connectionOptionsScope === 'camera-overlay') {
+    connectionOptionsTarget = null;
+    connectionOptionsScope = 'webui';
+    camEl('cam-mode-save').disabled = false;
+  }
   if (state && state.mode === 'native')
     orca.postMessage(Object.assign({}, state.identity, {type:'camera-native-close', requestId:state.requestId}));
   camClearTimers(); camHaltImage();
@@ -6927,10 +7381,24 @@ function camStart(mode){
 }
 function openCamera(printer, opener){
   if (camState) closeCamera(false);  // one stream at a time
+  camEl('cam-mode-save').disabled = false;
   var identity = targetIdentity(printer);
-  var state = camState = {requestId:++camSeq, opener:opener, uuid:printer.target_uuid,
+  var state = camState = {requestId:++camSeq, opener:opener, uuid:printer.target_uuid, type:printer.type,
     identity:targetIdentity(printer), info:null, mode:'', frames:0, errors:0};
   camEl('cam-title').textContent = t('cameraTitle', {printer:printer.name || printer.url});
+  var klipper = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(printer.type || '').toLowerCase()) >= 0;
+  var modeWrap = camEl('cam-mode-wrap');
+  modeWrap.style.display = klipper ? 'flex' : 'none';
+  if (klipper) {
+    camEl('cam-mode-label').textContent = t('cameraMode');
+    var modeSelect = camEl('cam-mode');
+    if (modeSelect.options) {
+      modeSelect.options[0].textContent = t('cameraModeAuto');
+      modeSelect.options[1].textContent = t('cameraModeU1');
+    }
+    modeSelect.value = printer.camera_mode === 'snapmaker_u1' ? 'snapmaker_u1' : 'auto';
+    camEl('cam-mode-save').textContent = t('connectionSave');
+  }
   camEl('cam-close').setAttribute('aria-label', t('cameraClose'));
   camEl('cam-close').title = t('cameraClose');
   camEl('cam-window').textContent = t('cameraOpenWindow');
@@ -6972,15 +7440,26 @@ function onCameraNativeFrame(data){
   if (!isFinite(received) || received <= 0 || Date.now()/1000 - received > 10) return;
   state.sequence = data.sequence;
   clearTimeout(state.expiryTimer);
-  camEl('cam-img').src = data.image;
+  var img = camEl('cam-img');
+  img.onload = function(){
+    if (camState !== state || state.failed || state.sessionId !== data.sessionId || state.sequence !== data.sequence) return;
+    orca.postMessage(Object.assign({}, state.identity, {type:'camera-native-frame-ack',
+      requestId:state.requestId, sessionId:state.sessionId, sequence:data.sequence}));
+  };
+  img.onerror = function(){
+    if (camState === state && !state.failed) camFail('cameraLoadFailed', false);
+  };
+  img.src = data.image;
   var hasCaptured = data.captured_at != null && isFinite(captured) && captured > 0;
   camNote(t('cameraNativeSession') + ' · ' + t(hasCaptured ? 'cameraCapturedAt' : 'cameraReceivedAt',
     {time:new Date((hasCaptured ? captured : received)*1000).toLocaleTimeString()}), false);
   state.expiryTimer = setTimeout(function(){ if (camState === state) camFail('cameraUnavailable', false); }, 10000);
 }
 function camMarkNone(state){
-  // This printer has no camera: drop its icon until the panel is reloaded.
   noCamera[state.uuid] = true;
+  // Keep Klipper's icon available so its camera mode can still be changed.
+  if (state.type && ['moonraker','klipper','mainsail','fluidd'].indexOf(String(state.type).toLowerCase()) >= 0) return;
+  // Ordinary printers without a camera can drop the icon until reload.
   if (typeof grid === 'undefined' || !grid.querySelectorAll) return;
   Array.prototype.forEach.call(grid.querySelectorAll('.cam'), function(button){
     if (button.dataset && button.dataset.uuid === state.uuid && button.remove) button.remove(); });
@@ -7004,6 +7483,16 @@ camEl('cam-window').addEventListener('click', function(){
   closeCamera(true);
   orca.postMessage(request);
 });
+camEl('cam-mode-save').addEventListener('click', function(){
+  var state = camState;
+  if (!state || state.modeSavePending) return;
+  state.modeSavePending = true;
+  connectionOptionsTarget = Object.assign({}, state.identity, {requestId:++connectionOptionsSequence});
+  connectionOptionsScope = 'camera-overlay';
+  this.disabled = true;
+  orca.postMessage(Object.assign({}, connectionOptionsTarget, {type:'connection-options-save',
+    camera_mode:camEl('cam-mode').value}));
+});
 camEl('cam-modal').addEventListener('click', function(event){
   if (event.target === camEl('cam-modal')) closeCamera(true);
 });
@@ -7011,12 +7500,15 @@ document.addEventListener('keydown', function(event){
   if (!camState) return;
   if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); closeCamera(true); return; }
   if (event.key === 'Tab') {
-    var first = camEl('cam-close');
-    var last = camEl('cam-window').style.display === 'none' ? first : camEl('cam-window');
+    var focusable = [camEl('cam-close')];
+    if (camEl('cam-mode-wrap').style.display !== 'none')
+      focusable.push(camEl('cam-mode'), camEl('cam-mode-save'));
+    if (camEl('cam-window').style.display !== 'none') focusable.push(camEl('cam-window'));
+    var index = focusable.indexOf(document.activeElement);
     event.stopImmediatePropagation();
-    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-    else if (document.activeElement !== first && document.activeElement !== last) { event.preventDefault(); first.focus(); }
+    if (event.shiftKey && index === 0) { event.preventDefault(); focusable[focusable.length - 1].focus(); }
+    else if (!event.shiftKey && index === focusable.length - 1) { event.preventDefault(); focusable[0].focus(); }
+    else if (index < 0) { event.preventDefault(); focusable[0].focus(); }
   }
 }, true);
 document.addEventListener('visibilitychange', function(){
@@ -7365,19 +7857,39 @@ document.getElementById('f-adopt').addEventListener('change', function(e){
 
 orca.onMessage(function(data){
   if (!data) return;
+  if (data.ftpsTrustIssue) {
+    var issue = data.ftpsTrustIssue;
+    if (current.some(function(p){ return targetKey(p) === issue.key; }) &&
+        (issue.error || ftpsTrustIssues[issue.key])) {
+      if (issue.error) ftpsTrustIssues[issue.key] = issue.error;
+      else delete ftpsTrustIssues[issue.key];
+      render(current);
+    }
+  }
   if (data.tlsTrustResult && tlsDialogCard &&
       data.tlsTrustResult.requestId === tlsDialogRequest) {
     var trust = data.tlsTrustResult;
+    tlsDialogPending = false;
+    document.getElementById('tls-probe').disabled = false;
+    document.getElementById('tls-confirm').hidden = true;
+    document.getElementById('tls-confirm').style.display = 'none';
     var note = document.getElementById('tls-note');
     if (trust.error) {
       tlsDialogToken = null;
       document.getElementById('tls-confirm').disabled = true;
       note.textContent = t(trust.error);
     } else if (trust.saved) {
+      if (trust.protocol === 'ftps' && ftpsTrustIssues[targetKey(tlsDialogCard)]) {
+        delete ftpsTrustIssues[targetKey(tlsDialogCard)];
+        render(current);
+      }
       tlsDialogToken = null;
       document.getElementById('tls-confirm').disabled = true;
-      document.getElementById('tls-probe').disabled = true;
       note.textContent = t('tlsTrustSaved');
+      document.getElementById('tls-address').textContent =
+        String(trust.address || '') + ' / ' + String(trust.protocol || '').toUpperCase() + ':' + trust.port;
+      document.getElementById('tls-current').textContent = trust.observed || '';
+      document.getElementById('tls-observed').textContent = trust.observed || '';
     } else if (trust.token && trust.protocol === document.getElementById('tls-protocol').value) {
       tlsDialogToken = trust.token;
       document.getElementById('tls-address').textContent =
@@ -7387,6 +7899,9 @@ orca.onMessage(function(data){
       note.textContent = trust.old && trust.old !== trust.observed
         ? t('tlsTrustReplacement') : t('tlsTrustIntro');
       document.getElementById('tls-confirm').disabled = false;
+      document.getElementById('tls-confirm').hidden = false;
+      document.getElementById('tls-confirm').style.display = '';
+      document.getElementById('tls-details').open = true;
     }
   }
   if (data.actionRejected && Number.isSafeInteger(data.actionRejected.requestId)) {
@@ -7478,6 +7993,10 @@ orca.onMessage(function(data){
   if (data.outboxPhysicalUsage) window.lastOutboxStorage = data.outboxPhysicalUsage;
   if (data.credentialMigration) window.credentialMigration = data.credentialMigration;
   if (data.printers) {
+    var liveKeys = new Set(data.printers.map(targetKey));
+    Object.keys(ftpsTrustIssues).forEach(function(key){
+      if (!liveKeys.has(key)) delete ftpsTrustIssues[key];
+    });
     if (tlsDialogCard) {
       var previousTlsCard = tlsDialogCard;
       tlsDialogCard = data.printers.find(function(p){
@@ -7486,7 +8005,7 @@ orca.onMessage(function(data){
           p.target_selector === previousTlsCard.target_selector && p.type === 'bambu';
       }) || null;
       if (!tlsDialogCard) closeTlsTrust();
-      else document.getElementById('tls-probe').disabled = false;
+      else document.getElementById('tls-probe').disabled = tlsDialogPending;
     }
     render(data.printers); renderAvailable();
     // An open journal follows the store: a send or delete changes both lists.
@@ -7551,17 +8070,38 @@ orca.onMessage(function(data){
   }
   if (data.cameraInfo) onCameraInfo(data.cameraInfo);
   if (data.cameraNativeFrame) onCameraNativeFrame(data.cameraNativeFrame);
+  if (data.openWebuiOptions) {
+    var wanted = data.openWebuiOptions;
+    var target = current.filter(function(p){ return p.target_uuid === wanted.targetUuid &&
+      p.owner_scope_uuid === wanted.ownerScope && p.binding_revision === wanted.bindingRevision &&
+      p.target_selector === wanted.targetSelector && p.url === wanted.url && p.type === wanted.connectionType; })[0];
+    if (target) openConnectionOptions(target, 'webui');
+  }
   if (data.connectionOptionsResult && connectionOptionsTarget &&
       data.connectionOptionsResult.requestId === connectionOptionsTarget.requestId &&
       data.connectionOptionsResult.targetUuid === connectionOptionsTarget.targetUuid) {
     document.getElementById('connection-options-save').disabled = false;
-    if (data.connectionOptionsResult.ok) { closeCamera(false); closeConnectionOptions(); noCamera = {}; }
-    else document.getElementById('connection-options-help').textContent = t('connectionOptionsFailed');
+    if (data.connectionOptionsResult.ok) {
+      noCamera = {};
+      if (connectionOptionsScope === 'camera-overlay') {
+        var state = camState;
+        if (state) state.modeSavePending = false;
+        camEl('cam-mode-save').disabled = false;
+        closeCamera(false);
+      } else { closeCamera(false); closeConnectionOptions(); }
+    } else if (connectionOptionsScope === 'camera-overlay') {
+      var state = camState;
+      if (state) state.modeSavePending = false;
+      camEl('cam-mode-save').disabled = false;
+      camNote(t('connectionOptionsFailed'), true);
+    } else document.getElementById('connection-options-help').textContent = t('connectionOptionsFailed');
   }
   if (data.legacyImport) {
     var preview = data.legacyImport;
     var panel = document.getElementById('legacy-import');
-    panel.style.display = preview.available ? 'flex' : 'none';
+    panel.style.display = preview.available || preview.blocked ? 'flex' : 'none';
+    document.getElementById('legacy-import-button').hidden = !preview.available;
+    if (preview.blocked) document.getElementById('legacy-import-text').textContent = t('legacyImportBlocked');
     if (preview.available) {
       document.getElementById('legacy-import-text').textContent = t('legacyImportDetail', {
         printers:preview.printers, history:preview.history,
@@ -7638,12 +8178,16 @@ def render_page():
 # only the selected printer origin, and the iframe cannot open popups or replace
 # Orca's top-level page.
 VIEWER_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; frame-src __ORIGIN__">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-src __ORIGIN__">
 <style>html,body{margin:0;height:100%;font:12px sans-serif}body{display:flex;flex-direction:column}
-header{padding:8px;display:flex;flex-wrap:wrap;gap:6px}input{width:min(65ch,100%);box-sizing:border-box}
-p{margin:0;width:100%}iframe{border:0;width:100%;flex:1;min-height:0;display:block}</style>
-</head><body><header><input readonly aria-label="URL" value="__URL__"><p>__HELP__</p></header>
-<iframe src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe></body></html>"""
+header{padding:5px;display:flex;align-items:center;gap:6px}input{width:min(48ch,55vw);min-width:8ch;box-sizing:border-box}button{white-space:nowrap}
+#note{font-size:11px}details{padding:0 6px 5px}summary{cursor:pointer}p{margin:5px 0}iframe{border:0;width:100%;flex:1;min-height:0;display:block}</style>
+</head><body><header><input id="url" readonly aria-label="URL" value="__URL__"><button id="copy" type="button">__COPY__</button><button id="edit" type="button" __EDIT_ATTR__>__EDIT__</button><span id="note" role="status"></span></header>
+<details id="help"><summary>__HELP_LABEL__</summary><p>__HELP__</p></details>
+<iframe src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
+<script>var u=document.getElementById('url'),n=document.getElementById('note');function failed(){document.getElementById('help').open=true;u.focus();u.select();}
+document.getElementById('copy').addEventListener('click',function(){u.focus();u.select();var ok=false;try{ok=document.execCommand('copy');}catch(e){}if(ok){n.textContent=__COPIED__;return;}if(navigator.clipboard){navigator.clipboard.writeText(u.value).then(function(){n.textContent=__COPIED__;},failed);}else failed();});
+document.getElementById('edit').addEventListener('click',function(){orca.postMessage({type:'viewer-edit-address'});});</script></body></html>"""
 
 
 def validated_printer_web_url(value):
@@ -7689,7 +8233,7 @@ def validated_printer_web_url(value):
     ))
 
 
-def render_viewer_page(url):
+def render_viewer_page(url, show_edit=True):
     safe_url = validated_printer_web_url(url)
     if not safe_url:
         return ""
@@ -7702,15 +8246,17 @@ def render_viewer_page(url):
         host,
         (":" + str(parsed.port)) if parsed.port is not None else "",
     )
-    return VIEWER_PAGE.replace(
-        "__ORIGIN__",
-        html.escape(origin, quote=True),
-    ).replace(
-        "__URL__",
-        html.escape(safe_url, quote=True),
-    ).replace(
-        "__HELP__", html.escape(ui_text("webuiFallbackHelp")),
-    )
+    replacements = {
+        "__ORIGIN__": html.escape(origin, quote=True),
+        "__URL__": html.escape(safe_url, quote=True),
+        "__HELP__": html.escape(ui_text("webuiFallbackHelp")),
+        "__COPY__": html.escape(ui_text("feedbackCopy")),
+        "__EDIT__": html.escape(ui_text("connectionOptions")),
+        "__EDIT_ATTR__": "" if show_edit else "hidden",
+        "__COPIED__": json.dumps(ui_text("feedbackCopied"), ensure_ascii=True).replace("<", "\\u003c"),
+        "__HELP_LABEL__": html.escape(ui_text("webuiHelp")),
+    }
+    return re.sub(r"__[A-Z_]+__", lambda match: replacements[match.group(0)], VIEWER_PAGE)
 
 
 def validated_webui_url(value, api_url):
@@ -7907,6 +8453,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         super().__init__()
         self._status_cache = {}
         self._status_lock = threading.Lock()
+        self._poll_host_locks = weakref.WeakValueDictionary()
+        self._permission_pending_hosts = set()
         self._list_generation = 0
         self._polling = False
         self._poll_token = None
@@ -7942,8 +8490,17 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
 
     def get_config_ui(self):
         language = refresh_ui_language() or _CACHED_UI_LANGUAGE or "en"
+        # Settings can open before capability activation. Resolve the current
+        # host account without activating workers or writing any plugin state.
+        try:
+            storage = getattr(getattr(orca.host, "plugin", None), "storage", None)
+            root = storage() if callable(storage) else fallback_plugin_storage_dir()
+            scope = _history_clear_scope(root if isinstance(root, str) else "")
+        except Exception:
+            scope = ""
         clear = {"label": ui_text("cfgClearHistory"), "confirm": ui_text("cfgClearConfirm"),
-                 "cancel": ui_text("cancel"), "done": ui_text("cfgClearDone")}
+                 "cancel": ui_text("cancel"), "done": ui_text("cfgClearDone"),
+                 "scope": scope}
         return _pf_settings.build_page(_pf_settings.DASHBOARD, ui_text, language, clear)
 
     def get_default_config(self):
@@ -8257,6 +8814,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         if not lock.acquire(blocking=False):
             result(protocol, "tlsTrustBusy", requestId=request_id)
             return
+        auto_confirm = None
         try:
             current = _stored_bambu_record(printer)
             if current is None:
@@ -8280,13 +8838,18 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                     "trust_revision": int(current.get("tls_trust_revision") or 0),
                     "protocol": protocol, "old": old, "observed": observed,
                 }
-            result(protocol, token=token, old=old, observed=observed,
-                             address=_endpoint_key(current.get("url")),
-                             port=_BAMBU_TLS_PORTS[protocol], requestId=request_id)
+            if msg.get("consent") is True and (old is None or old == observed):
+                auto_confirm = {"token": token, "consent": True, "requestId": request_id}
+            else:
+                result(protocol, token=token, old=old, observed=observed,
+                       address=_endpoint_key(current.get("url")),
+                       port=_BAMBU_TLS_PORTS[protocol], requestId=request_id)
         except BambuTlsError as exc:
             result(protocol, _BAMBU_TLS_ERRORS[exc.code], requestId=request_id)
         finally:
             lock.release()
+        if auto_confirm is not None:
+            self._confirm_tls_trust(auto_confirm, page_epoch=page_epoch)
 
     def _confirm_tls_trust(self, msg, page_epoch=None):
         token = msg.get("token")
@@ -8345,17 +8908,20 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                         or not self._accept_actions
                         or not ACTION_WORKER.current_job_is_active()):
                     raise BambuTlsError("tls_trust_stale")
-                updated = dict(pins)
-                updated[protocol] = challenge["observed"]
-                record["tls_pins"] = updated
-                record["tls_trust_revision"] = challenge["trust_revision"] + 1
-                keep_name = _name_is_matchable(record)
-                record["binding_revision"] += 1
-                if keep_name:
-                    record["name_match_binding_revision"] = record["binding_revision"]
-                if not save_manual_printers(manual):
-                    raise BambuTlsError("tls_trust_save_failed")
-            result(protocol, saved=True, requestId=request_id)
+                if old != challenge["observed"]:
+                    updated = dict(pins)
+                    updated[protocol] = challenge["observed"]
+                    record["tls_pins"] = updated
+                    record["tls_trust_revision"] = challenge["trust_revision"] + 1
+                    keep_name = _name_is_matchable(record)
+                    record["binding_revision"] += 1
+                    if keep_name:
+                        record["name_match_binding_revision"] = record["binding_revision"]
+                    if not save_manual_printers(manual):
+                        raise BambuTlsError("tls_trust_save_failed")
+            result(protocol, saved=True, observed=challenge["observed"],
+                   address=_endpoint_key(record.get("url")),
+                   port=_BAMBU_TLS_PORTS[protocol], requestId=request_id)
             with self._tls_lock:
                 self._tls_challenges.clear()
                 if challenge["page_epoch"] == self._tls_epoch and self._accept_actions:
@@ -8713,7 +9279,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
 
     # on_message runs on the UI thread — host reads happen here, network/disk on workers.
     def on_message(self, msg):
-        msg = msg or {}
+        if not isinstance(msg, dict):
+            return
         kind = msg.get("type")
         if kind == "ready":
             self._cancel_u1_camera()
@@ -8725,6 +9292,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             self._refresh_async(discover_network=True)
         elif kind == "refresh":
             self._refresh_async(discover_network=True)
+        elif kind == "retry-network":
+            self._submit_ui_work(self._retry_printer_network, msg)
         elif kind == "tls-probe":
             self._submit_tls_work(self._probe_tls_trust, msg)
         elif kind == "tls-confirm":
@@ -8900,7 +9469,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             printer = resolve_printer_target(dashboard_printers(), msg)
             url = printer_webui_url(printer) if printer else ""
             if url:
-                self._open_viewer(url, msg.get("name") or printer.get("name") or url)
+                self._open_viewer(url, msg.get("name") or printer.get("name") or url, printer)
         elif kind == "feedback":
             try:
                 win = orca.host.ui.create_window(title=ui_text("feedbackButton"), html=render_feedback_page(),
@@ -8916,6 +9485,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             self._begin_u1_camera(dict(msg))
         elif kind == "camera-native-lease":
             self._renew_u1_camera(msg)
+        elif kind == "camera-native-frame-ack":
+            self._ack_u1_camera(msg)
         elif kind == "camera-native-close":
             self._cancel_u1_camera(msg)
         elif kind == "camera-info":
@@ -8982,8 +9553,10 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if card is None or not _credential_work_is_active():
                 self._connection_options_result(msg, False)
                 return
-            raw = msg.get("webui_url")
-            mode = msg.get("camera_mode")
+            has_webui = "webui_url" in msg
+            has_mode = "camera_mode" in msg
+            raw = msg.get("webui_url") if has_webui else card.get("webui_url", "")
+            mode = msg.get("camera_mode") if has_mode else card.get("camera_mode", "auto")
             if (not isinstance(raw, str) or len(raw) > 2048
                     or mode not in ("auto", "snapmaker_u1")
                     or mode == "snapmaker_u1" and backend_for_type(card.get("type")) != "moonraker"):
@@ -9019,7 +9592,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if not entry.get("running"):
                 self._release_u1_slot(entry)
         with _U1_CAMERA_CLIENTS_LOCK:
-            if _U1_CAMERA_OWNER and _U1_CAMERA_OWNER[1] is entry:
+            if _U1_CAMERA_OWNER and _U1_CAMERA_OWNER[1] is entry and not entry.get("running"):
                 _U1_CAMERA_OWNER = None
         if client:
             client.cancel()
@@ -9039,6 +9612,50 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                     and time.monotonic() < entry["lease"]):
                 entry["lease"] = time.monotonic() + 15
 
+    def _ack_u1_camera(self, msg):
+        with self._u1_camera_lock:
+            entry = self._u1_camera
+            if (not entry or not entry.get("client")
+                    or type(msg.get("requestId")) is not int
+                    or type(msg.get("bindingRevision")) is not int
+                    or msg.get("requestId") != entry["request_id"]
+                    or msg.get("sessionId") != entry["client"].id
+                    or any(msg.get(key) != entry["identity"].get(key) for key in (
+                        "targetUuid", "ownerScope", "targetSelector", "bindingRevision", "url", "connectionType"))
+                    or not entry["guard"]()):
+                return
+            entry["client"].acknowledge(msg.get("sequence"))
+
+    def _run_u1_camera_chain(self, entry):
+        global _U1_CAMERA_OWNER
+        while entry is not None:
+            with self._u1_camera_lock:
+                entry["running"] = True
+            completed = False
+            try:
+                # Each successor gets a fresh credential context, after the
+                # previous context and its transport have fully unwound.
+                _run_credential_work(entry["guard"], entry["run"])
+                completed = True
+            finally:
+                with self._u1_camera_lock:
+                    successor = entry.pop("successor", None)
+                    if (not completed or successor is None or self._u1_camera is not successor
+                            or not successor["guard"]()):
+                        if self._u1_camera is entry or self._u1_camera is successor:
+                            self._u1_camera = None
+                        self._release_u1_slot(entry)
+                        successor = None
+                    else:
+                        # The same worker retains the one global reservation;
+                        # no second job or transport is admitted during handoff.
+                        successor["slot_owned"] = entry["slot_owned"]
+                        entry["slot_owned"] = False
+                    with _U1_CAMERA_CLIENTS_LOCK:
+                        if _U1_CAMERA_OWNER and _U1_CAMERA_OWNER[1] is entry:
+                            _U1_CAMERA_OWNER = (self, successor) if successor is not None else None
+                entry = successor
+
     def _begin_u1_camera(self, msg):
         global _U1_CAMERA_OWNER
         printer = resolve_printer_target(dashboard_printers(), msg)
@@ -9049,22 +9666,9 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             self._post({"cameraNativeFrame": {"ok": False, "requestId": request_id,
                 "targetUuid": msg.get("targetUuid"), "code": "unavailable"}})
             return
-        with self._u1_camera_lock:
-            if self._u1_camera is not None:
-                existing = self._u1_camera
-                if existing["identity"] == msg and existing["request_id"] == request_id:
-                    return
-                self._cancel_u1_camera()
-            if not _U1_CAMERA_SLOT.acquire(blocking=False):
-                self._post({"cameraNativeFrame": {"ok": False, "requestId": request_id,
-                    "targetUuid": printer["target_uuid"], "code": "unavailable"}})
-                return
-            entry = {"identity": dict(msg), "request_id": request_id, "lease": time.monotonic() + 15,
-                     "page_epoch": self._credential_page_epoch, "runtime_epoch": _PLUGIN_RUNTIME_EPOCH,
-                     "root": PLUGIN_STORAGE_DIR, "client": None, "slot_owned": True, "running": False}
-            self._u1_camera = entry
-        with _U1_CAMERA_CLIENTS_LOCK:
-            _U1_CAMERA_OWNER = (self, entry)
+        entry = {"identity": dict(msg), "request_id": request_id, "lease": time.monotonic() + 15,
+                 "page_epoch": self._credential_page_epoch, "runtime_epoch": _PLUGIN_RUNTIME_EPOCH,
+                 "root": PLUGIN_STORAGE_DIR, "client": None, "slot_owned": False, "running": False}
         def guard():
             with self._u1_camera_lock:
                 current = (self._u1_camera is entry and self._accept_actions
@@ -9076,11 +9680,9 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if guard():
                 self._post({"cameraNativeFrame": {"ok": True, "requestId": request_id,
                     "targetUuid": printer["target_uuid"], **payload}})
+        entry["guard"] = guard
         def run():
-            global _U1_CAMERA_OWNER
             try:
-                with self._u1_camera_lock:
-                    entry["running"] = True
                 if not guard():
                     return
                 current = hydrate_credentials(printer)
@@ -9102,36 +9704,69 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                     entry["client"].cancel()
                     with _U1_CAMERA_CLIENTS_LOCK:
                         _U1_CAMERA_CLIENTS.discard(entry["client"])
-                with self._u1_camera_lock:
-                    if self._u1_camera is entry:
-                        self._u1_camera = None
-                self._release_u1_slot(entry)
+        entry["run"] = run
+        with self._u1_camera_lock:
+            if self._u1_camera is not None:
+                existing = self._u1_camera
+                if existing["identity"] == msg and existing["request_id"] == request_id:
+                    return
+                self._cancel_u1_camera()
+            if not _U1_CAMERA_SLOT.acquire(blocking=False):
                 with _U1_CAMERA_CLIENTS_LOCK:
-                    if _U1_CAMERA_OWNER and _U1_CAMERA_OWNER[1] is entry:
-                        _U1_CAMERA_OWNER = None
+                    owner = _U1_CAMERA_OWNER
+                    retiring = owner[1] if owner and owner[0] is self else None
+                    if retiring and retiring.get("running") and retiring["lease"] == 0:
+                        retiring["successor"] = entry
+                        self._u1_camera = entry
+                        return
+                self._post({"cameraNativeFrame": {"ok": False, "requestId": request_id,
+                    "targetUuid": printer["target_uuid"], "code": "unavailable"}})
+                return
+            entry["slot_owned"] = True
+            self._u1_camera = entry
+            with _U1_CAMERA_CLIENTS_LOCK:
+                _U1_CAMERA_OWNER = (self, entry)
         try:
-            CAMERA_WORKER.submit(lambda: _run_credential_work(guard, run))
+            CAMERA_WORKER.submit(lambda: self._run_u1_camera_chain(entry))
         except (PermissionError, RuntimeError):
             self._cancel_u1_camera()
             self._release_u1_slot(entry)
             self._post({"cameraNativeFrame": {"ok": False, "requestId": request_id,
                 "targetUuid": printer["target_uuid"], "code": "thread_denied"}})
 
-    def _open_viewer(self, url, name):
+    def _open_viewer(self, url, name, printer=None):
         # Printer web UI in its own host window — inside Orca, no external browser
         # and without hijacking the dashboard tab. Keep a reference so it lives on.
-        page = render_viewer_page(url)
+        page = render_viewer_page(url, show_edit=printer is not None)
         if not page:
             return False
+        identity = ({"targetUuid": printer.get("target_uuid"),
+                     "ownerScope": printer.get("owner_scope_uuid"),
+                     "targetSelector": printer.get("target_selector"),
+                     "bindingRevision": printer.get("binding_revision"),
+                     "url": printer.get("url"),
+                     "connectionType": printer.get("type")}
+                    if printer else None)
+        viewer_ref = {}
+        def on_viewer_message(message):
+            if (identity and isinstance(message, dict)
+                    and message.get("type") == "viewer-edit-address"):
+                # Ignore viewer-supplied printer data. The editor gets only the
+                # identity resolved by the dashboard when this window opened.
+                self._post({"openWebuiOptions": identity})
+                viewer = viewer_ref.get("window")
+                if viewer is not None and viewer.is_open():
+                    viewer.close()
         try:
             win = orca.host.ui.create_window(
                 title=(name or url)[:80], html=page,
-                width=1100, height=760, on_message=lambda m: None, on_close=lambda: None)
+                width=1100, height=760, on_message=on_viewer_message, on_close=lambda: None)
             self._viewers = [
                 viewer for viewer in self._viewers
                 if viewer is not None and viewer.is_open()
             ]
             self._viewers.append(win)
+            viewer_ref["window"] = win
             return True
         except Exception:
             return False
@@ -9422,8 +10057,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
 
     def _poll_into_worker(self, printer, batch=None, generation=None):
         try:
-            status = poll_printer(printer)
-            if not POLL_WORKERS.current_job_is_active():
+            status = self._poll_with_network_permission(printer)
+            if status is None or not POLL_WORKERS.current_job_is_active():
                 return
             printer["status"] = status
             with self._status_lock:
@@ -9460,6 +10095,44 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         finally:
             if batch is not None:
                 batch.finish_one()
+
+    def _poll_with_network_permission(self, printer):
+        backend = backend_for_type(printer.get("type") or "moonraker")
+        host = _poll_host(printer)
+        if not host or backend == "unavailable":
+            return poll_printer(printer)
+        with self._status_lock:
+            host_lock = self._poll_host_locks.setdefault(host, threading.Lock())
+        # Multiple cards or refreshes can share an address. Let the first
+        # attempt finish before another worker can open a second Orca dialog.
+        with host_lock:
+            if not POLL_WORKERS.current_job_is_active():
+                return None
+            with self._status_lock:
+                permission_pending = host in self._permission_pending_hosts
+            if permission_pending:
+                return _transport_failure_status(backend, "network_permission_denied")
+            status = poll_printer(printer)
+            if status.get("error_code") == "network_permission_denied":
+                with self._status_lock:
+                    self._permission_pending_hosts.add(host)
+            return status
+
+    def _retry_printer_network(self, message):
+        printer = resolve_printer_target(dashboard_printers(), message)
+        host = _poll_host(printer) if printer else None
+        with self._status_lock:
+            if host not in self._permission_pending_hosts:
+                return
+            self._permission_pending_hosts.remove(host)
+            generation = self._list_generation
+        # Orca 2.5 does not report the user's answer to the worker. Retry only
+        # the address the user selected, without prompting for other cards.
+        try:
+            POLL_WORKERS.submit(self._poll_into, printer, None, generation)
+        except (PermissionError, RuntimeError):
+            with self._status_lock:
+                self._permission_pending_hosts.add(host)
 
     def _finish_poll_batch(self, printers, on_complete=None, generation=None):
         try:
@@ -9550,21 +10223,37 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 len(printers),
                 lambda: self._finish_poll_batch(printers, on_complete, generation),
             )
-            for printer in printers:
+            groups = {}
+            for index, printer in enumerate(printers):
+                groups.setdefault(_poll_host(printer) or index, []).append(printer)
+            for group in groups.values():
                 try:
-                    POLL_WORKERS.submit(self._poll_into, printer, batch, generation)
+                    POLL_WORKERS.submit(self._poll_host_group, group, batch, generation)
                 except (PermissionError, RuntimeError):
-                    printer["status"] = _poll_failure_status(
-                        backend_for_type(printer.get("type")),
-                        PermissionError("background work denied"),
-                    )
-                    batch.finish_one()
+                    for printer in group:
+                        printer["status"] = _poll_failure_status(
+                            backend_for_type(printer.get("type")),
+                            PermissionError("background work denied"),
+                        )
+                        batch.finish_one()
         if not discover:
             return
         try:
             POLL_WORKERS.submit(self._discover_and_push, list(printers), generation)
         except (PermissionError, RuntimeError):
             pass
+
+    def _poll_host_group(self, printers, batch, generation):
+        # A shared server (for example Repetier) uses one worker per batch.
+        # Other addresses keep their own workers, even if that server is slow.
+        completed = 0
+        try:
+            for printer in printers:
+                completed += 1
+                self._poll_into(printer, batch, generation)
+        finally:
+            for _ in range(completed, len(printers)):
+                batch.finish_one()
 
     def _prepare_outbox_start(self, msg):
         scheduler, generation = self._ensure_action_scheduler()
@@ -9727,6 +10416,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         self._journal_finish(dispatch, result)
         if not self._work_is_active():
             return
+        self._post_ftps_trust_issue(printer, result)
         if result.get("ok"):
             # Written by Print Farm itself, with the digest of the file it sent:
             # the journal can offer this stored copy again without guessing.
@@ -10251,6 +10941,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             self._journal_finish(dispatch, result)
             if not self._work_is_active():
                 return
+            self._post_ftps_trust_issue(current, result)
             if result.get("ok"):
                 ok += 1
             else:
@@ -10262,6 +10953,18 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         self._post_status(text)
         self._refresh_worker(None)
         return fail == 0 and ok == len(selected) and ok > 0
+
+    def _post_ftps_trust_issue(self, printer, result):
+        if printer.get("type") != "bambu":
+            return
+        needs_trust = (result.get("evidence_ref") == "tls:pre_dispatch"
+                       and result.get("error_code") in {
+                           "tls_trust_required", "tls_certificate_changed", "tls_trust_stale"})
+        if needs_trust or result.get("ok"):
+            key = ":".join(str(printer.get(field) or "") for field in
+                           ("owner_scope_uuid", "target_uuid", "binding_revision"))
+            self._post({"ftpsTrustIssue": {
+                "key": key, "error": operation_error_text(result) if needs_trust else ""}})
 
     def _post_status(self, text):
         self._post({"status": text})
@@ -10284,18 +10987,8 @@ _GRANTABLE_HOST = re.compile(r"[A-Za-z0-9.:-]+")
 MAX_LOAD_TIME_ORIGINS = 64
 
 
-def saved_printer_origins():
-    """Origins of saved printers, read without side effects for the load-time grant.
-
-    Orca reduces a network grant to scheme://host and applies it to the
-    printer's sockets too, so one dialog at start covers every saved printer.
-    """
+def _origins_of_store(path):
     try:
-        storage = getattr(getattr(getattr(orca, "host", None), "plugin", None), "storage", None)
-        root = storage() if callable(storage) else ""
-        if not isinstance(root, str) or not root:
-            return []
-        path = os.path.join(os.path.abspath(root), "printers.json")
         with open(path, "r", encoding="utf-8") as fh:
             cards = json.load(fh)
     except Exception:
@@ -10316,26 +11009,69 @@ def saved_printer_origins():
         origin = "%s://%s" % (parts.scheme, "[%s]" % host if ":" in host else host)
         if origin not in origins:
             origins.append(origin)
+    return origins
+
+
+def saved_printer_origins():
+    """Origins of saved printers, read without side effects for the load-time grant.
+
+    Orca reduces a network grant to scheme://host and applies it to the
+    printer's sockets too, so one dialog at start covers every saved printer.
+    Printers still waiting in an older storage folder for the explicit import
+    are included, so that importing them does not start a round of questions.
+    """
+    try:
+        storage = getattr(getattr(getattr(orca, "host", None), "plugin", None), "storage", None)
+        root = storage() if callable(storage) else ""
+        if not isinstance(root, str) or not root:
+            return []
+        roots = [os.path.abspath(root)]
+        for legacy in (fallback_plugin_storage_dir(), PLUGIN_DIR):
+            if legacy and os.path.abspath(legacy) not in roots:
+                roots.append(os.path.abspath(legacy))
+    except Exception:
+        return []
+    origins = []
+    for folder in roots:
+        for origin in _origins_of_store(os.path.join(folder, "printers.json")):
+            if origin not in origins:
+                origins.append(origin)
     return origins[:MAX_LOAD_TIME_ORIGINS]
 
 
 def declare_host_permissions():
+    """Ask once, while loading, for everything the plugin does in normal use.
+
+    OrcaSlicer interrupts any later action that was not declared here with a
+    dialog of its own, and a worker thread has to refuse that action meanwhile.
+    The request covers: the hosts of the saved printers (HTTP and raw sockets),
+    the Bambu discovery listener, and background threads. Files stay inside the
+    plugin's own storage folder, which needs no declaration.
+    """
     request = getattr(orca, "request_permissions", None)
     if not callable(request):
         return
+    discovery = {"network_socket": [str(BAMBU_DISCOVERY_ADDRESS)], "threading": True}
     origins = saved_printer_origins()
-    if origins:
+    attempts = ([dict(discovery, network=origins)] if origins else []) + [
+        discovery, {"threading": True}]
+    for arguments in attempts:
         try:
-            request(network=origins, threading=True)
+            request(**arguments)
             return
         except (TypeError, ValueError):
-            # An older host without network grants, or one rejecting an address:
-            # printers then ask on first use, as before.
-            pass
+            # An older host without that permission, or one rejecting an address:
+            # try the smaller request; what is left asks on first use, as before.
+            continue
+
+
+def preload_credential_provider():
+    """Import the system credential provider while loading, when nothing is asked.
+
+    A missing or broken provider is handled later, when a credential is used."""
     try:
-        request(threading=True)
-    except TypeError:
-        # Older hosts do not accept the threading permission argument.
+        _pf_credentials.preload()
+    except Exception:
         pass
 
 
@@ -10343,6 +11079,7 @@ def declare_host_permissions():
 class PrintersPlugin(orca.base):
     def register_capabilities(self):
         declare_host_permissions()
+        preload_credential_provider()
         if not host_capability_lifecycle_available():
             start_plugin_runtime()
         orca.register_capability(PrintersDashboard)

@@ -198,7 +198,7 @@ def _number(value):
     return value if type(value) in (int, float) and math.isfinite(value) else None
 
 
-def poll(base, ctx, apikey="", *, slug=""):
+def poll(base, ctx, apikey="", *, slug="", raise_if_access_denied=None):
     status = {"online": False, "state": "unknown", "job_state": "unknown", "nozzle": None,
               "target_nozzle": None, "bed": None, "target_bed": None, "progress": None,
               "filename": "", "thumbnail": "", "upload_ready": False, "can_start": False,
@@ -252,6 +252,8 @@ def poll(base, ctx, apikey="", *, slug=""):
             status["upload_reason"] = status["control_reason"] = "repetierNotReady"
         return status
     except AdapterError as exc:
+        if raise_if_access_denied is not None:
+            raise_if_access_denied(exc)
         status.update(online=False, upload_ready=False, can_start=False, can_control=False,
                       error_code=exc.code)
         return status

@@ -108,8 +108,9 @@ class _AdapterError(Exception):
 # Public interface
 # --------------------------------------------------------------------------
 
-def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "", *, serial_number: str = "") -> dict:
-    """Read-only status via ``POST /detail``. Never raises, never actuates.
+def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "", *,
+         serial_number: str = "", raise_if_access_denied=None) -> dict:
+    """Read-only status via ``POST /detail``. The optional callback can surface a host denial.
 
     ``base`` is ``http://host`` (port 8898 implied) or ``http://host:port``.
     ``secret`` is the check code; ``serial_number`` is the printer serial.
@@ -135,6 +136,8 @@ def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "",
         _apply_write_gate(status, pid)
         return status
     except _AdapterError as exc:
+        if raise_if_access_denied is not None:
+            raise_if_access_denied(exc)
         status["error_code"] = exc.code
         if exc.code not in ("connection_failed", "timeout"):
             status["state"] = "unknown"

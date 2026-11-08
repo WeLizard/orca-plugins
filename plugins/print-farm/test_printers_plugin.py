@@ -668,6 +668,31 @@ class PrintersOutboxTest(unittest.TestCase):
         self.assertNotIn("Previous release marker.", notes)
 
 
+class OutboxEffectiveSettingsTest(unittest.TestCase):
+    def test_each_export_uses_its_effective_settings_without_caching_them(self):
+        plugin = _load_plugin(initialize_test_storage=False)
+        capability = plugin.PrintersOutbox()
+        kind = plugin._pf_settings.OUTBOX
+        capability.get_config = mock.Mock(side_effect=[
+            '{"keep_copies": false, "keep_last": 3}',
+            '{"keep_copies": true, "keep_last": 5}',
+            '{"keep_copies": false, "keep_last": 1}',
+        ])
+        outside_export = plugin.plugin_settings(kind)
+        ctx = types.SimpleNamespace(step="post-process", gcode_path="slice.gcode")
+        record = {"name": "slice.gcode"}
+        with (mock.patch.object(plugin.os.path, "exists", return_value=True),
+              mock.patch.object(plugin, "outbox_add", return_value=record) as copy,
+              mock.patch.object(plugin, "prune_outbox_keep_last") as prune):
+            self.assertEqual(capability.execute(ctx)[0], "success")
+            self.assertEqual(capability.execute(ctx),
+                             ("skipped", plugin.ui_text("outboxCopiesOff")))
+        copy.assert_called_once()
+        prune.assert_called_once_with(5, record)
+        self.assertEqual(plugin.plugin_settings(kind), outside_export)
+        self.assertEqual(capability.get_config.call_count, 3)
+
+
 class PluginStorageTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1452,6 +1477,7 @@ class PluginStorageTest(unittest.TestCase):
 
         ftp = object.__new__(self.plugin._implicit_ftps_class())
         ftp._prot_p = True
+        ftp.passiveserver = False  # the passive-by-name path has its own audit test
         ftp.host = "printer"
         ftp._bambu_printer = self._bambu_printer()
         ftp.sock = types.SimpleNamespace(session="control-session")
@@ -3597,9 +3623,9 @@ var document = { activeElement: null,
   getElementById: function(id){ return ids[id] || (ids[id] = new El(id)); },
   createElement: function(tag){ return new El(tag); }, contains: function(){ return true; },
   addEventListener: function(type, fn){ document.l = document.l || {}; (document.l[type] = document.l[type] || []).push(fn); },
-  key: function(key, extra){ var ev = Object.assign({key:key, preventDefault:function(){},
+  key: function(key, extra){ var ev = Object.assign({key:key, preventDefault:function(){ this.prevented = true; },
       stopImmediatePropagation:function(){}}, extra || {});
-    ((document.l || {}).keydown || []).forEach(function(fn){ fn(ev); }); } };
+    ((document.l || {}).keydown || []).forEach(function(fn){ fn(ev); }); return ev; } };
 var posted = [];
 var orca = { postMessage: function(m){ posted.push(m); } };
 function t(key, vars){ return key; }
@@ -4365,6 +4391,81 @@ class SharedJobStatsTest(unittest.TestCase):
         self.assertNotIn("<b>", hostile)
 
 
+class PrinterNetworkPermissionTest(unittest.TestCase):
+    def test_audit_denial_is_distinct_from_offline_and_clears_on_next_poll(self):
+        plugin = _load_plugin(initialize_test_storage=False)
+        printer = {"type": "octoprint", "url": "http://printer.local"}
+        denied = PermissionError(
+            'Plugin attempted audited operation "urllib.Request" without permission'
+            ': network access denied: http://printer.local/api/printer?token=private')
+        accepted = {"online": True, "state": "idle"}
+        with mock.patch.object(plugin, "poll_octoprint",
+                               side_effect=[denied, accepted]) as poll:
+            blocked = plugin.poll_printer(printer)
+            self.assertEqual(blocked["error_code"], "network_permission_denied")
+            self.assertEqual(blocked["error"], plugin.ui_text("networkPermissionRequired"))
+            self.assertNotIn("private", blocked["error"])
+            self.assertEqual(blocked["state"], "unknown")
+            self.assertIsNone(blocked["online"])
+            self.assertIsNone(blocked["transport_online"])
+            poll.assert_called_once()
+            status = plugin.poll_printer(printer)
+        self.assertTrue(status["online"])
+        self.assertEqual(status["error"], "")
+
+    def test_wrapped_socket_audit_denial_reaches_bambu_status(self):
+        plugin = _load_plugin(initialize_test_storage=False)
+        denied = urllib.error.URLError(PermissionError(
+            'Plugin attempted audited operation "socket.connect" without permission'))
+        printer = {"type": "bambu", "url": "http://printer.local", "apikey": "fake"}
+        with mock.patch.object(plugin, "_bambu_pin"), \
+                mock.patch.object(plugin, "_connect_tcp", side_effect=denied):
+            status = plugin.poll_printer(printer)
+        self.assertEqual(status["error_code"], "network_permission_denied")
+        self.assertIsNone(status["online"])
+
+    def test_adapter_status_preserves_network_denial_without_reclassifying_offline(self):
+        plugin = _load_plugin(initialize_test_storage=False)
+        denied = 'Plugin attempted audited operation "http.client.connect" without permission'
+        for kind in ("crealityprint", "duet", "prusalink", "repetier", "flashforge"):
+            printer = {"type": kind, "url": "http://printer.local", "apikey": "fake",
+                       "serial": "SN123", "repetier_slug": "printer"}
+            target = (plugin._pf_creality if kind == "crealityprint"
+                      else http.client.HTTPConnection)
+            method = "_connect_tcp" if kind == "crealityprint" else "endheaders"
+            for error, code, online in (
+                (PermissionError(denied), "network_permission_denied", None),
+                (ConnectionRefusedError(), "connection_failed", False),
+            ):
+                with self.subTest(kind=kind, error=type(error).__name__):
+                    with (mock.patch.object(target, method, side_effect=error) as request,
+                          mock.patch.object(plugin, "hydrate_credentials", return_value=dict(printer))):
+                        status = plugin.poll_printer(printer)
+                    request.assert_called_once()
+                    self.assertIs(status["online"], online)
+                    self.assertEqual(status["error_code"], code)
+
+    def test_permission_guidance_is_visible_in_dashboard_settings(self):
+        plugin = _load_plugin(initialize_test_storage=False)
+        help_text = plugin.ui_text("networkPermissionRequired")
+        self.assertIn(help_text, plugin.PrintersDashboard().get_config_ui())
+        self.assertNotIn(help_text, plugin.PrintersOutbox().get_config_ui())
+
+    def test_other_denials_are_not_network_grants(self):
+        plugin = _load_plugin(initialize_test_storage=False)
+        endpoint = "http://printer.local"
+        errors = (
+            (urllib.error.HTTPError(endpoint, 403, "Forbidden", None, None), "authorization_denied"),
+            (PermissionError(13, "Permission denied"), "network_error"),
+            (ConnectionRefusedError(), "network_error"),
+            (PermissionError('Plugin attempted audited operation "open" without permission'),
+             "network_error"),
+        )
+        for error, expected in errors:
+            with self.subTest(error=error):
+                self.assertEqual(plugin.transport_error_code(error), expected)
+
+
 class CameraLookupTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -4567,6 +4668,7 @@ function advance(ms){ var end = clock + ms;
 function targetIdentity(p){ return {targetUuid:p.target_uuid, ownerScope:'o', url:p.url, connectionType:p.type}; }
 var P1 = {target_uuid:'u1', name:'Voron', url:'http://v.local', type:'moonraker'};
 var P2 = {target_uuid:'u2', name:'Octo', url:'http://o.local', type:'octoprint'};
+var connectionOptionsTarget = null, connectionOptionsScope = 'webui';
 var img = document.getElementById('cam-img'), modal = document.getElementById('cam-modal');
 var note = document.getElementById('cam-note'), win = document.getElementById('cam-window');
 var closeBtn = document.getElementById('cam-close');
@@ -4624,6 +4726,36 @@ report();""" % closer)
             self.assertEqual(out["display"], "none", closer)
             self.assertEqual(out["loads"], ["http://v.local/s"], closer)
             self.assertTrue(out["focus"], closer)
+
+    def test_mode_controls_are_included_in_camera_overlay_tab_order(self):
+        out = self.run_js("""
+openCamera(P1, opener);
+var mode = document.getElementById('cam-mode'), save = document.getElementById('cam-mode-save');
+var close = document.getElementById('cam-close');
+close.focus(); var fromClose = document.key('Tab');
+mode.focus(); var fromMode = document.key('Tab');
+save.focus(); var wrapForward = document.key('Tab');
+var forward = wrapForward.prevented && document.activeElement === close;
+close.focus(); var wrapReverse = document.key('Tab', {shiftKey:true});
+report({interiorAllowed:!fromClose.prevented && !fromMode.prevented,
+  forward:forward, reverse:wrapReverse.prevented && document.activeElement === save});""")
+        self.assertEqual(out["interiorAllowed"], True)
+        self.assertEqual(out["forward"], True)
+        self.assertEqual(out["reverse"], True)
+
+    def test_closing_overlay_invalidates_pending_mode_save_and_resets_control(self):
+        out = self.run_js("""
+openCamera(P1, opener);
+connectionOptionsTarget = {targetUuid:'u1', requestId:99}; connectionOptionsScope = 'camera-overlay';
+document.getElementById('cam-mode-save').disabled = true;
+closeBtn.fire('click');
+var invalidated = connectionOptionsTarget === null;
+openCamera(P1, opener);
+report({invalidated:invalidated, enabled:!document.getElementById('cam-mode-save').disabled,
+  activeRequest:camState.requestId});""")
+        self.assertTrue(out["invalidated"])
+        self.assertTrue(out["enabled"])
+        self.assertNotEqual(out["activeRequest"], 99)
 
     def test_card_clicks_inside_the_dialog_do_not_close_it(self):
         out = self.run_js("""
@@ -4721,19 +4853,19 @@ document.key('Tab');
 report({onClose: document.activeElement === closeBtn});""")
         self.assertTrue(out["onClose"])
 
-    def test_no_camera_hides_the_icon_until_reload(self):
+    def test_no_camera_keeps_klipper_icon_for_mode_access_but_hides_octoprint(self):
         out = self.run_js("""
 var btn1 = new El('button'); btn1.dataset = {uuid:'u1'}; btn1.remove = function(){ this.gone = true; };
 var btn2 = new El('button'); btn2.dataset = {uuid:'u2'}; btn2.remove = function(){ this.gone = true; };
 var grid = {querySelectorAll: function(){ return [btn1, btn2].filter(function(b){ return !b.gone; }); }};
 openCamera(P1, opener); reply(1, {ok:false, code:'no_camera', stream:'', snapshot:''});
 var first = {gone1: !!btn1.gone, gone2: !!btn2.gone, mem: JSON.stringify(noCamera)};
-openCamera(P2, opener); onCameraInfo({requestId:2, targetUuid:'u2', ok:false, code:'unavailable'});
+openCamera(P2, opener); onCameraInfo({requestId:2, targetUuid:'u2', ok:false, code:'no_camera'});
 report({first: first, gone2: !!btn2.gone, mem: JSON.stringify(noCamera)});""")
-        self.assertEqual(out["first"], {"gone1": True, "gone2": False, "mem": '{"u1":true}'})
-        self.assertEqual(out["note"], "cameraUnavailable")
-        self.assertFalse(out["gone2"])  # a failed lookup is not "no camera"
-        self.assertEqual(out["mem"], '{"u1":true}')
+        self.assertEqual(out["first"], {"gone1": False, "gone2": False, "mem": '{"u1":true}'})
+        self.assertEqual(out["note"], "cameraNone")
+        self.assertTrue(out["gone2"])
+        self.assertEqual(out["mem"], '{"u1":true,"u2":true}')
 
     def test_page_wires_the_button_only_for_camera_types(self):
         page = self.plugin_page()
@@ -4742,7 +4874,8 @@ report({first: first, gone2: !!btn2.gone, mem: JSON.stringify(noCamera)});""")
         self.assertIn('role="dialog" aria-modal="true" aria-labelledby="cam-title"', page)
         self.assertNotIn("innerHTML", page[page.index("// <camera-overlay>"):page.index("// </camera-overlay>")])
         card = page[page.index("CAMERA_TYPES.indexOf"):page.index("// Bambu has no LAN")]
-        self.assertIn("&& !noCamera[p.target_uuid]", card)
+        self.assertIn("(!noCamera[p.target_uuid] || klipperCamera)", card)
+        self.assertNotIn("connection-options ghost", page)
         self.assertIn("class=\"cam ghost\"", card)
         self.assertNotIn("p.url", card)
 
@@ -4849,16 +4982,18 @@ t = function(key){ return key; };
 var ADAPTER_TYPES = ['duet', 'flashforge', 'crealityprint', 'prusalink'];
 var ACTIVE_TYPES = ['moonraker', 'klipper', 'octoprint', 'bambu', 'duet', 'flashforge'];
 var CAMERA_TYPES = ['moonraker', 'klipper', 'octoprint', 'bambu'], noCamera = {};
-var current = [], selected = {};
+var current = [], selected = {}, ftpsTrustIssues = {};
 function targetKey(p){ return p.target_uuid; }
 function statusControlReady(p, action){ return true; }
 """ + _page_slice("function stateKind(s){", "function statusControlReady(p, action){") \
             + _page_slice("function cardActionsHtml(parts){", "function render(printers){") + r"""
 function build(p, noCam){
   var s = p.status, supported = true;
+  var tlsProtocol = tlsIssueProtocol(p, s);
   var multiTool = Array.isArray(s.tools) && s.tools.length > 1; noCamera = noCam ? {u: true} : {};
   var tile = {innerHTML: ''};
-""" + _page_slice("    var kind = stateKind(s);", "    var selBox") + r"""
+""" + _page_slice("    var networkAccessDenied", "\n    if (networkAccessDenied)") + "\n" \
+            + _page_slice("    var kind = stateKind(s);", "    var selBox") + r"""
   return tile.innerHTML;
 }
 function rowsOf(html){   // [{cls, items:[button/label classes in order]}]
@@ -4891,9 +5026,9 @@ var out = {};
 out.moon = rowsOf(build(P('moonraker', 'standby'), false));
 out.bambu = rowsOf(build(P('bambu', 'idle'), false));""")
         self.assertEqual(out["moon"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "connection-options", "print", "cam", "open"]}])
+                         ["select-control", "history", "print", "cam", "open"]}])
         self.assertEqual(out["bambu"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "print", "tls-trust", "cam"]}])
+                         ["select-control", "history", "print", "cam"]}])
         self.assertFalse(out["moon"]["empty"] or out["bambu"]["empty"])
 
     def test_feedback_page_offers_copy_with_confirmation_and_no_navigation(self):
@@ -4907,15 +5042,50 @@ out.bambu = rowsOf(build(P('bambu', 'idle'), false));""")
         self.assertIn(plugin.ui_text("feedbackCopied"), page)
 
     def test_bambu_card_highlights_certificates_only_when_trust_is_missing(self):
-        out = self.cards("""
+        out = self.cards(r"""
 var needed = P('bambu', 'offline', false); needed.status.error_code = 'tls_trust_required';
 var fine = P('bambu', 'idle');
 var other = P('moonraker', 'offline', false); other.status.error_code = 'tls_trust_required';
 out.needed = /class="tls-trust primary"/.test(build(needed, false));
-out.fine = /class="tls-trust ghost"/.test(build(fine, false));
+out.fine = /class="tls-trust\b/.test(build(fine, false));
 out.other = tlsTrustNeeded(other, other.status);
-out.flag = tlsTrustNeeded(needed, needed.status);""")
-        self.assertEqual(out, {"needed": True, "fine": True, "other": False, "flag": True})
+out.flag = tlsIssueProtocol(needed, needed.status);
+ftpsTrustIssues[targetKey(fine)] = 'Certificate changed';
+out.ftps = /class="tls-trust primary"/.test(build(fine, false));
+out.protocol = tlsIssueProtocol(fine, fine.status);
+fine.binding_revision = 2;
+out.rebound = tlsIssueProtocol(fine, fine.status);""")
+        self.assertEqual(out, {"needed": True, "fine": False, "other": False,
+                               "flag": "mqtt", "ftps": True, "protocol": "ftps", "rebound": ""})
+
+    def test_fleet_filter_keeps_counts_and_selection_when_cards_are_hidden(self):
+        out = self.cards("""
+var printers = [P('bambu', 'running'), P('moonraker', 'standby'),
+                P('octoprint', 'paused'), P('bambu', 'finished'),
+                P('moonraker', 'unknown')];
+printers[4].status.online = null;
+printers.push(P('octoprint', 'unknown'));
+printers[5].status.authorization = 'rejected';
+current = printers;
+selected.keep = true;
+var tiles = printers.map(function(p){ return {dataset:{fleetStatus:fleetStatus(p)}}; });
+var buttons = ['printing', 'idle', 'attention'].map(function(filter){
+  var b = new El('button'); b.dataset = {fleetFilter:filter}; return b;
+});
+var grid = {querySelectorAll:function(){ return tiles; }};
+fleetSummary.querySelectorAll = function(){ return buttons; };
+fleetSummary.fire('click', {target:buttons[1]});
+out.counts = buttons.map(function(b){ return b.textContent; });
+out.pressed = buttons.map(function(b){ return b.getAttribute('aria-pressed'); });
+out.visible = tiles.map(function(tile){ return !tile.hidden; });
+out.selection = [selected.keep, current === printers];
+fleetSummary.fire('click', {target:buttons[1]});
+out.cleared = tiles.every(function(tile){ return !tile.hidden; });
+""")
+        self.assertEqual(out, {"counts": ["fleetPrinting 1", "fleetIdle 2", "fleetAttention 2"],
+                               "pressed": ["false", "true", "false"],
+                               "visible": [False, True, False, True, False, False],
+                               "selection": [True, True], "cleared": True})
 
     def test_missing_camera_or_open_keeps_the_single_row_intact(self):
         out = self.cards("""
@@ -4923,11 +5093,11 @@ var u = P('moonraker', 'standby'); u.type = 'prusalink'; u.status.backend = 'pru
 out.nocam = rowsOf(build(P('moonraker', 'standby'), true));
 out.nocamOpen = rowsOf(build(P('bambu', 'standby'), true));
 out.nocamIdleOnlyOpen = rowsOf(build(u, false));""")
-        self.assertEqual(out["nocam"]["rows"][0]["items"], ["select-control", "history", "connection-options", "print", "open"])
+        self.assertEqual(out["nocam"]["rows"][0]["items"], ["select-control", "history", "print", "cam", "open"])
         self.assertEqual(out["nocamOpen"]["rows"], [{"cls": "row", "items":
-                         ["select-control", "history", "print", "tls-trust"]}])
+                         ["select-control", "history", "print"]}])
         self.assertEqual(out["nocamIdleOnlyOpen"]["rows"][0]["items"],
-                         ["select-control", "history", "connection-options", "print", "open"])
+                         ["select-control", "history", "print", "open"])
 
     def test_offline_card_keeps_the_disabled_actions_in_the_same_row(self):
         out = self.cards("""
@@ -4935,8 +5105,19 @@ var html = build(P('moonraker', 'offline', false), false);
 out.rows = rowsOf(html); out.disabledPrint = /<button class="print ghost" disabled/.test(html);""")
         self.assertEqual(len(out["rows"]["rows"]), 1)
         self.assertEqual(out["rows"]["rows"][0]["items"],
-                         ["select-control", "history", "connection-options", "print", "cam", "open"])
+                         ["select-control", "history", "print", "cam", "open"])
         self.assertTrue(out["disabledPrint"])
+
+    def test_permission_denial_explains_why_print_is_disabled(self):
+        out = self.cards("""
+var offline = P('moonraker', 'offline', false);
+var denied = P('moonraker', 'unknown', false);
+denied.status.error_code = 'network_permission_denied';
+denied.status.error = 'Grant printer access, then refresh.';
+out.offline = /<button class="print ghost" disabled title="printerNotOnline"/.test(build(offline, false));
+out.denied = /<button class="print ghost" disabled title="Grant printer access, then refresh[.]"/.test(build(denied, false));
+""")
+        self.assertEqual(out, {"offline": True, "denied": True})
 
     def test_printing_keeps_history_and_stop_together_without_select_or_print(self):
         out = self.cards("""
@@ -4944,12 +5125,12 @@ out.moon = rowsOf(build(P('moonraker', 'printing'), false));
 out.paused = rowsOf(build(P('octoprint', 'paused'), false));
 out.bambu = rowsOf(build(P('bambu', 'printing'), true));""")
         self.assertEqual(out["moon"]["rows"], [
-            {"cls": "ctl-row", "items": ["history", "connection-options", "ctl-slot", "ctl", "ctl"]},
+            {"cls": "ctl-row", "items": ["history", "ctl-slot", "ctl", "ctl"]},
             {"cls": "row", "items": ["cam", "open"]}])
-        self.assertEqual(out["paused"]["rows"][0]["items"], ["history", "connection-options", "ctl-slot", "ctl", "ctl"])
+        self.assertEqual(out["paused"]["rows"][0]["items"], ["history", "ctl-slot", "ctl", "ctl"])
         # Nothing left for the second row: it is not drawn at all.
         self.assertEqual(out["bambu"]["rows"], [{"cls": "ctl-row",
-                                                  "items": ["history", "tls-trust", "ctl-slot", "ctl", "ctl"]}])
+                                                  "items": ["history", "ctl-slot", "ctl", "ctl"]}])
         for key in ("moon", "paused", "bambu"):
             self.assertFalse(out[key]["empty"])
 
@@ -4958,7 +5139,7 @@ out.bambu = rowsOf(build(P('bambu', 'printing'), true));""")
 var p = P('octoprint', 'printing'); statusControlReady = function(){ return false; };
 out.rows = rowsOf(build(p, true));""")
         self.assertEqual(len(out["rows"]["rows"]), 1)
-        self.assertEqual(out["rows"]["rows"][0]["items"], ["history", "connection-options", "open"])
+        self.assertEqual(out["rows"]["rows"][0]["items"], ["history", "open"])
 
     def test_row_css_pushes_actions_right_and_selection_left(self):
         page = _load_plugin().PAGE
@@ -5608,6 +5789,19 @@ class OutboxHintUiTest(unittest.TestCase):
         self.assertEqual(hidden, ["none", "", ""])
 
 
+class DashboardHostMessageTest(unittest.TestCase):
+    def test_non_object_host_messages_do_not_reach_the_dispatcher(self):
+        plugin = _load_plugin(pages=True, initialize_test_storage=False)
+        dashboard = plugin.PrintersDashboard()
+        with mock.patch.object(dashboard, "_refresh_async") as refresh:
+            for message in (None, "refresh", ["refresh"], True, 1, {}):
+                with self.subTest(message=message):
+                    dashboard.on_message(message)
+            refresh.assert_not_called()
+            dashboard.on_message({"type": "refresh"})
+            refresh.assert_called_once_with(discover_network=True)
+
+
 class ThreadPermissionSafetyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -6225,6 +6419,44 @@ class BambuTlsTrustTest(unittest.TestCase):
         dashboard._probe_tls_trust(dict(self.identity(), protocol=protocol))
         return posted[-1]["tlsTrustResult"]["token"]
 
+    def test_read_and_trust_first_certificate_is_one_consent_and_protocol_scoped(self):
+        self.card["tls_pins"].pop("mqtt")
+        self.plugin.save_manual_printers([self.card])
+        observed = hashlib.sha256(b"initial certificate").hexdigest()
+        dashboard, posted = self.plugin.PrintersDashboard(), []
+        dashboard._post = posted.append
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value=observed) as probe, \
+             mock.patch.object(dashboard, "_refresh_worker"):
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt", consent=True, requestId=7))
+        self.assertEqual(probe.call_count, 2)
+        self.assertTrue(posted[-1]["tlsTrustResult"]["saved"])
+        self.assertFalse(any("token" in item["tlsTrustResult"] for item in posted))
+        saved = self.plugin.load_manual_printers()[0]
+        self.assertEqual(saved["tls_pins"]["mqtt"], observed)
+        self.assertEqual(saved["tls_pins"]["ftps"], self.card["tls_pins"]["ftps"])
+
+    def test_read_and_trust_never_replaces_changed_pin_without_second_consent(self):
+        original = self.plugin.load_manual_printers()[0]
+        observed = hashlib.sha256(b"replacement certificate").hexdigest()
+        dashboard, posted = self.plugin.PrintersDashboard(), []
+        dashboard._post = posted.append
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", return_value=observed) as probe:
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt", consent=True, requestId=8))
+        self.assertEqual(probe.call_count, 1)
+        self.assertIn("token", posted[-1]["tlsTrustResult"])
+        self.assertEqual(self.plugin.load_manual_printers()[0], original)
+
+    def test_read_and_trust_refuses_certificate_changed_between_observations(self):
+        self.card["tls_pins"].pop("mqtt")
+        self.plugin.save_manual_printers([self.card])
+        dashboard, posted = self.plugin.PrintersDashboard(), []
+        dashboard._post = posted.append
+        with mock.patch.object(self.plugin, "_probe_bambu_certificate", side_effect=[
+                hashlib.sha256(b"first").hexdigest(), hashlib.sha256(b"second").hexdigest()]):
+            dashboard._probe_tls_trust(dict(self.identity(), protocol="mqtt", consent=True, requestId=9))
+        self.assertEqual(posted[-1]["tlsTrustResult"]["error"], "tlsTrustStale")
+        self.assertNotIn("mqtt", self.plugin.load_manual_printers()[0]["tls_pins"])
+
     def test_dashboard_denies_embedded_frames_objects_and_base_replacement(self):
         page = self.plugin.render_page()
         self.assertIn("frame-src 'none'; object-src 'none'; base-uri 'none'", page)
@@ -6381,24 +6613,32 @@ class BambuTlsTrustTest(unittest.TestCase):
         with self.assertRaises(self.plugin.BambuTlsError):
             self.plugin._verify_bambu_socket(self.card, "mqtt", socket)
 
-    def test_missing_mqtt_pin_blocks_all_application_bytes_even_with_insecure_flag(self):
+    def test_untrusted_mqtt_ca_blocks_all_application_bytes_even_with_insecure_flag(self):
         self.card["insecure"] = True
         self.card["tls_pins"].pop("mqtt")
         self.assertTrue(self.plugin.save_manual_printers([self.card]))
-        with mock.patch.object(self.plugin.socket, "create_connection") as connect:
+        raw, context = mock.Mock(), mock.Mock()
+        error = self.plugin.ssl.SSLCertVerificationError(1, "untrusted test issuer")
+        error.verify_code = 20
+        context.wrap_socket.side_effect = error
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw) as connect, \
+             mock.patch.object(self.plugin, "_SSL_BAMBU_CA", context):
             status = self.plugin.poll_bambu(self.card)
             publish = self.plugin._bambu_publish(
                 "192.0.2.77", "secret", "device/SERIAL/request", {}, printer=self.card)
         self.assertEqual(status["error_code"], "tls_trust_required")
         self.assertEqual(publish, "tls_trust_required")
-        connect.assert_not_called()
+        self.assertEqual(connect.call_count, 2)
+        raw.sendall.assert_not_called()
 
     def test_certificate_probe_sends_no_mqtt_or_ftp_application_bytes(self):
         raw, wrapped, context = mock.Mock(), mock.Mock(), mock.Mock()
-        wrapped.getpeercert.return_value = b"observed certificate"
+        wrapped.getpeercert.side_effect = lambda binary_form=False: (
+            b"observed certificate" if binary_form else
+            {"subject": ((('commonName', self.card["serial"]),),)})
         context.wrap_socket.return_value = wrapped
         with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw) as connect, \
-             mock.patch.object(self.plugin, "_SSL_INSECURE", context):
+             mock.patch.object(self.plugin, "_SSL_BAMBU_CA", context):
             mqtt = self.plugin._probe_bambu_certificate(self.card, "mqtt")
             ftps = self.plugin._probe_bambu_certificate(self.card, "ftps")
         self.assertEqual(mqtt, hashlib.sha256(b"observed certificate").hexdigest())
@@ -6511,19 +6751,25 @@ class BambuTlsTrustTest(unittest.TestCase):
         self.assertEqual(saved["binding_revision"], self.card["binding_revision"] + 1)
         self.assertIsNone(self.plugin.resolve_printer_target([saved], self.identity()))
 
-    def test_pre_dispatch_pin_refusal_is_journal_rejected_not_unknown(self):
+    def test_pre_dispatch_ca_refusal_is_journal_rejected_not_unknown(self):
         self.card["tls_pins"].pop("ftps")
         self.assertTrue(self.plugin.save_manual_printers([self.card]))
         temporary = tempfile.TemporaryDirectory(dir=self.plugin.PLUGIN_STORAGE_DIR)
         self.addCleanup(temporary.cleanup)
         source = pathlib.Path(temporary.name) / "job.gcode"
         source.write_bytes(b"G28\n")
-        with mock.patch.object(self.plugin.socket, "create_connection") as connect:
+        raw, context = mock.Mock(), mock.Mock()
+        error = self.plugin.ssl.SSLCertVerificationError(1, "untrusted test issuer")
+        error.verify_code = 20
+        context.wrap_socket.side_effect = error
+        with mock.patch.object(self.plugin.socket, "create_connection", return_value=raw) as connect, \
+             mock.patch.object(self.plugin, "_SSL_BAMBU_CA", context):
             result = self.plugin._bambu_send_file(
                 self.card, "job.gcode", str(source), True, False, None)
         self.assertEqual(result["journal_state"], "rejected")
         self.assertEqual(result["evidence_ref"], "tls:pre_dispatch")
-        connect.assert_not_called()
+        connect.assert_called_once()
+        raw.sendall.assert_not_called()
         journal = mock.Mock()
         dashboard = self.plugin.PrintersDashboard()
         dashboard._journal_finish((journal, "operation"), result)

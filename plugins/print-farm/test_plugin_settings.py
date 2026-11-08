@@ -366,7 +366,7 @@ class RuntimeSettingsTest(unittest.TestCase):
     def test_token_clears_once_and_repeat_does_not_clear_again(self):
         p = self.plugin
         self.seed_history()
-        self.set_config(DASH, {"clear_history_token": "tok-1"})
+        self.set_config(DASH, {"clear_history_token": p._history_clear_scope() + ":tok-1"})
         self.assertTrue(p.apply_history_clear_request())
         self.assertEqual(p.load_print_history(), [])
         p.record_orca_job(None, "after", "sent")
@@ -378,7 +378,7 @@ class RuntimeSettingsTest(unittest.TestCase):
         self.assertFalse(p.apply_history_clear_request())
         self.assertEqual(len(p.load_print_history()), 1)
         # A new click means a new token.
-        self.set_config(DASH, {"clear_history_token": "tok-2"})
+        self.set_config(DASH, {"clear_history_token": p._history_clear_scope() + ":tok-2"})
         self.assertTrue(p.apply_history_clear_request())
         self.assertEqual(p.load_print_history(), [])
 
@@ -396,7 +396,7 @@ class RuntimeSettingsTest(unittest.TestCase):
         store = self.root / "print_history.json"
         original = '[{"id":"good"}, null]'
         store.write_text(original, encoding="utf-8")
-        self.set_config(DASH, {"clear_history_token": "tok-d"})
+        self.set_config(DASH, {"clear_history_token": p._history_clear_scope() + ":tok-d"})
         self.assertFalse(p.apply_history_clear_request())
         self.assertEqual(store.read_text(encoding="utf-8"), original)
         store.write_text(json.dumps([{"id": "1", "state": "sent"}]), encoding="utf-8")
@@ -406,7 +406,7 @@ class RuntimeSettingsTest(unittest.TestCase):
     def test_failed_token_mark_does_not_clear(self):
         p = self.plugin
         self.seed_history()
-        self.set_config(DASH, {"clear_history_token": "tok-f"})
+        self.set_config(DASH, {"clear_history_token": p._history_clear_scope() + ":tok-f"})
         with unittest.mock.patch.object(p, "write_bytes_atomic", side_effect=OSError("disk")):
             self.assertFalse(p.apply_history_clear_request())
         self.assertEqual(len(p.load_print_history()), 2)
@@ -417,7 +417,7 @@ class RuntimeSettingsTest(unittest.TestCase):
         posted = []
         dashboard._post = posted.append
         self.seed_history()
-        self.set_config(DASH, {"clear_history_token": "tok-v"})
+        self.set_config(DASH, {"clear_history_token": p._history_clear_scope() + ":tok-v"})
         dashboard._post_print_history_all({"requestId": 1})
         self.assertEqual(posted[-1]["printHistory"]["items"], [])
 
@@ -429,7 +429,9 @@ class SettingsPageTest(unittest.TestCase):
 
     def pages(self):
         p = self.plugin
-        return {OUT: p.PrintersOutbox().get_config_ui(), DASH: p.PrintersDashboard().get_config_ui()}
+        with unittest.mock.patch.object(p.orca.host, "plugin", types.SimpleNamespace(
+                storage=lambda: p.PLUGIN_STORAGE_DIR), create=True):
+            return {OUT: p.PrintersOutbox().get_config_ui(), DASH: p.PrintersDashboard().get_config_ui()}
 
     def test_pages_are_self_contained_html_with_localized_labels_and_no_secrets(self):
         p = self.plugin

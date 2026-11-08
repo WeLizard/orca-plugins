@@ -126,11 +126,14 @@ class ArtifactTransferManager:
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             if hasattr(os, "O_BINARY"):
                 flags |= os.O_BINARY
-            fd = os.open(str(temp_path), flags, 0o600)
             try:
-                stream = os.fdopen(fd, "wb")
+                # By path, so the host can show which file is being created: a
+                # bare descriptor (os.fdopen) is a question it cannot describe.
+                stream = open(str(temp_path), "wb",
+                              opener=lambda path, _flags: os.open(path, flags, 0o600))
+            except FileExistsError:
+                raise
             except BaseException:
-                os.close(fd)
                 self._unlink(temp_path)
                 raise
             self._by_owner[owner] = _Transfer(

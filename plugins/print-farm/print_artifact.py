@@ -488,6 +488,16 @@ def _inspect_3mf(path: Path, chunk_bytes: int) -> tuple[tuple[str, ...], dict[st
         raise ArtifactError("invalid 3MF archive") from exc
 
 
+def _open_with_flags(path, mode, flags, permissions=0o777):
+    """open() that creates the descriptor with exact ``os.open`` flags.
+
+    Exclusive creation and no-follow keep their meaning, while the file is opened
+    by path. OrcaSlicer asks the user about a plugin that wraps a bare descriptor
+    (``os.fdopen``) and cannot show which file it is, and asks again every time.
+    """
+    return open(path, mode, opener=lambda opened, _flags: os.open(opened, flags, permissions))
+
+
 def _stage_root(path: str | os.PathLike[str]) -> Path:
     root = Path(path).expanduser().absolute()
     if root.exists() and (root.is_symlink() or not root.is_dir()):
@@ -541,17 +551,17 @@ def stage_artifact(source_path: str | os.PathLike[str], staging_dir: str | os.Pa
     copied = 0
     try:
         source_flags = os.O_RDONLY | _O_BINARY | _O_NOFOLLOW
-        source_fd = os.open(source, source_flags)
+        source_stream = _open_with_flags(source, "rb", source_flags)
         try:
-            target_fd = os.open(destination, flags, 0o600)
+            target_stream = _open_with_flags(destination, "wb", flags, 0o600)
         except FileExistsError as exc:
-            os.close(source_fd)
+            source_stream.close()
             raise ArtifactError("artifact id is already staged") from exc
         except BaseException:
-            os.close(source_fd)
+            source_stream.close()
             raise
         created = True
-        with os.fdopen(source_fd, "rb") as source_stream, os.fdopen(target_fd, "wb") as target_stream:
+        with source_stream, target_stream:
             opened_info = os.fstat(source_stream.fileno())
             if not stat.S_ISREG(opened_info.st_mode) or (opened_info.st_dev, opened_info.st_ino) != (
                 source_info.st_dev, source_info.st_ino
@@ -720,8 +730,8 @@ def stage_selected_plate(artifact: StagedArtifact, plate_entry: str,
     flags |= _O_BINARY | _O_NOFOLLOW
     created = False
     try:
-        source_fd = os.open(artifact.path, os.O_RDONLY | _O_BINARY | _O_NOFOLLOW)
-        with os.fdopen(source_fd, "rb") as source:
+        source_stream = _open_with_flags(artifact.path, "rb", os.O_RDONLY | _O_BINARY | _O_NOFOLLOW)
+        with source_stream as source:
             before_size, before_digest = _hash_stream(source, chunk_bytes, source_max_bytes)
             if (before_size != artifact.manifest.get("size_bytes")
                     or before_digest != artifact.manifest.get("sha256")):
@@ -738,11 +748,11 @@ def stage_selected_plate(artifact: StagedArtifact, plate_entry: str,
                     raise ArtifactError("selected plate entry is unsafe")
                 if info.file_size < 1 or info.file_size > max_bytes:
                     raise ArtifactError("selected plate exceeds size limit")
-                target_fd = os.open(destination, flags, 0o600)
+                target_stream = _open_with_flags(destination, "wb", flags, 0o600)
                 created = True
                 digest = hashlib.sha256()
                 copied = 0
-                with os.fdopen(target_fd, "wb") as target, archive.open(info, "r") as member:
+                with target_stream as target, archive.open(info, "r") as member:
                     while True:
                         block = member.read(chunk_bytes)
                         if not block:

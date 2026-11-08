@@ -2,6 +2,8 @@
 import json
 import time
 import types
+import threading
+import contextlib
 from unittest import mock
 
 import pytest
@@ -51,6 +53,33 @@ def test_webui_and_camera_edits_invalidate_binding_without_rebinding_keys(setup)
     assert p.resolve_printer_target([card], msg) is None
     assert p.printer_webui_url(card) == "http://synthetic.invalid:80/fluidd"
     assert "synthetic-key" not in json.dumps(p.public_printer_record(card))
+
+
+def test_partial_webui_and_camera_saves_preserve_the_other_setting(setup):
+    p, page, card, msg, _ = setup
+    page._save_connection_options(dict(msg, webui_url="http://synthetic.invalid:8080/fluidd"))
+    card = p.load_manual_printers()[0]
+    assert card["webui_url"] == "http://synthetic.invalid:8080/fluidd"
+    assert card["camera_mode"] == "auto"
+    msg = dict(msg, bindingRevision=card["binding_revision"])
+    page._save_connection_options(dict(msg, camera_mode="snapmaker_u1"))
+    card = p.load_manual_printers()[0]
+    assert card["camera_mode"] == "snapmaker_u1"
+    assert card["webui_url"] == "http://synthetic.invalid:8080/fluidd"
+
+
+def test_camera_icon_overlay_exposes_mode_and_viewer_uses_address_editor_bridge(setup):
+    p, _, _, _, _ = setup
+    page = p.render_page()
+    camera = page[page.index("// <camera-overlay>"):page.index("// </camera-overlay>")]
+    assert 'id="cam-mode-wrap"' in page
+    assert "camera_mode:camEl('cam-mode').value" in camera
+    viewer = p.render_viewer_page("http://synthetic.invalid:8080/fluidd")
+    assert "frame-src http://synthetic.invalid:8080" in viewer
+    assert "viewer-edit-address" in viewer
+    assert 'readonly aria-label="URL"' in viewer
+    camera_viewer = p.render_viewer_page("http://synthetic.invalid:8080/webcam", show_edit=False)
+    assert 'id="edit" type="button" hidden' in camera_viewer
 
 
 @pytest.mark.parametrize("url", ["http://other.invalid", "javascript:alert(1)",
@@ -237,3 +266,187 @@ def test_native_failure_is_terminal_for_late_started_frame_and_error(failure):
     assert value["failed"] is True and value["sessionId"] is None
     assert value["src"] in (None, "") and value["note"] == value["terminalNote"]
     assert value["lateMessages"] == 0
+
+
+def test_native_ack_checks_identity_epochs_and_does_not_renew_lease(setup):
+    p, page, c, msg, _ = enable(setup)
+    client = mock.Mock(id="current-session")
+    def run():
+        entry = page._u1_camera
+        lease = entry["lease"]
+        ack = dict(msg, sessionId=client.id, sequence=7)
+        for key, wrong in (("requestId", 99), ("targetUuid", "old"), ("ownerScope", "old"),
+                           ("targetSelector", "old"), ("bindingRevision", -1), ("sessionId", "old")):
+            page._ack_u1_camera(dict(ack, **{key: wrong}))
+        for key, wrong in (("root", "old"), ("page_epoch", -1), ("runtime_epoch", -1), ("lease", 0)):
+            previous, entry[key] = entry[key], wrong
+            page._ack_u1_camera(ack)
+            entry[key] = previous
+        client.acknowledge.assert_not_called()
+        page.on_message(dict(ack, type="camera-native-frame-ack"))
+        client.acknowledge.assert_called_once_with(7)
+        assert entry["lease"] == lease
+    client.run.side_effect = run
+    with mock.patch.object(p.CAMERA_WORKER, "submit", side_effect=lambda fn: fn()), \
+         mock.patch.object(p._pf_u1_camera, "Session", return_value=client):
+        page._begin_u1_camera(msg)
+
+
+def test_native_image_ack_waits_for_load_and_old_load_cannot_ack_replacement():
+    value = CameraOverlayUiTest().run_js(r'''
+      function start(){
+        openCamera(Object.assign({},P1,{camera_mode:'snapmaker_u1'}),opener);
+        onCameraNativeFrame({ok:true,started:true,requestId:camState.requestId,targetUuid:'u1',sessionId:'session'+camState.requestId});
+      }
+      start(); var id=camState.requestId;
+      var frame={ok:true,requestId:id,targetUuid:'u1',sessionId:camState.sessionId,sequence:1,
+        received_at:Date.now()/1000,captured_at:null,image:'data:image/jpeg;base64,/9j/2Q=='};
+      onCameraNativeFrame(frame);
+      function acks(){return posted.filter(function(x){return x.type==='camera-native-frame-ack';});}
+      var before=acks().length;img.onload();
+      frame.sequence=2;onCameraNativeFrame(frame);img.onload();
+      var loaded=img.onload, completed=acks();
+      start(); loaded();
+      report({before:before,completed:completed,after:acks().length});
+    ''')
+    assert value["before"] == 0
+    assert [ack["sequence"] for ack in value["completed"]] == [1, 2]
+    assert value["after"] == 2
+
+
+def test_native_image_decode_error_closes_session_and_clears_image():
+    value = CameraOverlayUiTest().run_js(r'''
+      openCamera(Object.assign({},P1,{camera_mode:'snapmaker_u1'}),opener);
+      var id=camState.requestId;
+      onCameraNativeFrame({ok:true,started:true,requestId:id,targetUuid:'u1',sessionId:'session'});
+      onCameraNativeFrame({ok:true,requestId:id,targetUuid:'u1',sessionId:'session',sequence:1,
+        received_at:Date.now()/1000,captured_at:null,image:'data:image/jpeg;base64,/9j/2Q=='});
+      img.onerror();report({failed:camState.failed});
+    ''')
+    assert value["failed"] and value["src"] in (None, "")
+    assert value["posted"][-1]["type"] == "camera-native-close"
+
+
+def test_close_then_reopen_waits_for_owned_session_to_finish(setup):
+    p, page, c, msg, _ = enable(setup)
+    started, finish = threading.Event(), threading.Event()
+    runs, clients = [], []
+    class Client:
+        def __init__(self, *args):
+            self.id = "session-" + str(len(clients))
+            self.publish = args[-1]
+            clients.append(self)
+        def run(self):
+            runs.append(self.id)
+            started.set()
+            assert finish.wait(2)
+        def cancel(self):
+            pass  # Deliberately defer the old worker's finally until finish.
+    try:
+        with mock.patch.object(p._pf_u1_camera, "Session", Client):
+            page._begin_u1_camera(msg)
+            assert started.wait(1)
+            page._cancel_u1_camera(msg)
+            page._begin_u1_camera(dict(msg, requestId=9))
+            assert page._u1_camera is not None
+            assert page._u1_camera["request_id"] == 9
+            assert len(clients) == 1  # Replacement cannot overlap the old transport.
+            finish.set()
+            deadline = time.monotonic() + 1
+            while len(runs) < 2 and time.monotonic() < deadline:
+                time.sleep(.005)
+            assert len(runs) == 2
+    finally:
+        finish.set()
+
+
+@contextlib.contextmanager
+def blocked_camera(setup):
+    p, page, card, msg, _ = enable(setup)
+    started, finish = threading.Event(), threading.Event()
+    clients, contexts = [], []
+    class Client:
+        def __init__(self, *args):
+            self.id = "barrier-" + str(len(clients))
+            clients.append(self)
+            contexts.append(p._CREDENTIAL_WORK_CONTEXT.guard())
+        def run(self):
+            if len(clients) == 1:
+                started.set()
+                assert finish.wait(2)
+        def cancel(self):
+            pass
+    with mock.patch.object(p._pf_u1_camera, "Session", Client):
+        try:
+            page._begin_u1_camera(msg)
+            assert started.wait(1)
+            yield p, page, msg, finish, clients, contexts
+        finally:
+            page._cancel_u1_camera()
+            finish.set()
+            deadline = time.monotonic() + 1
+            while p._U1_CAMERA_CLIENTS and time.monotonic() < deadline:
+                time.sleep(.005)
+            assert not p._U1_CAMERA_CLIENTS
+
+
+@pytest.mark.parametrize("change", ["close", "replace", "root", "page", "runtime", "lease", "unload"])
+def test_pending_replacement_is_bounded_and_revalidates_before_credentials(setup, change):
+    with blocked_camera(setup) as (p, page, msg, finish, clients, contexts):
+        retiring = page._u1_camera
+        page._cancel_u1_camera(msg)
+        pending_msg = dict(msg, requestId=9)
+        page._begin_u1_camera(pending_msg)
+        pending = page._u1_camera
+        assert retiring["successor"] is pending and not pending["slot_owned"]
+        if change == "close": page._cancel_u1_camera(pending_msg)
+        elif change == "replace":
+            page._begin_u1_camera(dict(msg, requestId=10))
+            assert retiring["successor"] is page._u1_camera
+            assert page._u1_camera["request_id"] == 10 and pending["lease"] == 0
+        elif change == "root": p.PLUGIN_STORAGE_DIR += "-other"
+        elif change == "page": page._credential_page_epoch += 1
+        elif change == "runtime": p._PLUGIN_RUNTIME_EPOCH += 1
+        elif change == "lease": pending["lease"] = 0
+        else:
+            p._PLUGIN_RUNTIME_ACTIVE = True
+            p.stop_plugin_runtime()
+        finish.set()
+        deadline = time.monotonic() + 1
+        while (p._U1_CAMERA_OWNER is not None or p._U1_CAMERA_CLIENTS) and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert p._U1_CAMERA_OWNER is None and not p._U1_CAMERA_CLIENTS
+        assert len(clients) == (2 if change == "replace" else 1)
+        assert contexts == [True] * len(clients)
+        assert p._U1_CAMERA_SLOT.acquire(blocking=False)
+        p._U1_CAMERA_SLOT.release()
+
+
+def test_close_at_handoff_guard_cannot_start_successor(setup):
+    with blocked_camera(setup) as (p, page, msg, finish, clients, _):
+        page._cancel_u1_camera(msg)
+        pending_msg = dict(msg, requestId=9)
+        page._begin_u1_camera(pending_msg)
+        pending = page._u1_camera
+        original = pending["guard"]
+        def close_at_transfer():
+            page._cancel_u1_camera(pending_msg)
+            return original()
+        pending["guard"] = close_at_transfer
+        finish.set()
+        deadline = time.monotonic() + 1
+        while p._U1_CAMERA_OWNER is not None and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert p._U1_CAMERA_OWNER is None and len(clients) == 1
+
+
+def test_other_page_cannot_claim_active_or_retiring_camera(setup):
+    with blocked_camera(setup) as (p, page, msg, finish, clients, _):
+        other = p.PrintersDashboard()
+        other._post = mock.Mock()
+        other._begin_u1_camera(msg)
+        assert other._u1_camera is None
+        assert other._post.call_args.args[0]["cameraNativeFrame"]["ok"] is False
+        page._cancel_u1_camera(msg)
+        other._begin_u1_camera(dict(msg, requestId=9))
+        assert other._u1_camera is None and len(clients) == 1

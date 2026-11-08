@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -60,7 +61,8 @@ def ws_base(upload_url: str, ws_port: int) -> str:
     return "ws://%s:%d" % ("[%s]" % host if ":" in host else host, port)
 
 
-def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "") -> dict:
+def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "", *,
+         raise_if_access_denied=None) -> dict:
     """Read printer status over the stock WebSocket; never sends a mutating command.
 
     ``base`` is ``ws://host:port``. ``ssl_context`` and ``secret`` are accepted
@@ -78,6 +80,8 @@ def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "")
         status["error_code"] = "writable_target_unverified"
         return status
     except _AdapterError as exc:
+        if raise_if_access_denied is not None:
+            raise_if_access_denied(exc)
         status["error_code"] = exc.code
         return status
     except (OSError, ValueError):
@@ -255,6 +259,25 @@ def _http_connection(parsed, ssl_context):
 
 # --- minimal RFC 6455 client -------------------------------------------------
 
+def _connect_tcp(host, port, timeout):
+    """A TCP connection that OrcaSlicer can attribute to the host the user saved.
+
+    The host asks the user before a plugin connects. For a host name,
+    ``socket.create_connection`` reports the address the name resolved to, which
+    no saved permission names; ``http.client`` reports the name itself and the
+    host covers the connection it opens. Literal addresses connect directly.
+    """
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        connection = http.client.HTTPConnection(host, port, timeout=timeout)
+        connection.connect()
+        raw, connection.sock = connection.sock, None
+        connection.close()
+        return raw
+    return socket.create_connection((host, port), timeout=timeout)
+
+
 def _ws_request(base, payload, timeout):
     if not isinstance(base, str):
         raise _AdapterError("invalid_request")
@@ -267,7 +290,7 @@ def _ws_request(base, payload, timeout):
         raise _AdapterError("invalid_request")
     deadline = time.monotonic() + timeout
     try:
-        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        sock = _connect_tcp(parsed.hostname, parsed.port, timeout)
     except socket.timeout:
         raise _AdapterError("timeout") from None
     except OSError:

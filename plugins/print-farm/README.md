@@ -14,6 +14,22 @@ artifacts. The upstream plugin API is still evolving and updates may be frequent
 
 ## Known OrcaSlicer UI limitation
 
+Printer Web UI windows offer a compact address field and **Copy** button. Open
+**Page not loading?** for manual browser instructions. OrcaSlicer's current
+plugin API does not provide a supported way to open the system browser.
+
+Printer data stays in the storage folder supplied by OrcaSlicer. Local wheel
+installations can receive a separate folder for each package version; installing
+another version then shows that version's data rather than merging folders.
+The previous folders remain untouched. Legacy import is explicit and preserves
+printer lists, history, nested slice copies and local settings state. Stores
+with scoped credential references, operation journals or incoming transfers are
+blocked instead of partially imported; they need a separate migration.
+
+Bambu LAN connections normally verify the certificate automatically with the
+Bambu CA. **Certificates… → Read and trust** is available for certificates
+outside that chain. A changed saved fingerprint still needs confirmation.
+
 The available-printer picker currently uses the native drop-down supplied by
 OrcaSlicer's embedded WebView. If that drop-down is open while the OrcaSlicer
 window is moved, its popup may remain at its original screen position until it
@@ -81,24 +97,34 @@ dashboard and printer data are unaffected.
 - Authenticated OctoPrint instances can be added with an API key. Credentials
   use the system credential store for new manual entries; saved keys and Bambu access codes are
   never sent back to the dashboard page.
-- For Bambu connections, open **Certificates…** on the card to read and confirm
-  the MQTT and FTPS certificates separately. This read sends no access code.
-  Subsequent connections require the saved certificate before credentials or
-  file contents are sent, including the FTPS data channel. A changed certificate
-  blocks that connection until you explicitly confirm the replacement; a failed
-  upload or print is never repeated by confirming it. First-time confirmation is
-  a trust decision on your network, not proof of the printer's identity.
-- **Connection** → optional Web UI address on the same printer host, with an
-  explicit port; the API endpoint stays unchanged. Relative camera URLs use
-  this Web UI address. **Open** keeps a sandboxed frame restricted to the
-  selected origin, plus a selectable address and browser instructions when
-  an embedded Web UI keeps loading. No external program is started.
-- **Stock Snapmaker U1 camera** is an explicit per-card camera mode. Only an
+- Bambu MQTT and FTPS verify the Bambu CA chain and the saved device serial before
+  sending credentials. If the serial is missing, the first MQTT status report
+  must match the certified serial before it is saved. The FTPS data channel
+  checks the same certificate as the control connection. Existing fingerprints
+  continue to be checked. **Certificates…** reads a certificate without the
+  access code and can confirm it explicitly. Confirmation never retries a print
+  or upload.
+- **Open** keeps a sandboxed frame restricted to the selected origin. Its
+  address action edits the optional Web UI address on the same printer host;
+  the API endpoint stays unchanged. Relative camera URLs use this Web UI
+  address. Browser instructions remain available when an embedded Web UI keeps
+  loading. No external program is started.
+- The camera icon opens the camera overlay. On Klipper printers it also exposes
+  the camera mode setting, including when automatic camera lookup finds no
+  camera. **Stock Snapmaker U1 camera** is an explicit per-card camera mode. Only an
   open overlay starts its authenticated websocket monitor and bounded JPEG
-  polling. Close, binding changes, runtime shutdown and an expired page lease
+  polling, up to four frames per second independently of the two-second monitor
+  keepalive. With an API key, HTTP obtains a one-shot token for the websocket;
+  the persistent key never goes into its URL or handshake. One frame at a time
+  waits for the image to load before another JPEG is requested.
+  Close, binding changes, runtime shutdown and an expired page lease
   end the session. The display distinguishes capture time (when available)
   from receipt time, and clears expired or failed frames. Verified on local
   emulators only; hardware acceptance is pending.
+  Protocol reference and authentication flow: [lanwen's U1 camera plugin
+  v0.5.0](https://github.com/lanwen/orca-snapmaker-u1-camera-plugin/tree/df55c9124ebe038f85cb1d1180592d14951773db),
+  MIT, Copyright (c) 2026 lanwen. Its full notice is retained in `u1_camera.py`
+  and in the packaged plugin.
 - **Feedback** shows the fixed site address `https://filamenthub.ru`, ready to
   select and copy into a browser, with directions to its **Beta Feedback**
   button. No printer data is sent and no browser process is launched.
@@ -166,5 +192,18 @@ dashboard and printer data are unaffected.
 - `description.md` — Orca Cloud listing text.
 - `CHANGELOG.md` — release notes owned by this plugin.
 - `build_package.py` / `PUBLISHING.md` — deterministic package and release workflow.
+- `audit_fixtures/loopback_tls_test_only.pem` — throw-away self-signed certificate and key for the loopback
+  Bambu MQTT/FTPS servers in the tests (real TLS handshakes); it protects nothing and is never packaged.
+- `orca_audit_sim.py` / `test_audit_prompts.py` — test-only model of OrcaSlicer's plugin audit hook
+  (`PluginAuditManager.cpp`) and the flows that run under it. OrcaSlicer asks the user before a
+  plugin reaches a host, lists or opens files outside the data folder, starts a thread or binds a
+  socket, unless the plugin declared it with `orca.request_permissions()` while loading. The tests
+  load the plugin, answer that one dialog, and fail on any later question. Rules they enforce:
+  everything the plugin writes stays in its storage folder; HTTP goes through `http.client`
+  (the host sees only the host name, where `urllib` reports every URL); files are opened by path
+  (`open(path, opener=...)`), never wrapped from a descriptor (`os.fdopen`), which the host cannot
+  describe; raw TCP connections to a host name go through `_connect_tcp` (the host would otherwise
+  see only the resolved address); imports of third-party modules happen while loading; every new socket target or
+  thread is added to `declare_host_permissions()`.
 
 Printer keys entered manually are saved in Windows Credential Manager, macOS Keychain or Linux Secret Service through keyring 25.7.0. OrcaSlicer needs dependency installation support and package access for the initial keyring installation; installation failure may prevent the plugin from loading. After loading, an unavailable system store blocks saving new keys and connections using stored keys while the dashboard remains available. Use **Retry access** after unlocking the system store. Existing plaintext keys remain until you confirm **Move keys**. Old backups are not removed and may still contain plaintext keys. Keys supplied by OrcaSlicer presets stay in memory. Stored keys are bound to their printer, endpoint and account storage; moving the JSON file alone does not move the keys.

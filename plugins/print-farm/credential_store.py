@@ -12,6 +12,23 @@ USERNAME = "Print Farm"
 class Unavailable(Exception):
     pass
 
+def preload():
+    """Import the platform provider's modules; create nothing and touch no store.
+
+    Importing the keyring packages reads their files and lists folders. OrcaSlicer
+    asks the user about reads like that while a plugin works, but not while it
+    loads, so the plugin imports them then and the first credential use stays
+    silent. Raises ImportError when the provider is not installed.
+    """
+    if sys.platform == "win32":
+        from keyring.backends.Windows import WinVaultKeyring
+    elif sys.platform == "darwin":
+        from keyring.backends.macOS import Keyring
+    elif sys.platform.startswith("linux"):
+        from keyring.backends.SecretService import Keyring
+    else:
+        raise Unavailable()
+
 def system_backend():
     # Never invoke keyring discovery, config, or environment-selected providers.
     if sys.platform == "win32":
