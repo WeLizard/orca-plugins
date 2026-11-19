@@ -73,40 +73,4594 @@ import weakref
 
 import orca
 
-# BEGIN PRINT_FARM_HELPERS
-# Source modules stay separate for review and focused tests. The release builder
-# embeds their exact contents into this single-file plugin at this marker.
-import importlib.util as _pf_importlib_util
 import sys as _pf_sys
+import types as _pf_types
 
 
-def _pf_load_local_helper(name):
-    module_name = __name__ + "_" + name
-    path = pathlib.Path(__file__).with_name(name + ".py")
-    spec = _pf_importlib_util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError("Print Farm helper is unavailable: " + name)
-    module = _pf_importlib_util.module_from_spec(spec)
+def _pf_embedded_helper(name, define, doc):
+    module_name = __name__ + '_' + name
+    module = _pf_types.ModuleType(module_name, doc)
+    module.__dict__.update(define())
     _pf_sys.modules[module_name] = module
-    spec.loader.exec_module(module)
     return module
 
 
-_pf_artifact = _pf_load_local_helper("print_artifact")
-_pf_transfer = _pf_load_local_helper("artifact_transfer")
-_pf_upload = _pf_load_local_helper("upload_transport")
-_pf_journal = _pf_load_local_helper("operation_journal")
-_pf_scheduler = _pf_load_local_helper("action_scheduler")
-_pf_approval = _pf_load_local_helper("operation_approval")
-_pf_duet = _pf_load_local_helper("duet_adapter")
-_pf_prusalink = _pf_load_local_helper("prusalink_adapter")
-_pf_repetier = _pf_load_local_helper("repetier_adapter")
-_pf_u1_camera = _pf_load_local_helper("u1_camera")
-_pf_creality = _pf_load_local_helper("creality_adapter")
-_pf_flashforge = _pf_load_local_helper("flashforge_adapter")
-_pf_settings = _pf_load_local_helper("plugin_settings")
-_pf_credentials = _pf_load_local_helper("credential_store")
-# END PRINT_FARM_HELPERS
+def _pf_define_artifact():
+    import hashlib
+    import json
+    import math
+    import os
+    import re
+    import stat
+    import uuid
+    import zipfile
+    from dataclasses import dataclass
+    from pathlib import Path
+    from types import MappingProxyType
+    from typing import Mapping
+    try:
+        _O_BINARY = os.O_BINARY
+    except AttributeError:
+        _O_BINARY = 0
+    try:
+        _O_NOFOLLOW = os.O_NOFOLLOW
+    except AttributeError:
+        _O_NOFOLLOW = 0
+    DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+    DEFAULT_CHUNK_BYTES = 192 * 1024
+    MAX_ZIP_ENTRIES = 20000
+    MAX_ZIP_DIRECTORY_BYTES = 16 * 1024 * 1024
+    MAX_ZIP_UNPACKED_BYTES = 2 * 1024 * 1024 * 1024
+    MAX_ZIP_MEMBER_BYTES = 512 * 1024 * 1024
+    MAX_METADATA_MEMBER_BYTES = 8 * 1024 * 1024
+    MAX_JSON_NESTING = 32
+    MAX_ZIP_COMPRESSION_RATIO = 200
+    GCODE_METADATA_SCAN_BYTES = 1024 * 1024
+    _PROVENANCE = {'synthetic', 'orca_export', 'manual_import', 'native_capture'}
+    _PLATE_ENTRY = re.compile('Metadata/plate_([1-9][0-9]*)\\.gcode\\Z')
+    _ARTIFACT_STAGE_NAME = re.compile('(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.artifact|pf-artifact-[0-9a-f]{32}\\.(?:gcode|gco|3mf))\\Z')
+    _PLATE_STAGE_NAME = re.compile('[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.gcode\\Z')
+    _GCODE_EXTENSIONS = {'.gcode', '.gco'}
+
+    class ArtifactError(ValueError):
+        """Input is invalid, unsafe, unsupported, or exceeds a configured bound."""
+
+    @dataclass(frozen=True)
+    class StagedArtifact:
+        """Immutable handle for a verified file held in a private staging directory."""
+        path: Path
+        filename: str
+        manifest: Mapping[str, object]
+        metadata: Mapping[str, object]
+        plate_entries: tuple[str, ...]
+        manifest_complete: bool
+
+    @dataclass(frozen=True)
+    class StagedPlate:
+        """Verified extracted G-code for one exact 3MF plate member."""
+        path: Path
+        plate_entry: str
+        size_bytes: int
+        sha256: str
+        source_artifact_id: str
+
+    def _validate_limits(max_bytes: int, chunk_bytes: int) -> None:
+        if type(max_bytes) is not int or max_bytes < 1:
+            raise ValueError('max_bytes must be a positive integer')
+        if type(chunk_bytes) is not int or not 1 <= chunk_bytes <= 4 * 1024 * 1024:
+            raise ValueError('chunk_bytes must be between 1 and 4 MiB')
+
+    def _safe_filename(value: str | os.PathLike[str]) -> str:
+        name = Path(os.fspath(value)).name
+        if not name or name in {'.', '..'} or any((ord(ch) < 32 or ch in '\\/:\x00' for ch in name)):
+            raise ArtifactError('invalid artifact filename')
+        lower = name.lower()
+        if lower.endswith('.gcode.3mf') or lower.endswith('.3mf'):
+            return name
+        if Path(name).suffix.lower() in _GCODE_EXTENSIONS:
+            return name
+        raise ArtifactError('unsupported artifact type')
+
+    def _artifact_kind(filename: str) -> str:
+        lower = filename.lower()
+        if lower.endswith('.gcode.3mf') or lower.endswith('.3mf'):
+            return '3mf'
+        return 'gcode'
+
+    def _hash_file(path: Path, chunk_bytes: int, max_bytes: int) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open('rb') as stream:
+            while True:
+                block = stream.read(chunk_bytes)
+                if not block:
+                    break
+                size += len(block)
+                if size > max_bytes:
+                    raise ArtifactError('artifact exceeds size limit')
+                digest.update(block)
+        return (size, digest.hexdigest())
+
+    def _parse_gcode_metadata(path: Path, size: int) -> dict[str, str]:
+        metadata: dict[str, str] = {}
+        try:
+            with path.open('rb') as stream:
+                stream.seek(max(0, size - GCODE_METADATA_SCAN_BYTES))
+                tail = stream.read(GCODE_METADATA_SCAN_BYTES)
+        except OSError as exc:
+            raise ArtifactError('could not read staged G-code metadata') from exc
+        for raw_line in tail.splitlines():
+            if not raw_line.startswith(b';') or b'=' not in raw_line:
+                continue
+            key, value = raw_line[1:].decode('utf-8', 'replace').split('=', 1)
+            key = key.strip()
+            if key in {'printer_settings_id', 'printer_model', 'filament_type', 'nozzle_diameter', 'layer_height', 'printhost_port', 'host_type', 'print_host'}:
+                value = value.strip().strip('"')
+                if value and len(value) <= 512:
+                    metadata[key] = value
+        return metadata
+
+    def _gcode_parameters_digest(metadata: Mapping[str, str]) -> str | None:
+        if not metadata:
+            return None
+        canonical = json.dumps(dict(metadata), ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        return hashlib.sha256(canonical).hexdigest()
+
+    def manifest_is_complete(manifest: Mapping[str, object]) -> bool:
+        """Check that the normalized v2 manifest has proven required fields."""
+        required = {'schema_version', 'provenance', 'artifact_id', 'sha256', 'size_bytes', 'kind', 'slicer_build', 'selected_plate_entry', 'compatible_target_ids', 'compatibility_evidence_refs', 'parameters_sha256'}
+        if not isinstance(manifest, Mapping) or not required.issubset(manifest):
+            return False
+        digest = manifest.get('sha256')
+        parameter_digest = manifest.get('parameters_sha256')
+        size = manifest.get('size_bytes')
+        if manifest.get('schema_version') != 2 or manifest.get('provenance') not in _PROVENANCE or (not isinstance(manifest.get('artifact_id'), str)) or (not manifest.get('artifact_id')) or (not isinstance(digest, str)) or (re.fullmatch('[0-9a-f]{64}', digest) is None) or (type(size) is not int) or (size < 1) or (not isinstance(parameter_digest, str)) or (re.fullmatch('[0-9a-f]{64}', parameter_digest) is None) or (not isinstance(manifest.get('compatible_target_ids'), (list, tuple))) or (not isinstance(manifest.get('compatibility_evidence_refs'), (list, tuple))):
+            return False
+        kind = manifest.get('kind')
+        if kind not in {'gcode', 'bgcode', 'sliced_3mf'}:
+            return False
+        if kind == 'sliced_3mf':
+            return isinstance(manifest.get('selected_plate_entry'), str) and bool(manifest.get('selected_plate_entry'))
+        return manifest.get('selected_plate_entry') is None
+
+    def _safe_zip_member(name: str) -> bool:
+        if not name or len(name.encode('utf-8', 'surrogatepass')) > 1024 or '\\' in name or ('\x00' in name) or name.startswith('/'):
+            return False
+        if re.match('^[A-Za-z]:', name):
+            return False
+        parts = name.rstrip('/').split('/')
+        return all((part not in {'', '.', '..'} for part in parts))
+
+    def _read_zip_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int, chunk_bytes: int) -> bytes:
+        if info.file_size > limit:
+            raise ArtifactError('archive member exceeds size limit')
+        pieces = []
+        observed = 0
+        with archive.open(info, 'r') as member:
+            while True:
+                block = member.read(min(chunk_bytes, limit - observed + 1))
+                if not block:
+                    break
+                observed += len(block)
+                if observed > limit:
+                    raise ArtifactError('archive member exceeds size limit')
+                pieces.append(block)
+        if observed != info.file_size:
+            raise ArtifactError('archive member size mismatch')
+        return b''.join(pieces)
+
+    def _bounded_json_loads(raw: bytes, *, object_pairs_hook=None):
+        """Reject deeply nested JSON before decoding and normalize parser failures."""
+        depth = 0
+        in_string = False
+        escaped = False
+        for byte in raw:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif byte == 92:
+                    escaped = True
+                elif byte == 34:
+                    in_string = False
+                continue
+            if byte == 34:
+                in_string = True
+            elif byte in (123, 91):
+                depth += 1
+                if depth > MAX_JSON_NESTING:
+                    raise ArtifactError('JSON nesting exceeds supported limit')
+            elif byte in (125, 93):
+                depth = max(0, depth - 1)
+        try:
+            return json.loads(raw.decode('utf-8'), object_pairs_hook=object_pairs_hook)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            raise ArtifactError('invalid bounded JSON metadata') from exc
+
+    def _parameter_fingerprint(archive: zipfile.ZipFile, by_name: Mapping[str, zipfile.ZipInfo], chunk_bytes: int) -> str | None:
+        """Fingerprint bounded parameter configs without implying semantic equivalence.
+
+    JSON is canonicalized after duplicate-key validation. XML is fingerprinted
+    byte-for-byte with filename and format tags; it is never parsed or entity-expanded.
+    """
+        exact_names = {'Metadata/project_settings.config', 'Metadata/print_profile.config', 'Metadata/model_settings.config'}
+        prefixes = ('Metadata/machine_settings_', 'Metadata/process_settings_', 'Metadata/filament_settings_', 'Metadata/print_setting_')
+        names = sorted((name for name in by_name if name in exact_names or (name.startswith(prefixes) and name.endswith('.config'))))
+        if not names:
+            return None
+        digest = hashlib.sha256()
+        for name in names:
+            raw = _read_zip_member(archive, by_name[name], MAX_METADATA_MEMBER_BYTES, chunk_bytes)
+            try:
+                parsed = _bounded_json_loads(raw, object_pairs_hook=_unique_pairs)
+            except ArtifactError as exc:
+                if 'nesting' in str(exc):
+                    raise ArtifactError('parameter metadata JSON nesting exceeds limit') from exc
+                if raw.lstrip().startswith(b'<'):
+                    format_tag = b'xml-raw-v1'
+                    parameter_bytes = raw
+                else:
+                    raise ArtifactError('invalid parameter metadata') from exc
+            else:
+                format_tag = b'json-canonical-v1'
+                parameter_bytes = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode('utf-8')
+            digest.update(name.encode('utf-8'))
+            digest.update(b'\x00')
+            digest.update(format_tag)
+            digest.update(b'\x00')
+            digest.update(parameter_bytes)
+            digest.update(b'\x00')
+        return digest.hexdigest()
+
+    def _sanitize_project_metadata(value: object, *, allow_list: bool=False) -> str | list[str] | None:
+        """Keep only small, printable scalar values from known project fields."""
+
+        def clean_scalar(item: object) -> str | None:
+            if isinstance(item, str):
+                result = item.strip()
+            elif isinstance(item, (int, float)) and (not isinstance(item, bool)):
+                if isinstance(item, float) and (not math.isfinite(item)):
+                    return None
+                result = str(item)
+            else:
+                return None
+            if not result or len(result) > 256 or any((ord(char) < 32 or ord(char) == 127 for char in result)):
+                return None
+            return result
+        if allow_list and isinstance(value, list):
+            if not 1 <= len(value) <= 16:
+                return None
+            items = [clean_scalar(item) for item in value]
+            if any((item is None for item in items)):
+                return None
+            return [item for item in items if item is not None]
+        return clean_scalar(value)
+
+    def _project_metadata(archive: zipfile.ZipFile, by_name: Mapping[str, zipfile.ZipInfo], chunk_bytes: int) -> dict[str, str | list[str]]:
+        """Extract bounded allowlisted project fields from Orca's config JSON."""
+        name = 'Metadata/project_settings.config'
+        info = by_name.get(name)
+        if info is None:
+            return {}
+        raw = _read_zip_member(archive, info, MAX_METADATA_MEMBER_BYTES, chunk_bytes)
+        try:
+            parsed = _bounded_json_loads(raw, object_pairs_hook=_unique_pairs)
+        except ArtifactError as exc:
+            if 'nesting' in str(exc):
+                raise ArtifactError('project metadata JSON nesting exceeds limit') from exc
+            if raw.lstrip().startswith(b'<'):
+                return {}
+            raise ArtifactError('invalid project metadata') from exc
+        if not isinstance(parsed, dict):
+            return {}
+        result: dict[str, str | list[str]] = {}
+        for key in ('printer_settings_id', 'printer_model', 'nozzle_diameter', 'printhost_port', 'host_type', 'print_host'):
+            if key not in parsed:
+                continue
+            value = _sanitize_project_metadata(parsed[key], allow_list=key == 'nozzle_diameter')
+            if value is not None:
+                result[key] = value
+        return result
+
+    def _slicer_build_metadata(raw: bytes) -> str | None:
+        """Read the build label from JSON or bounded Orca/Bambu XML header data."""
+        try:
+            parsed = _bounded_json_loads(raw, object_pairs_hook=_unique_pairs)
+        except ArtifactError:
+            text = raw.decode('utf-8', 'replace')
+            match = re.search('<header_item\\b(?=[^>]*\\bkey=["\\\']OrcaSlicer-Version["\\\'])(?=[^>]*\\bvalue=["\\\']([^"\\\']{1,256})["\\\'])[^>]*/?>', text)
+            return match.group(1) if match else None
+        if isinstance(parsed, dict):
+            candidate = parsed.get('OrcaSlicer-Version') or parsed.get('slicer_version')
+            if isinstance(candidate, str) and len(candidate) <= 256:
+                return candidate
+        return None
+
+    def _unique_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate JSON key')
+            result[key] = value
+        return result
+
+    def _validate_zip_directory(path: Path) -> None:
+        """Reject oversized/multidisk/ZIP64 directories before ZipFile allocates entries."""
+        try:
+            size = path.stat().st_size
+            tail_size = min(size, 22 + 65535)
+            with path.open('rb') as stream:
+                stream.seek(size - tail_size)
+                tail = stream.read(tail_size)
+        except OSError as exc:
+            raise ArtifactError('could not read archive directory') from exc
+        signature = b'PK\x05\x06'
+        offset = tail.rfind(signature)
+        if offset < 0 or offset + 22 > len(tail):
+            raise ArtifactError('invalid archive directory')
+        disk_number = int.from_bytes(tail[offset + 4:offset + 6], 'little')
+        directory_disk = int.from_bytes(tail[offset + 6:offset + 8], 'little')
+        entries_on_disk = int.from_bytes(tail[offset + 8:offset + 10], 'little')
+        entries_total = int.from_bytes(tail[offset + 10:offset + 12], 'little')
+        directory_size = int.from_bytes(tail[offset + 12:offset + 16], 'little')
+        directory_offset = int.from_bytes(tail[offset + 16:offset + 20], 'little')
+        comment_length = int.from_bytes(tail[offset + 20:offset + 22], 'little')
+        absolute_eocd = size - tail_size + offset
+        if offset + 22 + comment_length != len(tail) or disk_number != 0 or directory_disk != 0 or (entries_on_disk != entries_total) or (entries_total in {65535}) or (directory_size == 4294967295) or (directory_offset == 4294967295) or (entries_total > MAX_ZIP_ENTRIES) or (directory_size > MAX_ZIP_DIRECTORY_BYTES) or (directory_offset + directory_size != absolute_eocd):
+            raise ArtifactError('archive directory exceeds supported bounds')
+
+    def _inspect_3mf(path: Path, chunk_bytes: int) -> tuple[tuple[str, ...], dict[str, object], str | None]:
+        try:
+            _validate_zip_directory(path)
+            with zipfile.ZipFile(path, 'r') as archive:
+                infos = archive.infolist()
+                if not infos or len(infos) > MAX_ZIP_ENTRIES:
+                    raise ArtifactError('invalid archive entry count')
+                by_name: dict[str, zipfile.ZipInfo] = {}
+                folded: set[str] = set()
+                total_unpacked = 0
+                observed_unpacked = 0
+                for info in infos:
+                    name = info.filename
+                    if not _safe_zip_member(name):
+                        raise ArtifactError('unsafe archive path')
+                    key = name.casefold()
+                    if key in folded:
+                        raise ArtifactError('duplicate archive member')
+                    folded.add(key)
+                    if info.flag_bits & 1:
+                        raise ArtifactError('encrypted archive member')
+                    mode = info.external_attr >> 16
+                    if stat.S_ISLNK(mode):
+                        raise ArtifactError('symbolic link in archive')
+                    if info.is_dir():
+                        if info.file_size != 0:
+                            raise ArtifactError('invalid archive directory')
+                        continue
+                    if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                        raise ArtifactError('archive member exceeds size limit')
+                    total_unpacked += info.file_size
+                    if total_unpacked > MAX_ZIP_UNPACKED_BYTES:
+                        raise ArtifactError('archive exceeds unpacked size limit')
+                    if info.file_size > 1024 and info.file_size > max(1, info.compress_size) * MAX_ZIP_COMPRESSION_RATIO:
+                        raise ArtifactError('archive compression ratio exceeds limit')
+                    observed_member = 0
+                    with archive.open(info, 'r') as member:
+                        while True:
+                            block = member.read(chunk_bytes)
+                            if not block:
+                                break
+                            observed_member += len(block)
+                            observed_unpacked += len(block)
+                            if observed_member > MAX_ZIP_MEMBER_BYTES or observed_unpacked > MAX_ZIP_UNPACKED_BYTES:
+                                raise ArtifactError('archive exceeds unpacked size limit')
+                    if observed_member != info.file_size:
+                        raise ArtifactError('archive member size mismatch')
+                    by_name[name] = info
+                if '3D/3dmodel.model' not in by_name:
+                    raise ArtifactError('3MF model entry is missing')
+                plates = []
+                for name, info in by_name.items():
+                    match = _PLATE_ENTRY.fullmatch(name)
+                    if match:
+                        if info.file_size == 0:
+                            raise ArtifactError('empty sliced plate')
+                        plates.append((int(match.group(1)), name))
+                if not plates:
+                    raise ArtifactError('unsliced 3MF project')
+                plates.sort()
+                if len({plate_id for plate_id, _ in plates}) != len(plates):
+                    raise ArtifactError('duplicate plate id')
+                build = None
+                if 'Metadata/slice_info.config' in by_name:
+                    raw = _read_zip_member(archive, by_name['Metadata/slice_info.config'], MAX_METADATA_MEMBER_BYTES, chunk_bytes)
+                    build = _slicer_build_metadata(raw)
+                parameter_digest = _parameter_fingerprint(archive, by_name, chunk_bytes)
+                metadata: dict[str, object] = {'slicer_build': build}
+                metadata.update(_project_metadata(archive, by_name, chunk_bytes))
+                if parameter_digest:
+                    metadata['parameters_sha256'] = parameter_digest
+                return (tuple((name for _, name in plates)), metadata, parameter_digest)
+        except ArtifactError:
+            raise
+        except (OSError, zipfile.BadZipFile, RuntimeError, EOFError, NotImplementedError) as exc:
+            raise ArtifactError('invalid 3MF archive') from exc
+
+    def _open_with_flags(path, mode, flags, permissions=511):
+        """open() that creates the descriptor with exact ``os.open`` flags.
+
+    Exclusive creation and no-follow keep their meaning, while the file is opened
+    by path. OrcaSlicer asks the user about a plugin that wraps a bare descriptor
+    (``os.fdopen``) and cannot show which file it is, and asks again every time.
+    """
+        return open(path, mode, opener=lambda opened, _flags: os.open(opened, flags, permissions))
+
+    def _stage_root(path: str | os.PathLike[str]) -> Path:
+        root = Path(path).expanduser().absolute()
+        if root.exists() and (root.is_symlink() or not root.is_dir()):
+            raise ArtifactError('staging root must be a real directory')
+        root.mkdir(mode=448, parents=True, exist_ok=True)
+        if root.is_symlink():
+            raise ArtifactError('staging root must not be a symbolic link')
+        root = root.resolve(strict=True)
+        try:
+            os.chmod(root, 448)
+        except OSError:
+            pass
+        return root
+
+    def stage_artifact(source_path: str | os.PathLike[str], staging_dir: str | os.PathLike[str], *, provenance: str='manual_import', max_bytes: int=DEFAULT_MAX_BYTES, chunk_bytes: int=DEFAULT_CHUNK_BYTES, artifact_id: str | None=None) -> StagedArtifact:
+        """Copy, inspect, and digest an artifact using bounded memory.
+
+    `staging_dir` is a Python-supplied account storage path. The returned path
+    is opaque and generated in Python; never accept it from JavaScript.
+    """
+        _validate_limits(max_bytes, chunk_bytes)
+        if provenance not in _PROVENANCE:
+            raise ArtifactError('invalid artifact provenance')
+        filename = _safe_filename(source_path)
+        source = Path(source_path)
+        try:
+            source_info = source.lstat()
+        except OSError as exc:
+            raise ArtifactError('source file is unavailable') from exc
+        if not stat.S_ISREG(source_info.st_mode) or stat.S_ISLNK(source_info.st_mode):
+            raise ArtifactError('source must be a regular file')
+        if source_info.st_size < 1 or source_info.st_size > max_bytes:
+            raise ArtifactError('artifact size is outside configured bounds')
+        kind = _artifact_kind(filename)
+        identifier = artifact_id or str(uuid.uuid4())
+        try:
+            identifier = str(uuid.UUID(identifier))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ArtifactError('invalid artifact id') from exc
+        root = _stage_root(staging_dir)
+        destination = root / (identifier + '.artifact')
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= _O_BINARY | _O_NOFOLLOW
+        created = False
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            source_flags = os.O_RDONLY | _O_BINARY | _O_NOFOLLOW
+            source_stream = _open_with_flags(source, 'rb', source_flags)
+            try:
+                target_stream = _open_with_flags(destination, 'wb', flags, 384)
+            except FileExistsError as exc:
+                source_stream.close()
+                raise ArtifactError('artifact id is already staged') from exc
+            except BaseException:
+                source_stream.close()
+                raise
+            created = True
+            with source_stream, target_stream:
+                opened_info = os.fstat(source_stream.fileno())
+                if not stat.S_ISREG(opened_info.st_mode) or (opened_info.st_dev, opened_info.st_ino) != (source_info.st_dev, source_info.st_ino):
+                    raise ArtifactError('source changed during staging')
+                while True:
+                    block = source_stream.read(chunk_bytes)
+                    if not block:
+                        break
+                    copied += len(block)
+                    if copied > max_bytes:
+                        raise ArtifactError('artifact exceeds size limit')
+                    target_stream.write(block)
+                    digest.update(block)
+                target_stream.flush()
+                os.fsync(target_stream.fileno())
+                after_info = os.fstat(source_stream.fileno())
+                if copied != source_info.st_size or (after_info.st_size, after_info.st_mtime_ns) != (opened_info.st_size, opened_info.st_mtime_ns):
+                    raise ArtifactError('source changed during staging')
+                source_stream.seek(0)
+                source_size, source_digest = _hash_stream(source_stream, chunk_bytes, max_bytes)
+                if source_size != copied or source_digest != digest.hexdigest():
+                    raise ArtifactError('source changed during staging')
+            os.chmod(destination, stat.S_IREAD)
+            return inspect_staged_path(destination, filename, root, provenance=provenance, expected_sha256=digest.hexdigest(), max_bytes=max_bytes, chunk_bytes=chunk_bytes, artifact_id=identifier)
+        except BaseException:
+            if created:
+                try:
+                    os.chmod(destination, stat.S_IWRITE | stat.S_IREAD)
+                    destination.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def inspect_staged_path(path: str | os.PathLike[str], filename: str, staging_dir: str | os.PathLike[str], *, provenance: str='manual_import', expected_sha256: str, max_bytes: int=DEFAULT_MAX_BYTES, chunk_bytes: int=DEFAULT_CHUNK_BYTES, artifact_id: str | None=None) -> StagedArtifact:
+        """Inspect a receiver-created file in Python-owned staging without copying it.
+
+    The caller must pass a private account-storage root and an opaque path that
+    the Python receiver created. The path is never obtained from WebView input.
+    Its complete digest must match the receiver's claimed digest.
+    """
+        _validate_limits(max_bytes, chunk_bytes)
+        if provenance not in _PROVENANCE:
+            raise ArtifactError('invalid artifact provenance')
+        if not isinstance(expected_sha256, str) or re.fullmatch('[0-9a-f]{64}', expected_sha256) is None:
+            raise ArtifactError('invalid expected artifact digest')
+        safe_name = _safe_filename(filename)
+        identifier = artifact_id or str(uuid.uuid4())
+        try:
+            identifier = str(uuid.UUID(identifier))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ArtifactError('invalid artifact id') from exc
+        root = _stage_root(staging_dir)
+        candidate = Path(path).absolute()
+        try:
+            if candidate.is_symlink():
+                raise ArtifactError('staged path must not be a symbolic link')
+            resolved = candidate.resolve(strict=True)
+            if os.path.commonpath((str(root), str(resolved))) != str(root):
+                raise ArtifactError('staged path is outside private storage')
+            file_info = resolved.stat()
+        except ArtifactError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ArtifactError('staged file is unavailable') from exc
+        if not stat.S_ISREG(file_info.st_mode) or file_info.st_size < 1 or file_info.st_size > max_bytes:
+            raise ArtifactError('staged file size is outside configured bounds')
+        file_size, digest = _hash_file(resolved, chunk_bytes, max_bytes)
+        if file_size != file_info.st_size or digest != expected_sha256:
+            raise ArtifactError('receiver digest does not match staged file')
+        kind = _artifact_kind(safe_name)
+        if kind == '3mf':
+            plates, metadata, parameters_digest = _inspect_3mf(resolved, chunk_bytes)
+        else:
+            plates = ()
+            metadata = _parse_gcode_metadata(resolved, file_size)
+            parameters_digest = _gcode_parameters_digest(metadata)
+        manifest: dict[str, object] = {'schema_version': 2, 'provenance': provenance, 'artifact_id': identifier, 'sha256': digest, 'size_bytes': file_size, 'kind': 'sliced_3mf' if kind == '3mf' else 'gcode', 'slicer_build': metadata.get('slicer_build'), 'selected_plate_entry': None, 'compatible_target_ids': (), 'compatibility_evidence_refs': ()}
+        if parameters_digest is not None:
+            manifest['parameters_sha256'] = parameters_digest
+        try:
+            os.chmod(resolved, stat.S_IREAD)
+        except OSError:
+            pass
+        return StagedArtifact(path=resolved, filename=safe_name, manifest=MappingProxyType(manifest), metadata=MappingProxyType(dict(metadata)), plate_entries=plates, manifest_complete=manifest_is_complete(manifest))
+
+    def verify_staged_artifact(artifact: StagedArtifact, *, chunk_bytes: int=DEFAULT_CHUNK_BYTES, max_bytes: int=DEFAULT_MAX_BYTES) -> bool:
+        """Re-check the immutable staged copy before a later consumer uses it."""
+        _validate_limits(max_bytes, chunk_bytes)
+        if not isinstance(artifact, StagedArtifact):
+            return False
+        try:
+            if artifact.path.is_symlink() or not stat.S_ISREG(artifact.path.stat().st_mode):
+                return False
+            size, digest = _hash_file(artifact.path, chunk_bytes, max_bytes)
+            return size == artifact.manifest.get('size_bytes') and digest == artifact.manifest.get('sha256')
+        except (OSError, ArtifactError, ValueError, TypeError):
+            return False
+
+    def select_plate_entry(artifact: StagedArtifact, plate_entry: str) -> Mapping[str, object]:
+        """Return a manifest copy bound to an exact plate discovered by inspection."""
+        if not isinstance(artifact, StagedArtifact) or artifact.manifest.get('kind') != 'sliced_3mf':
+            raise ArtifactError('artifact is not a sliced 3MF')
+        if not isinstance(plate_entry, str) or plate_entry not in artifact.plate_entries:
+            raise ArtifactError('selected plate was not discovered in this artifact')
+        manifest = dict(artifact.manifest)
+        manifest['selected_plate_entry'] = plate_entry
+        return MappingProxyType(manifest)
+
+    def stage_selected_plate(artifact: StagedArtifact, plate_entry: str, staging_dir: str | os.PathLike[str], *, max_bytes: int=MAX_ZIP_MEMBER_BYTES, chunk_bytes: int=DEFAULT_CHUNK_BYTES) -> StagedPlate:
+        """Stream one inspected plate into a unique staged G-code file.
+
+    Used by non-Bambu upload transports. Bambu should receive the original 3MF
+    plus `plate_entry` returned by `select_plate_entry`.
+    """
+        _validate_limits(max_bytes, chunk_bytes)
+        select_plate_entry(artifact, plate_entry)
+        artifact_size = artifact.manifest.get('size_bytes')
+        if type(artifact_size) is not int or artifact_size < 1:
+            raise ArtifactError('source artifact has invalid size metadata')
+        source_max_bytes = max(DEFAULT_MAX_BYTES, artifact_size)
+        if not verify_staged_artifact(artifact, chunk_bytes=chunk_bytes, max_bytes=source_max_bytes):
+            raise ArtifactError('source artifact failed digest verification')
+        root = _stage_root(staging_dir)
+        destination = root / (str(uuid.uuid4()) + '.gcode')
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= _O_BINARY | _O_NOFOLLOW
+        created = False
+        try:
+            source_stream = _open_with_flags(artifact.path, 'rb', os.O_RDONLY | _O_BINARY | _O_NOFOLLOW)
+            with source_stream as source:
+                before_size, before_digest = _hash_stream(source, chunk_bytes, source_max_bytes)
+                if before_size != artifact.manifest.get('size_bytes') or before_digest != artifact.manifest.get('sha256'):
+                    raise ArtifactError('source artifact failed digest verification')
+                source.seek(0)
+                with zipfile.ZipFile(source, 'r') as archive:
+                    try:
+                        info = archive.getinfo(plate_entry)
+                    except KeyError as exc:
+                        raise ArtifactError('selected plate is missing') from exc
+                    match = _PLATE_ENTRY.fullmatch(info.filename)
+                    if match is None or info.filename != plate_entry or info.is_dir() or info.flag_bits & 1 or stat.S_ISLNK(info.external_attr >> 16):
+                        raise ArtifactError('selected plate entry is unsafe')
+                    if info.file_size < 1 or info.file_size > max_bytes:
+                        raise ArtifactError('selected plate exceeds size limit')
+                    target_stream = _open_with_flags(destination, 'wb', flags, 384)
+                    created = True
+                    digest = hashlib.sha256()
+                    copied = 0
+                    with target_stream as target, archive.open(info, 'r') as member:
+                        while True:
+                            block = member.read(chunk_bytes)
+                            if not block:
+                                break
+                            copied += len(block)
+                            if copied > max_bytes:
+                                raise ArtifactError('selected plate exceeds size limit')
+                            target.write(block)
+                            digest.update(block)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    if copied != info.file_size:
+                        raise ArtifactError('selected plate size mismatch')
+                source.seek(0)
+                after_size, after_digest = _hash_stream(source, chunk_bytes, source_max_bytes)
+                if (after_size, after_digest) != (before_size, before_digest):
+                    raise ArtifactError('source artifact changed during plate extraction')
+            os.chmod(destination, stat.S_IREAD)
+            result = StagedPlate(destination, plate_entry, copied, digest.hexdigest(), str(artifact.manifest.get('artifact_id', '')))
+            if not verify_staged_plate(result, chunk_bytes=chunk_bytes, max_bytes=max_bytes):
+                raise ArtifactError('extracted plate verification failed')
+            return result
+        except BaseException:
+            if created:
+                try:
+                    os.chmod(destination, stat.S_IWRITE | stat.S_IREAD)
+                    destination.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def _is_reparse_point(info: os.stat_result) -> bool:
+        """Recognize Windows reparse points as well as POSIX symbolic links."""
+        attributes = getattr(info, 'st_file_attributes', 0)
+        reparse_flag = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 1024)
+        return bool(attributes & reparse_flag)
+
+    def _discardable_stage_path(path: Path, staging_dir: str | os.PathLike[str], expected_name: re.Pattern[str]) -> Path | None:
+        """Validate a direct, plugin-named child of a real staging directory."""
+        requested_root = Path(staging_dir).expanduser().absolute()
+        try:
+            root_info = requested_root.lstat()
+            if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode) or _is_reparse_point(root_info):
+                raise ArtifactError('staging root must be a real directory')
+            root = requested_root.resolve(strict=True)
+            candidate = Path(path).absolute()
+            if expected_name.fullmatch(candidate.name) is None:
+                raise ArtifactError('staged file is not a plugin-created temporary')
+            if candidate.parent != root or candidate.parent.resolve(strict=True) != root:
+                raise ArtifactError('staged file is outside private storage')
+            try:
+                file_info = candidate.lstat()
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(file_info.st_mode) or stat.S_ISLNK(file_info.st_mode) or _is_reparse_point(file_info):
+                raise ArtifactError('staged file must be a regular file')
+            return candidate
+        except ArtifactError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise ArtifactError('staged file is unavailable') from exc
+
+    def discard_staged_artifact(artifact: StagedArtifact, staging_dir: str | os.PathLike[str], *, selected_plate: StagedPlate | None=None) -> bool:
+        """Remove only a plugin-named staged copy, optionally with its extracted plate.
+
+    This operation accepts Python-created handles, never browser paths. Both
+    files must be direct regular-file children of the caller's real staging
+    directory, and their generated names must match this module's staging
+    formats. User source files and retained outbox files are outside this API.
+    Missing files are treated as already discarded so callers can retry safely.
+    """
+        if not isinstance(artifact, StagedArtifact):
+            raise ArtifactError('invalid staged artifact handle')
+        artifact_id = artifact.manifest.get('artifact_id')
+        try:
+            if str(uuid.UUID(str(artifact_id))) != str(artifact_id):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ArtifactError('invalid staged artifact id') from exc
+        targets = [_discardable_stage_path(artifact.path, staging_dir, _ARTIFACT_STAGE_NAME)]
+        if selected_plate is not None:
+            if not isinstance(selected_plate, StagedPlate) or selected_plate.source_artifact_id != artifact_id:
+                raise ArtifactError('selected plate does not belong to this artifact')
+            targets.append(_discardable_stage_path(selected_plate.path, staging_dir, _PLATE_STAGE_NAME))
+        existing = [target for target in targets if target is not None]
+        for target in existing:
+            try:
+                os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+                target.unlink()
+            except OSError as exc:
+                raise ArtifactError('could not discard staged temporary') from exc
+        return bool(existing)
+
+    def discard_staged_plate(plate: StagedPlate, staging_dir: str | os.PathLike[str]) -> bool:
+        """Remove one extracted plate temporary without touching its source artifact."""
+        if not isinstance(plate, StagedPlate):
+            raise ArtifactError('invalid staged plate handle')
+        try:
+            if str(uuid.UUID(str(plate.source_artifact_id))) != str(plate.source_artifact_id):
+                raise ValueError
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ArtifactError('invalid source artifact id') from exc
+        target = _discardable_stage_path(plate.path, staging_dir, _PLATE_STAGE_NAME)
+        if target is None:
+            return False
+        try:
+            os.chmod(target, stat.S_IREAD | stat.S_IWRITE)
+            target.unlink()
+        except OSError as exc:
+            raise ArtifactError('could not discard staged plate temporary') from exc
+        return True
+
+    def _hash_stream(stream, chunk_bytes: int, max_bytes: int) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            block = stream.read(chunk_bytes)
+            if not block:
+                break
+            size += len(block)
+            if size > max_bytes:
+                raise ArtifactError('artifact exceeds size limit')
+            digest.update(block)
+        return (size, digest.hexdigest())
+
+    def verify_staged_plate(plate: StagedPlate, *, chunk_bytes: int=DEFAULT_CHUNK_BYTES, max_bytes: int=MAX_ZIP_MEMBER_BYTES) -> bool:
+        _validate_limits(max_bytes, chunk_bytes)
+        if not isinstance(plate, StagedPlate):
+            return False
+        try:
+            if plate.path.is_symlink() or not stat.S_ISREG(plate.path.stat().st_mode):
+                return False
+            size, digest = _hash_file(plate.path, chunk_bytes, max_bytes)
+            return size == plate.size_bytes and digest == plate.sha256
+        except (OSError, ArtifactError, ValueError, TypeError):
+            return False
+    return dict(locals())
+
+
+def _pf_define_transfer():
+    import hashlib
+    import hmac
+    import os
+    import re
+    import secrets
+    import stat
+    import threading
+    import time
+    from dataclasses import dataclass
+    from pathlib import Path
+    MAX_CHUNK_BYTES = 32 * 1024
+    DEFAULT_MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+    DEFAULT_STORAGE_QUOTA_BYTES = 2 * 1024 * 1024 * 1024
+    DEFAULT_IDLE_TIMEOUT_SECONDS = 15 * 60
+    _SHA256_RE = re.compile('[0-9a-fA-F]{64}\\Z')
+    _ALLOWED_SUFFIXES = ('.gcode', '.gco', '.3mf')
+
+    class ArtifactTransferError(ValueError):
+        """A transfer is invalid, incomplete, expired, or over its configured bound."""
+
+    @dataclass(frozen=True)
+    class ReceivedArtifact:
+        """A complete artifact atomically installed in the approved storage directory."""
+        path: Path
+        filename: str
+        size_bytes: int
+        sha256: str
+
+    @dataclass
+    class _Transfer:
+        owner: str
+        token: str
+        filename: str
+        expected_size: int
+        expected_sha256: str
+        temp_path: Path
+        stream: object
+        digest: object
+        received_size: int
+        next_sequence: int
+        touched_at: float
+
+    def _valid_digest(value):
+        return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+    def _safe_filename(value):
+        if not isinstance(value, str) or not value or len(value) > 255:
+            raise ArtifactTransferError('invalid artifact filename')
+        if '/' in value or '\\' in value:
+            raise ArtifactTransferError('invalid artifact filename')
+        leaf = value
+        if leaf in ('', '.', '..') or any((ord(ch) < 32 or ch in ':\x00<>|"?*' for ch in leaf)):
+            raise ArtifactTransferError('invalid artifact filename')
+        if not leaf.lower().endswith(_ALLOWED_SUFFIXES):
+            raise ArtifactTransferError('unsupported artifact type')
+        return leaf
+
+    class ArtifactTransferManager:
+        """Receive bounded, ordered chunks into private files in one storage root.
+
+    One transfer can be active for each owner key. The manager itself is safe
+    to call from multiple threads. The owner key must be an application-owned
+    string, never a value used directly as a path.
+    """
+
+        def __init__(self, storage_dir, max_artifact_bytes=DEFAULT_MAX_ARTIFACT_BYTES, storage_quota_bytes=DEFAULT_STORAGE_QUOTA_BYTES, idle_timeout_seconds=DEFAULT_IDLE_TIMEOUT_SECONDS, clock=None):
+            if type(max_artifact_bytes) is not int or max_artifact_bytes < 1:
+                raise ValueError('max_artifact_bytes must be a positive integer')
+            if type(storage_quota_bytes) is not int or storage_quota_bytes < 1:
+                raise ValueError('storage_quota_bytes must be a positive integer')
+            if type(idle_timeout_seconds) not in (int, float) or idle_timeout_seconds <= 0:
+                raise ValueError('idle_timeout_seconds must be positive')
+            self.storage_dir = Path(storage_dir).expanduser().resolve()
+            self.max_artifact_bytes = max_artifact_bytes
+            self.storage_quota_bytes = storage_quota_bytes
+            self.idle_timeout_seconds = float(idle_timeout_seconds)
+            self._clock = clock or time.monotonic
+            self._lock = threading.RLock()
+            self._by_owner = {}
+
+        def begin(self, owner, filename, total_bytes, sha256=None):
+            """Reserve one transfer and return its unguessable, server-made token."""
+            self._validate_owner(owner)
+            safe_name = _safe_filename(filename)
+            if type(total_bytes) is not int or not 1 <= total_bytes <= self.max_artifact_bytes:
+                raise ArtifactTransferError('artifact size is outside the allowed range')
+            if sha256 is not None and (not _valid_digest(sha256)):
+                raise ArtifactTransferError('invalid artifact SHA-256')
+            expected_digest = sha256.lower() if sha256 is not None else None
+            with self._lock:
+                self._expire_locked()
+                if owner in self._by_owner:
+                    raise ArtifactTransferError('this owner already has an active transfer')
+                self._ensure_storage()
+                reserved = sum((item.expected_size for item in self._by_owner.values()))
+                current = self._storage_bytes()
+                if current + reserved + total_bytes > self.storage_quota_bytes:
+                    raise ArtifactTransferError('artifact storage quota exceeded')
+                token = secrets.token_urlsafe(32)
+                temp_path = self.storage_dir / ('.pf-transfer-' + secrets.token_hex(16) + '.part')
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                if hasattr(os, 'O_BINARY'):
+                    flags |= os.O_BINARY
+                try:
+                    stream = open(str(temp_path), 'wb', opener=lambda path, _flags: os.open(path, flags, 384))
+                except FileExistsError:
+                    raise
+                except BaseException:
+                    self._unlink(temp_path)
+                    raise
+                self._by_owner[owner] = _Transfer(owner=owner, token=token, filename=safe_name, expected_size=total_bytes, expected_sha256=expected_digest, temp_path=temp_path, stream=stream, digest=hashlib.sha256(), received_size=0, next_sequence=0, touched_at=self._clock())
+                return token
+
+        def append(self, owner, token, sequence, chunk, chunk_sha256=None):
+            """Persist one raw chunk after validating ownership, order, size and hash."""
+            with self._lock:
+                transfer = self._get_transfer(owner, token)
+                if type(sequence) is not int or sequence != transfer.next_sequence:
+                    raise ArtifactTransferError('unexpected artifact chunk sequence')
+                if not isinstance(chunk, bytes) or not 1 <= len(chunk) <= MAX_CHUNK_BYTES:
+                    raise ArtifactTransferError('artifact chunk must be 1..32 KiB of raw bytes')
+                if chunk_sha256 is not None and (not _valid_digest(chunk_sha256)):
+                    raise ArtifactTransferError('invalid chunk SHA-256')
+                if chunk_sha256 is not None:
+                    actual_chunk_digest = hashlib.sha256(chunk).hexdigest()
+                    if not hmac.compare_digest(actual_chunk_digest, chunk_sha256.lower()):
+                        raise ArtifactTransferError('artifact chunk SHA-256 mismatch')
+                if transfer.received_size + len(chunk) > transfer.expected_size:
+                    raise ArtifactTransferError('artifact exceeds declared size')
+                try:
+                    transfer.stream.write(chunk)
+                except OSError as exc:
+                    self._discard_locked(transfer)
+                    raise ArtifactTransferError('could not write artifact chunk') from exc
+                transfer.digest.update(chunk)
+                transfer.received_size += len(chunk)
+                transfer.next_sequence += 1
+                transfer.touched_at = self._clock()
+                return transfer.received_size
+
+        def finish(self, owner, token):
+            """Verify the whole artifact, fsync it, and publish a generated filename."""
+            with self._lock:
+                transfer = self._get_transfer(owner, token)
+                if transfer.received_size != transfer.expected_size:
+                    raise ArtifactTransferError('artifact transfer is incomplete')
+                actual_sha256 = transfer.digest.hexdigest()
+                if transfer.expected_sha256 is not None and (not hmac.compare_digest(actual_sha256, transfer.expected_sha256)):
+                    self._discard_locked(transfer)
+                    raise ArtifactTransferError('artifact SHA-256 mismatch')
+                final_path = self.storage_dir / ('pf-artifact-' + secrets.token_hex(16) + self._extension(transfer.filename))
+                try:
+                    transfer.stream.flush()
+                    os.fsync(transfer.stream.fileno())
+                    transfer.stream.close()
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    if hasattr(os, 'O_BINARY'):
+                        flags |= os.O_BINARY
+                    fd = os.open(str(final_path), flags, 384)
+                    os.close(fd)
+                    os.replace(str(transfer.temp_path), str(final_path))
+                    self._fsync_directory()
+                except OSError as exc:
+                    self._unlink(final_path)
+                    self._discard_locked(transfer)
+                    raise ArtifactTransferError('could not finalize artifact') from exc
+                del self._by_owner[owner]
+                return ReceivedArtifact(path=final_path, filename=transfer.filename, size_bytes=transfer.received_size, sha256=actual_sha256)
+
+        def cancel(self, owner, token):
+            """Cancel the matching owner's transfer and remove its incomplete file."""
+            with self._lock:
+                transfer = self._get_transfer(owner, token)
+                self._discard_locked(transfer)
+
+        def expire(self):
+            """Remove and count all incomplete transfers past the idle timeout."""
+            with self._lock:
+                return self._expire_locked()
+
+        def active_owners(self):
+            """Return a snapshot of active owner keys for diagnostics and scheduling."""
+            with self._lock:
+                self._expire_locked()
+                return tuple(self._by_owner)
+
+        @staticmethod
+        def _validate_owner(owner):
+            if not isinstance(owner, str) or not owner or len(owner) > 256:
+                raise ArtifactTransferError('invalid transfer owner')
+
+        def _get_transfer(self, owner, token):
+            self._validate_owner(owner)
+            if not isinstance(token, str):
+                raise ArtifactTransferError('invalid artifact transfer token')
+            self._expire_locked()
+            transfer = self._by_owner.get(owner)
+            if transfer is None or not hmac.compare_digest(transfer.token, token):
+                raise ArtifactTransferError('artifact transfer is unavailable')
+            return transfer
+
+        def _ensure_storage(self):
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
+            info = self.storage_dir.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise ArtifactTransferError('artifact storage directory is unsafe')
+
+        def _storage_bytes(self):
+            total = 0
+            active = {item.temp_path.name for item in self._by_owner.values()}
+            try:
+                with os.scandir(self.storage_dir) as entries:
+                    for entry in entries:
+                        if entry.name in active:
+                            continue
+                        try:
+                            if entry.is_file(follow_symlinks=False):
+                                total += entry.stat(follow_symlinks=False).st_size
+                                if total > self.storage_quota_bytes:
+                                    return total
+                        except OSError as exc:
+                            raise ArtifactTransferError('could not inspect artifact storage quota') from exc
+            except OSError as exc:
+                raise ArtifactTransferError('could not inspect artifact storage quota') from exc
+            return total
+
+        def _expire_locked(self):
+            now = self._clock()
+            expired = [item for item in self._by_owner.values() if now - item.touched_at >= self.idle_timeout_seconds]
+            for transfer in expired:
+                self._discard_locked(transfer)
+            return len(expired)
+
+        def _discard_locked(self, transfer):
+            try:
+                if not transfer.stream.closed:
+                    transfer.stream.close()
+            finally:
+                self._unlink(transfer.temp_path)
+                if self._by_owner.get(transfer.owner) is transfer:
+                    del self._by_owner[transfer.owner]
+
+        @staticmethod
+        def _unlink(path):
+            try:
+                Path(path).unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+        @staticmethod
+        def _extension(filename):
+            lower = filename.lower()
+            if lower.endswith('.gcode'):
+                return '.gcode'
+            if lower.endswith('.gco'):
+                return '.gco'
+            return '.3mf'
+
+        def _fsync_directory(self):
+            if os.name == 'nt':
+                return
+            flags = os.O_RDONLY
+            if hasattr(os, 'O_DIRECTORY'):
+                flags |= os.O_DIRECTORY
+            try:
+                fd = os.open(str(self.storage_dir), flags)
+            except OSError:
+                return
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    return dict(locals())
+
+
+def _pf_define_upload():
+    import http.client
+    import os
+    import re
+    import ssl
+    import urllib.parse
+    from collections.abc import Mapping
+    from pathlib import Path
+    DEFAULT_CHUNK_SIZE = 64 * 1024
+    MAX_CHUNK_SIZE = 1024 * 1024
+    _BOUNDARY = '----PrintFarmUpload7MA4YWxkTrZu0gW'
+    _HEADER_NAME_RE = re.compile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+    def post_multipart_file(url: str, file_path: str | os.PathLike[str], *, file_field: str='file', filename: str | None=None, fields: Mapping[str, object] | None=None, headers: Mapping[str, str] | None=None, timeout: float=30.0, ssl_context: ssl.SSLContext | None=None, chunk_size: int=DEFAULT_CHUNK_SIZE) -> int:
+        """POST a file as multipart/form-data and return the HTTP status.
+
+    The request body is sent in bounded pieces with an exact Content-Length.
+    Redirects are never followed. Only ``http`` and ``https`` URLs without
+    embedded credentials are accepted.
+    """
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme.lower() not in ('http', 'https'):
+            raise ValueError('upload URL must use http or https')
+        if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+            raise ValueError('upload URL must have a host and no embedded credentials')
+        if parsed.fragment:
+            raise ValueError('upload URL must not contain a fragment')
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError('upload URL has an invalid port') from exc
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool):
+            raise ValueError('chunk_size must be an integer')
+        if chunk_size < 1 or chunk_size > MAX_CHUNK_SIZE:
+            raise ValueError('chunk_size must be between 1 and %d' % MAX_CHUNK_SIZE)
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError('timeout must be a positive number')
+        body_prefix, body_suffix, content_type = _multipart_envelope(file_field=file_field, filename=filename if filename is not None else Path(file_path).name, fields=fields)
+        connection_type = http.client.HTTPSConnection if parsed.scheme.lower() == 'https' else http.client.HTTPConnection
+        connection_options = {'timeout': timeout}
+        if parsed.scheme.lower() == 'https':
+            connection_options['context'] = ssl_context or ssl.create_default_context()
+        connection = connection_type(parsed.hostname, port=port, **connection_options)
+        request_target = urllib.parse.urlunsplit(('', '', parsed.path or '/', parsed.query, ''))
+        request_headers = _validated_headers(headers)
+        request_headers['Content-Type'] = content_type
+        request_headers.setdefault('Connection', 'close')
+        try:
+            with open(file_path, 'rb') as source:
+                file_size = os.fstat(source.fileno()).st_size
+                content_length = len(body_prefix) + file_size + len(body_suffix)
+                request_headers['Content-Length'] = str(content_length)
+                connection.putrequest('POST', request_target)
+                for name, value in request_headers.items():
+                    connection.putheader(name, value)
+                connection.endheaders()
+                connection.send(body_prefix)
+                _send_file(connection, source, file_size, chunk_size)
+                connection.send(body_suffix)
+                response = connection.getresponse()
+                return response.status
+        finally:
+            connection.close()
+
+    def _send_file(connection, source, file_size: int, chunk_size: int) -> None:
+        remaining = file_size
+        while remaining:
+            chunk = source.read(min(chunk_size, remaining))
+            if not chunk:
+                raise OSError('upload file changed or ended before its declared size')
+            connection.send(chunk)
+            remaining -= len(chunk)
+
+    def _multipart_envelope(*, file_field, filename, fields):
+        safe_file_field = _quoted_parameter(file_field, 'file field')
+        safe_filename = _quoted_filename(filename)
+        prefix = bytearray()
+        for key, value in (fields or {}).items():
+            safe_key = _quoted_parameter(key, 'field name')
+            prefix.extend(('--%s\r\n' % _BOUNDARY).encode('ascii'))
+            prefix.extend(('Content-Disposition: form-data; name="%s"\r\n\r\n' % safe_key).encode('ascii'))
+            prefix.extend(str(value).encode('utf-8'))
+            prefix.extend(b'\r\n')
+        prefix.extend(('--%s\r\n' % _BOUNDARY).encode('ascii'))
+        prefix.extend(('Content-Disposition: form-data; name="%s"; %s\r\nContent-Type: application/octet-stream\r\n\r\n' % (safe_file_field, safe_filename)).encode('ascii'))
+        suffix = ('\r\n--%s--\r\n' % _BOUNDARY).encode('ascii')
+        return (bytes(prefix), suffix, 'multipart/form-data; boundary=' + _BOUNDARY)
+
+    def _quoted_parameter(value, label: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError('%s must be a non-empty string' % label)
+        if any((ord(char) < 32 or ord(char) == 127 for char in value)):
+            raise ValueError('%s must not contain control characters' % label)
+        if any((ord(char) > 127 for char in value)):
+            raise ValueError('%s must contain only ASCII characters' % label)
+        return value.replace('\\', '\\\\').replace('"', '\\"')
+
+    def _quoted_filename(value) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError('filename must be a non-empty string')
+        if any((ord(char) < 32 or ord(char) == 127 for char in value)):
+            raise ValueError('filename must not contain control characters')
+        ascii_fallback = ''.join((char if 32 <= ord(char) < 127 else '_' for char in value))
+        ascii_fallback = ascii_fallback.replace('\\', '\\\\').replace('"', '\\"')
+        encoded = urllib.parse.quote(value.encode('utf-8'), safe='')
+        return 'filename="%s"; filename*=UTF-8\'\'%s' % (ascii_fallback, encoded)
+
+    def _validated_headers(headers):
+        result = {}
+        seen = set()
+        for name, value in (headers or {}).items():
+            if not isinstance(name, str) or not _HEADER_NAME_RE.fullmatch(name):
+                raise ValueError('invalid HTTP header name')
+            lower_name = name.lower()
+            if lower_name in seen:
+                raise ValueError('duplicate HTTP header name')
+            if lower_name in {'content-length', 'transfer-encoding', 'content-type', 'host'}:
+                raise ValueError('header %s is managed by the upload transport' % name)
+            if not isinstance(value, str) or '\r' in value or '\n' in value:
+                raise ValueError('invalid HTTP header value')
+            result[name] = value
+            seen.add(lower_name)
+        return result
+    return dict(locals())
+
+
+def _pf_define_journal():
+    import hashlib
+    import json
+    import re
+    import sqlite3
+    import threading
+    import time
+    import uuid
+    from pathlib import Path
+    SCHEMA_VERSION = 3
+    DEFAULT_MAX_RECORDS = 5000
+    MAX_BINDING_BYTES = 8192
+    MAX_EVIDENCE_LENGTH = 256
+    _ACTIONS = frozenset(('upload', 'start', 'pause', 'resume', 'cancel'))
+    _TRANSITIONS = {'planned': frozenset(('dispatching', 'cancelled_before_dispatch')), 'dispatching': frozenset(('submitted', 'acknowledged', 'verified', 'rejected', 'unknown_outcome')), 'submitted': frozenset(('acknowledged', 'verified', 'rejected', 'unknown_outcome', 'manually_resolved')), 'acknowledged': frozenset(('verified', 'rejected', 'unknown_outcome', 'manually_resolved')), 'unknown_outcome': frozenset(('verified', 'rejected', 'manually_resolved')), 'verified': frozenset(), 'rejected': frozenset(), 'cancelled_before_dispatch': frozenset(), 'manually_resolved': frozenset()}
+
+    def _locked(method):
+
+        def wrapper(self, *args, **kwargs):
+            with self._lock:
+                return method(self, *args, **kwargs)
+        return wrapper
+
+    class JournalError(RuntimeError):
+        """Base error for invalid or unavailable journal operations."""
+
+    class JournalCorruptError(JournalError):
+        """The journal cannot be trusted; preserve it and fail closed."""
+
+    class ConflictError(JournalError):
+        """An operation or target conflicts with an existing durable intent."""
+
+    class TransitionError(JournalError):
+        """A requested lifecycle transition is not allowed."""
+
+    def _identity(value, label):
+        if not isinstance(value, str) or not value or len(value) > 256:
+            raise ValueError('invalid ' + label)
+        if any((ord(char) < 32 for char in value)):
+            raise ValueError('invalid ' + label)
+        return value
+
+    def _sha256(value, label, required):
+        if value is None and (not required):
+            return None
+        if not isinstance(value, str) or re.fullmatch('[0-9a-f]{64}', value) is None:
+            raise ValueError(label + ' must be a lowercase SHA-256 digest')
+        return value
+
+    def _artifact_name(value):
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value or value != value.strip() or (len(value) > 255) or (value in ('.', '..')) or any((char in value for char in ('/', '\\', ':'))) or any((ord(char) < 32 for char in value)):
+            raise ValueError('artifact_name must be a sanitized filename without a path')
+        return value
+
+    def _json_object(value, label):
+        if not isinstance(value, dict) or not value:
+            raise ValueError(label + ' must be a non-empty object')
+        try:
+            forbidden = ('password', 'token', 'secret', 'credential', 'accesscode', 'privatekey')
+
+            def inspect(item):
+                if isinstance(item, dict):
+                    for key, child in item.items():
+                        if not isinstance(key, str) or any((word in re.sub('[^a-z]', '', key.lower()) for word in forbidden)):
+                            raise ValueError(label + ' must not contain credentials')
+                        inspect(child)
+                elif isinstance(item, list):
+                    for child in item:
+                        inspect(child)
+            inspect(value)
+            encoded = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(label + ' is not JSON serializable') from exc
+        if len(encoded.encode('utf-8')) > MAX_BINDING_BYTES:
+            raise ValueError(label + ' is too large')
+        return encoded
+
+    class OperationJournal:
+        """SQLite-backed journal stored at a path inside private plugin storage.
+
+    The embedding plugin must pass its account-scoped private storage path.
+    SQLite uses FULL synchronous commits and an append-only event table. All
+    methods are safe across SQLite connections/processes; no network call is
+    made by this class.
+    """
+
+        def __init__(self, path, max_records=DEFAULT_MAX_RECORDS, timeout=5.0):
+            if isinstance(max_records, bool) or not isinstance(max_records, int) or max_records < 1:
+                raise ValueError('max_records must be a positive integer')
+            self.path = Path(path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.max_records = max_records
+            self._lock = threading.RLock()
+            try:
+                self._db = sqlite3.connect(str(self.path), timeout=timeout, isolation_level=None, check_same_thread=False)
+                self._db.row_factory = sqlite3.Row
+                self._db.execute('PRAGMA foreign_keys=ON')
+                self._db.execute('PRAGMA busy_timeout=%d' % max(1, int(timeout * 1000)))
+                self._db.execute('PRAGMA synchronous=FULL')
+                self._initialize()
+                self._db.execute('PRAGMA journal_mode=WAL')
+                self._validate()
+            except JournalError:
+                db = getattr(self, '_db', None)
+                if db is not None:
+                    db.close()
+                raise
+            except (sqlite3.DatabaseError, OSError) as exc:
+                db = getattr(self, '_db', None)
+                if db is not None:
+                    db.close()
+                raise JournalCorruptError('operation journal unavailable; preserve the file') from exc
+
+        @_locked
+        def close(self):
+            self._db.close()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+
+        def _initialize(self):
+            version = self._db.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (0, 1, 2, SCHEMA_VERSION):
+                raise JournalCorruptError('unknown operation journal schema; preserve the file')
+            tables = self._db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            if version == 0 and tables:
+                raise JournalCorruptError('unrecognized non-empty operation journal; preserve the file')
+            if version == 0:
+                self._db.executescript("\n                BEGIN IMMEDIATE;\n                CREATE TABLE operations (\n                    operation_id TEXT PRIMARY KEY,\n                    account_id TEXT NOT NULL,\n                    target_id TEXT NOT NULL,\n                    binding_json TEXT NOT NULL,\n                    action TEXT NOT NULL,\n                    artifact_sha256 TEXT,\n                    plate_entry TEXT,\n                    artifact_name TEXT,\n                    fingerprint TEXT NOT NULL,\n                    state TEXT NOT NULL,\n                    created_at REAL NOT NULL,\n                    updated_at REAL NOT NULL,\n                    evidence_ref TEXT\n                );\n                CREATE INDEX operations_account_created\n                    ON operations(account_id, created_at DESC, operation_id DESC);\n                CREATE UNIQUE INDEX one_unresolved_start_per_target\n                    ON operations(account_id, target_id)\n                    WHERE action='start' AND state IN\n                    ('planned','dispatching','submitted','acknowledged','unknown_outcome');\n                CREATE UNIQUE INDEX one_unresolved_upload_per_artifact\n                    ON operations(account_id, target_id, artifact_sha256, ifnull(plate_entry,''))\n                    WHERE action='upload' AND state IN\n                    ('planned','dispatching','submitted','acknowledged','unknown_outcome');\n                CREATE TABLE operation_events (\n                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,\n                    operation_id TEXT NOT NULL REFERENCES operations(operation_id) ON DELETE CASCADE,\n                    state TEXT NOT NULL,\n                    at REAL NOT NULL,\n                    evidence_ref TEXT,\n                    note TEXT,\n                    actor TEXT NOT NULL\n                );\n                PRAGMA user_version=3;\n                COMMIT;\n            ")
+            elif version == 1:
+                if {row[0] for row in tables} != {'operations', 'operation_events'}:
+                    raise JournalCorruptError('unrecognized journal schema; preserve the file')
+                self._db.executescript("\n                BEGIN IMMEDIATE;\n                CREATE UNIQUE INDEX one_unresolved_upload_per_artifact\n                    ON operations(account_id, target_id, artifact_sha256, ifnull(plate_entry,''))\n                    WHERE action='upload' AND state IN\n                    ('planned','dispatching','submitted','acknowledged','unknown_outcome');\n                ALTER TABLE operations ADD COLUMN artifact_name TEXT;\n                PRAGMA user_version=3;\n                COMMIT;\n            ")
+            elif version == 2:
+                if {row[0] for row in tables} != {'operations', 'operation_events'}:
+                    raise JournalCorruptError('unrecognized journal schema; preserve the file')
+                self._db.executescript('\n                BEGIN IMMEDIATE;\n                ALTER TABLE operations ADD COLUMN artifact_name TEXT;\n                PRAGMA user_version=3;\n                COMMIT;\n            ')
+
+        def _validate(self):
+            integrity = self._db.execute('PRAGMA quick_check').fetchone()
+            if integrity is None or integrity[0] != 'ok':
+                raise JournalCorruptError('operation journal integrity check failed; preserve the file')
+            expected = {'operations', 'operation_events'}
+            tables = {row[0] for row in self._db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if tables != expected:
+                raise JournalCorruptError('operation journal schema is incomplete or unexpected')
+            bad = self._db.execute("\n            SELECT 1 FROM operations o WHERE o.state NOT IN\n            ('planned','dispatching','submitted','acknowledged','verified','rejected',\n             'unknown_outcome','cancelled_before_dispatch','manually_resolved')\n            OR NOT EXISTS (SELECT 1 FROM operation_events e WHERE e.operation_id=o.operation_id)\n            LIMIT 1\n        ").fetchone()
+            if bad:
+                raise JournalCorruptError('operation journal contains invalid records')
+
+        def _tx(self):
+            self._db.execute('BEGIN IMMEDIATE')
+
+        def _get_row(self, operation_id):
+            row = self._db.execute('SELECT * FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
+            if row is None:
+                raise KeyError(operation_id)
+            return row
+
+        @staticmethod
+        def _public(row):
+            result = dict(row)
+            result['target_binding'] = json.loads(result.pop('binding_json'))
+            return result
+
+        @_locked
+        def get(self, operation_id):
+            return self._public(self._get_row(_identity(operation_id, 'operation_id')))
+
+        @_locked
+        def list_operations(self, account_id, limit=100, *, before=None):
+            account_id = _identity(account_id, 'account_id')
+            if isinstance(limit, bool) or not isinstance(limit, int) or (not 1 <= limit <= 500):
+                raise ValueError('limit must be between 1 and 500')
+            if before is None:
+                rows = self._db.execute('SELECT * FROM operations WHERE account_id=? ORDER BY created_at DESC,operation_id DESC LIMIT ?', (account_id, limit)).fetchall()
+            else:
+                if not isinstance(before, tuple) or len(before) != 2:
+                    raise ValueError('before must be a (created_at, operation_id) cursor')
+                rows = self._db.execute('SELECT * FROM operations WHERE account_id=? AND (created_at,operation_id)<(?,?) ORDER BY created_at DESC,operation_id DESC LIMIT ?', (account_id, before[0], before[1], limit)).fetchall()
+            return [self._public(row) for row in rows]
+
+        @_locked
+        def list_unresolved(self, account_id, limit=100):
+            """Show holds independently of the normal recent-history page."""
+            account_id = _identity(account_id, 'account_id')
+            if isinstance(limit, bool) or not isinstance(limit, int) or (not 1 <= limit <= 500):
+                raise ValueError('limit must be between 1 and 500')
+            rows = self._db.execute("SELECT * FROM operations WHERE account_id=? AND state IN ('planned','dispatching','submitted','acknowledged','unknown_outcome') ORDER BY created_at DESC,operation_id DESC LIMIT ?", (account_id, limit)).fetchall()
+            return [self._public(row) for row in rows]
+
+        @_locked
+        def events(self, operation_id, limit=100):
+            operation_id = _identity(operation_id, 'operation_id')
+            if isinstance(limit, bool) or not isinstance(limit, int) or (not 1 <= limit <= 500):
+                raise ValueError('limit must be between 1 and 500')
+            rows = self._db.execute('SELECT state,at,evidence_ref,note,actor FROM operation_events WHERE operation_id=? ORDER BY sequence LIMIT ?', (operation_id, limit)).fetchall()
+            return [dict(row) for row in rows]
+
+        def _trim_for_insert(self):
+            count = self._db.execute('SELECT count(*) FROM operations').fetchone()[0]
+            excess = count - self.max_records + 1
+            if excess <= 0:
+                return
+            rows = self._db.execute("SELECT operation_id FROM operations WHERE state NOT IN ('planned','dispatching','submitted','acknowledged','unknown_outcome') ORDER BY updated_at,operation_id LIMIT ?", (excess,)).fetchall()
+            if len(rows) < excess:
+                raise JournalError('operation journal is full of unresolved operations')
+            self._db.executemany('DELETE FROM operations WHERE operation_id=?', [(row[0],) for row in rows])
+
+        @_locked
+        def prepare(self, *, account_id, target_id, target_binding, action, artifact_sha256=None, plate_entry=None, artifact_name=None, operation_id=None):
+            """Persist an immutable planned intent; this method never dispatches."""
+            account_id = _identity(account_id, 'account_id')
+            target_id = _identity(target_id, 'target_id')
+            if action not in _ACTIONS:
+                raise ValueError('unsupported action')
+            binding_json = _json_object(target_binding, 'target_binding')
+            remote_file = target_binding.get('remote_file')
+            remote_start = (action == 'start' and isinstance(remote_file, dict)
+                            and isinstance(remote_file.get('path'), str) and remote_file['path']
+                            and isinstance(remote_file.get('version'), (int, str)))
+            artifact_sha256 = _sha256(artifact_sha256, 'artifact_sha256',
+                                      action in ('upload', 'start') and not remote_start)
+            artifact_name = _artifact_name(artifact_name)
+            if plate_entry is not None:
+                plate_entry = _identity(plate_entry, 'plate_entry')
+                components = plate_entry.split('/')
+                if len(plate_entry) > 512 or '\\' in plate_entry or plate_entry.startswith('/') or (':' in plate_entry) or any((part in ('', '.', '..') for part in components)) or ('\x00' in plate_entry):
+                    raise ValueError('invalid plate_entry')
+            operation_id = _identity(operation_id or str(uuid.uuid4()), 'operation_id')
+            try:
+                if str(uuid.UUID(operation_id)) != operation_id:
+                    raise ValueError
+            except (ValueError, AttributeError) as exc:
+                raise ValueError('operation_id must be a canonical UUID') from exc
+            immutable = {'account_id': account_id, 'target_id': target_id, 'target_binding': json.loads(binding_json), 'action': action, 'artifact_sha256': artifact_sha256, 'plate_entry': plate_entry, 'artifact_name': artifact_name}
+            fingerprint = hashlib.sha256(json.dumps(immutable, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('utf-8')).hexdigest()
+            now = time.time()
+            try:
+                self._tx()
+                existing = self._db.execute('SELECT * FROM operations WHERE operation_id=?', (operation_id,)).fetchone()
+                if existing:
+                    if existing['fingerprint'] != fingerprint:
+                        raise ConflictError('operation ID reused with changed intent')
+                    self._db.execute('COMMIT')
+                    return self._public(existing)
+                self._trim_for_insert()
+                self._db.execute("\n                INSERT INTO operations(operation_id,account_id,target_id,binding_json,action,\n                    artifact_sha256,plate_entry,artifact_name,fingerprint,state,created_at,updated_at)\n                VALUES(?,?,?,?,?,?,?,?,?,'planned',?,?)\n            ", (operation_id, account_id, target_id, binding_json, action, artifact_sha256, plate_entry, artifact_name, fingerprint, now, now))
+                self._db.execute("INSERT INTO operation_events(operation_id,state,at,actor) VALUES(?,?,?,'local')", (operation_id, 'planned', now))
+                self._db.execute('COMMIT')
+            except sqlite3.IntegrityError as exc:
+                if self._db.in_transaction:
+                    self._db.execute('ROLLBACK')
+                raise ConflictError('an unresolved operation already protects this target or upload artifact') from exc
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute('ROLLBACK')
+                raise
+            return self.get(operation_id)
+
+        @_locked
+        def begin_dispatch(self, operation_id):
+            """Durably claim the one allowed dispatch before the first network byte."""
+            return self._transition(operation_id, 'dispatching', actor='dispatcher', expected='planned')
+
+        @_locked
+        def report(self, operation_id, state, *, evidence_ref=None, actor='transport'):
+            if state not in _TRANSITIONS:
+                raise ValueError('unsupported state')
+            return self._transition(operation_id, state, evidence_ref=evidence_ref, actor=actor)
+
+        @_locked
+        def _transition(self, operation_id, state, *, evidence_ref=None, note=None, actor, expected=None):
+            operation_id = _identity(operation_id, 'operation_id')
+            actor = _identity(actor, 'actor')
+            if evidence_ref is not None:
+                if not isinstance(evidence_ref, str) or not evidence_ref or len(evidence_ref) > MAX_EVIDENCE_LENGTH or (re.fullmatch('[A-Za-z0-9_.:/-]+', evidence_ref) is None):
+                    raise ValueError('evidence_ref must be a short opaque redacted reference')
+            if state in ('verified', 'rejected', 'acknowledged') and (not evidence_ref):
+                raise ValueError('matching protocol evidence is required for this state')
+            self._tx()
+            try:
+                old = self._get_row(operation_id)
+                if expected is not None and old['state'] != expected:
+                    self._db.execute('COMMIT')
+                    return False
+                if state not in _TRANSITIONS.get(old['state'], frozenset()):
+                    raise TransitionError('invalid transition %s -> %s' % (old['state'], state))
+                now = time.time()
+                self._db.execute('UPDATE operations SET state=?,updated_at=?,evidence_ref=? WHERE operation_id=?', (state, now, evidence_ref, operation_id))
+                self._db.execute('INSERT INTO operation_events(operation_id,state,at,evidence_ref,note,actor) VALUES(?,?,?,?,?,?)', (operation_id, state, now, evidence_ref, note, actor))
+                self._db.execute('COMMIT')
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute('ROLLBACK')
+                raise
+            return self.get(operation_id)
+
+        @_locked
+        def recover_interrupted(self, account_id, *, exclusive_session_owner=False):
+            """Conservatively mark in-flight calls unknown (and never-sent plans cancelled)
+        after exclusive ownership.
+
+        Caller must establish exclusive account runtime ownership first; a timer
+        or process age is not proof that another writer stopped.
+        """
+            account_id = _identity(account_id, 'account_id')
+            if exclusive_session_owner is not True:
+                raise PermissionError('exclusive session ownership must be established first')
+            self._tx()
+            try:
+                rows = self._db.execute("SELECT operation_id FROM operations WHERE account_id=? AND state IN ('dispatching','submitted','acknowledged')", (account_id,)).fetchall()
+                planned = self._db.execute("SELECT operation_id FROM operations WHERE account_id=? AND state='planned'", (account_id,)).fetchall()
+                now = time.time()
+                for row in rows:
+                    op_id = row[0]
+                    self._db.execute("UPDATE operations SET state='unknown_outcome',updated_at=? WHERE operation_id=?", (now, op_id))
+                    self._db.execute("INSERT INTO operation_events(operation_id,state,at,actor) VALUES(?,'unknown_outcome',?,'recovery')", (op_id, now))
+                for row in planned:
+                    op_id = row[0]
+                    self._db.execute("UPDATE operations SET state='cancelled_before_dispatch',updated_at=? WHERE operation_id=?", (now, op_id))
+                    self._db.execute("INSERT INTO operation_events(operation_id,state,at,actor) VALUES(?,'cancelled_before_dispatch',?,'recovery')", (op_id, now))
+                rows = list(rows) + list(planned)
+                self._db.execute('COMMIT')
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute('ROLLBACK')
+                raise
+            return len(rows)
+
+        @_locked
+        def reconcile(self, operation_id, outcome, *, evidence_ref, actor='reconciler'):
+            """Record read-only, target-matched observation; never calls a device."""
+            if outcome not in ('verified', 'rejected'):
+                raise ValueError('reconciliation outcome must be verified or rejected')
+            row = self._get_row(_identity(operation_id, 'operation_id'))
+            if row['state'] not in ('dispatching', 'submitted', 'acknowledged', 'unknown_outcome'):
+                raise TransitionError('only an in-flight or unknown operation can be reconciled')
+            return self._transition(operation_id, outcome, evidence_ref=evidence_ref, actor=actor)
+
+        @_locked
+        def resolve_unknown_manually(self, operation_id, *, reason, actor):
+            """Release a completed or uncertain transport hold without claiming success.
+
+        An actively dispatching call is never released here: the caller must
+        first establish exclusive session ownership and recover it as unknown.
+        """
+            if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 500:
+                raise ValueError('a concise manual resolution reason is required')
+            actor = _identity(actor, 'actor')
+            safe_reason = re.sub('[^A-Za-z0-9 _.,:;()/-]', '?', reason.strip())
+            evidence = 'manual:' + hashlib.sha256((actor + '\n' + safe_reason).encode('utf-8')).hexdigest()
+            return self._transition(operation_id, 'manually_resolved', evidence_ref=evidence, note=safe_reason[:500], actor=actor)
+    return dict(locals())
+
+
+def _pf_define_scheduler():
+    import threading
+    import time
+    from collections import deque
+
+    class ActionScheduler:
+        ACCEPTED = 'accepted'
+        DUPLICATE = 'duplicate'
+        FULL = 'queue_full'
+        STOPPING = 'shutting_down'
+        CONTROL_KINDS = frozenset(('cancel', 'pause', 'resume', 'stop'))
+        CONTROL_BURST_LIMIT = 4
+
+        def __init__(self, max_pending=64, max_workers=4, name='print-farm-action'):
+            if not isinstance(max_pending, int) or max_pending < 1:
+                raise ValueError('max_pending must be a positive integer')
+            if not isinstance(max_workers, int) or max_workers < 1:
+                raise ValueError('max_workers must be a positive integer')
+            self.max_pending = max_pending
+            self.max_workers = max_workers
+            self._condition = threading.Condition()
+            self._queues = {}
+            self._busy_targets = set()
+            self._records = {}
+            self._seen_ids = set()
+            self._pending = 0
+            self._control_streak = 0
+            self._stopping = False
+            self._cancel_pending = False
+            self._workers = []
+            try:
+                for index in range(max_workers):
+                    worker = threading.Thread(target=self._run, name='{}-{}'.format(name, index + 1), daemon=True)
+                    worker.start()
+                    self._workers.append(worker)
+            except (PermissionError, RuntimeError):
+                self.shutdown(wait=True, cancel_pending=True)
+                raise
+
+        def submit(self, target_id, action_id, callback, kind='upload'):
+            """Queue one action and return a result with an explicit status.
+
+        action_id must be stable and unique for the logical operation. An ID is
+        remembered for this scheduler's lifetime even after terminal completion
+        so a stale caller cannot cause that operation to be dispatched twice.
+        """
+            if not target_id or not action_id or (not callable(callback)):
+                raise ValueError('target_id, action_id, and callable callback are required')
+            if not isinstance(kind, str) or not kind:
+                raise ValueError('kind must be a non-empty string')
+            with self._condition:
+                if self._stopping:
+                    return {'status': self.STOPPING, 'action_id': action_id}
+                if action_id in self._seen_ids:
+                    return {'status': self.DUPLICATE, 'action_id': action_id}
+                if self._pending >= self.max_pending:
+                    return {'status': self.FULL, 'action_id': action_id}
+                record = {'action_id': action_id, 'target_id': target_id, 'kind': kind, 'status': 'queued', 'sequence': len(self._records), 'submitted_at': time.monotonic(), 'started_at': None, 'finished_at': None, 'error': None, 'result': None, 'callback': callback}
+                self._seen_ids.add(action_id)
+                self._records[action_id] = record
+                self._queues.setdefault(target_id, deque()).append(action_id)
+                self._pending += 1
+                self._condition.notify_all()
+                return {'status': self.ACCEPTED, 'action_id': action_id}
+
+        def get(self, action_id):
+            """Return a snapshot without exposing the callback."""
+            with self._condition:
+                record = self._records.get(action_id)
+                return self._snapshot(record) if record else None
+
+        def snapshot(self):
+            """Return scheduler lifecycle and action states."""
+            with self._condition:
+                return {'stopping': self._stopping, 'pending': self._pending, 'running': len(self._busy_targets), 'actions': [self._snapshot(item) for item in self._records.values()]}
+
+        def wait_for_idle(self, timeout=None):
+            """Wait until no queued or executing callback remains."""
+            deadline = None if timeout is None else time.monotonic() + timeout
+            with self._condition:
+                while self._pending or self._busy_targets:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
+                        return False
+                    self._condition.wait(remaining)
+                return True
+
+        def shutdown(self, wait=True, cancel_pending=False, timeout=None):
+            """Stop accepting work and drain or cancel queued work.
+
+        Running callbacks are not interrupted. With a timeout, False means a
+        callback is still executing; the workers finish in the background and
+        exit after it returns. Calling shutdown again is safe.
+        """
+            with self._condition:
+                self._stopping = True
+                self._cancel_pending = self._cancel_pending or bool(cancel_pending)
+                if self._cancel_pending:
+                    now = time.monotonic()
+                    for queue in self._queues.values():
+                        while queue:
+                            action_id = queue.popleft()
+                            record = self._records[action_id]
+                            record['status'] = 'cancelled_before_dispatch'
+                            record['finished_at'] = now
+                            record['callback'] = None
+                            self._pending -= 1
+                    self._queues.clear()
+                self._condition.notify_all()
+            if not wait:
+                return not self._has_live_workers()
+            deadline = None if timeout is None else time.monotonic() + timeout
+            for worker in self._workers:
+                remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                worker.join(remaining)
+            return not self._has_live_workers()
+
+        def _has_live_workers(self):
+            return any((worker.is_alive() for worker in self._workers))
+
+        def _run(self):
+            while True:
+                with self._condition:
+                    action_id = self._next_action_locked()
+                    while action_id is None:
+                        if self._stopping and self._pending == 0 and (not self._busy_targets):
+                            self._condition.notify_all()
+                            return
+                        self._condition.wait()
+                        action_id = self._next_action_locked()
+                    record = self._records[action_id]
+                    target_id = record['target_id']
+                    self._busy_targets.add(target_id)
+                    self._pending -= 1
+                    record['status'] = 'running'
+                    record['started_at'] = time.monotonic()
+                    callback = record['callback']
+                result = None
+                error = None
+                try:
+                    result = callback()
+                except Exception as exc:
+                    error = '{}: {}'.format(type(exc).__name__, exc)
+                with self._condition:
+                    record['result'] = result
+                    record['error'] = error
+                    record['status'] = 'failed' if error is not None else 'completed'
+                    record['finished_at'] = time.monotonic()
+                    record['callback'] = None
+                    self._busy_targets.remove(target_id)
+                    self._condition.notify_all()
+
+        def _next_action_locked(self):
+            candidates = []
+            for target_id, queue in self._queues.items():
+                if target_id in self._busy_targets or not queue:
+                    continue
+                action_id = queue[0]
+                record = self._records[action_id]
+                priority = 0 if record['kind'] in self.CONTROL_KINDS else 1
+                candidates.append((priority, record['sequence'], target_id, queue))
+            if not candidates:
+                return None
+            ordinary_waiting = any((item[0] for item in candidates))
+            if ordinary_waiting and self._control_streak >= self.CONTROL_BURST_LIMIT:
+                candidates = [item for item in candidates if item[0] == 1]
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            _, _, target_id, queue = candidates[0]
+            action_id = queue.popleft()
+            if self._records[action_id]['kind'] in self.CONTROL_KINDS:
+                self._control_streak += 1
+            else:
+                self._control_streak = 0
+            if not queue:
+                del self._queues[target_id]
+            return action_id
+
+        @staticmethod
+        def _snapshot(record):
+            return {key: value for key, value in record.items() if key != 'callback'}
+    return dict(locals())
+
+
+def _pf_define_approval():
+    import hashlib
+    import hmac
+    import json
+    import math
+    import re
+    import secrets
+    import threading
+    import time
+    from collections import OrderedDict
+    DEFAULT_MAX_ENTRIES = 256
+    MAX_TTL_SECONDS = 300.0
+    MAX_PLAN_BYTES = 32 * 1024
+    _DIGEST_RE = re.compile('[0-9a-f]{64}\\Z')
+    _PLAN_KEYS = frozenset(('target_identity', 'binding_revision', 'artifact_sha256', 'plate_entry', 'action', 'use_ams', 'metadata_digest'))
+
+    def _canonical_json(value, label):
+        try:
+            encoded = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError(label + ' must be finite JSON data') from exc
+        if len(encoded.encode('ascii')) > MAX_PLAN_BYTES:
+            raise ValueError(label + ' is too large')
+        return encoded
+
+    def _validate_plan(plan):
+        if not isinstance(plan, dict) or set(plan) != _PLAN_KEYS:
+            raise ValueError('plan has missing or unexpected fields')
+        target = plan['target_identity']
+        if not isinstance(target, str) or not target or target != target.strip() or (len(target) > 1024):
+            raise ValueError('target_identity must be a stable non-empty identity')
+        revision = plan['binding_revision']
+        if isinstance(revision, bool) or not isinstance(revision, (int, str)) or (isinstance(revision, int) and revision < 0) or (isinstance(revision, str) and (not revision or revision != revision.strip() or len(revision) > 256)):
+            raise ValueError('binding_revision must be a non-negative integer or stable string')
+        for key in ('artifact_sha256', 'metadata_digest'):
+            if not isinstance(plan[key], str) or _DIGEST_RE.fullmatch(plan[key]) is None:
+                raise ValueError(key + ' must be a lowercase SHA-256 digest')
+        plate = plan['plate_entry']
+        if plate is not None and (not isinstance(plate, str) or not plate or len(plate) > 1024):
+            raise ValueError('plate_entry must be a selected entry or None')
+        if plan['action'] != 'start':
+            raise ValueError('approval is only valid for the start action')
+        if not isinstance(plan['use_ams'], bool):
+            raise ValueError('use_ams must be a boolean')
+        encoded = _canonical_json(plan, 'plan')
+        return hashlib.sha256(encoded.encode('ascii')).hexdigest()
+
+    def _epoch_key(epoch):
+        if isinstance(epoch, bool) or not isinstance(epoch, (str, int)):
+            raise ValueError('epoch must be a non-empty string or integer')
+        if isinstance(epoch, str) and (not epoch or len(epoch) > 256):
+            raise ValueError('epoch must be a non-empty string or integer')
+        return _canonical_json(epoch, 'epoch')
+
+    class OperationApprovalStore:
+        """Thread-safe, bounded store of short-lived one-use print approvals."""
+
+        def __init__(self, max_entries=DEFAULT_MAX_ENTRIES, clock=None):
+            if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
+                raise ValueError('max_entries must be a positive integer')
+            self.max_entries = max_entries
+            self._clock = clock or time.monotonic
+            self._lock = threading.RLock()
+            self._entries = OrderedDict()
+
+        def _purge_expired(self, now):
+            for nonce, entry in tuple(self._entries.items()):
+                if entry['expires_at'] <= now:
+                    del self._entries[nonce]
+
+        def create(self, plan, ttl, epoch):
+            """Create an approval and return ``(nonce, plan_digest)``.
+
+        Raises ``ValueError`` for malformed plans, epochs, or TTLs and
+        ``RuntimeError`` when the bounded store is full of live approvals.
+        """
+            digest = _validate_plan(plan)
+            epoch_key = _epoch_key(epoch)
+            if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+                raise ValueError('ttl must be a positive finite number')
+            ttl = float(ttl)
+            if not math.isfinite(ttl) or ttl <= 0 or ttl > MAX_TTL_SECONDS:
+                raise ValueError('ttl must be between 0 and %s seconds' % MAX_TTL_SECONDS)
+            now = self._clock()
+            with self._lock:
+                self._purge_expired(now)
+                if len(self._entries) >= self.max_entries:
+                    raise RuntimeError('approval store is full')
+                nonce = secrets.token_urlsafe(32)
+                while nonce in self._entries:
+                    nonce = secrets.token_urlsafe(32)
+                self._entries[nonce] = {'digest': digest, 'epoch': epoch_key, 'expires_at': now + ttl}
+            return (nonce, digest)
+
+        def consume(self, nonce, exact_plan, epoch):
+            """Consume an approval exactly once; return false for any mismatch."""
+            if not isinstance(nonce, str) or not nonce:
+                return False
+            with self._lock:
+                entry = self._entries.pop(nonce, None)
+                if entry is None or entry['expires_at'] <= self._clock():
+                    return False
+                try:
+                    plan_digest = _validate_plan(exact_plan)
+                    epoch_key = _epoch_key(epoch)
+                except (TypeError, ValueError):
+                    return False
+                return hmac.compare_digest(entry['digest'], plan_digest) and hmac.compare_digest(entry['epoch'], epoch_key)
+
+        def __len__(self):
+            with self._lock:
+                self._purge_expired(self._clock())
+                return len(self._entries)
+    return dict(locals())
+
+
+def _pf_define_duet():
+    import http.client
+    import json
+    import os
+    import re
+    import ssl
+    import time
+    import urllib.parse
+    import zlib
+    from pathlib import Path
+    TIMEOUT = 8.0
+    POLL_DEADLINE = 20.0
+    UPLOAD_DEADLINE = 1800.0
+    OPERATION_DEADLINE = 30.0
+    MAX_MODEL_BYTES = 8 * 1024 * 1024
+    MAX_SMALL_BYTES = 64 * 1024
+    CHUNK_SIZE = 64 * 1024
+    READ_CHUNK = 16 * 1024
+    MAX_FILELIST_PAGES = 50
+    MAX_NAME_LENGTH = 100
+    PROTOCOL_RRF = 'rrf'
+    PROTOCOL_DSF = 'dsf'
+    _BACKEND_NAMES = {'rrf': PROTOCOL_RRF, 'duet_rrf': PROTOCOL_RRF, 'dsf': PROTOCOL_DSF, 'duet_dsf': PROTOCOL_DSF}
+    CAPABILITIES = {'status': 'implemented', 'upload': 'implemented', 'start': 'implemented_requires_explicit_confirmation', 'pause': 'unsupported_unverified', 'resume': 'unsupported_unverified', 'cancel': 'unsupported_unverified'}
+    _UPLOAD_NAME_FORBIDDEN = re.compile('[/\\\\\\x00-\\x1f\\x7f:*?"<>|]')
+    _START_NAME = re.compile('^[A-Za-z0-9._()\\- ]+$')
+    _SESSION_KEY = re.compile('^[A-Za-z0-9_\\-]{1,128}$')
+    _REDIRECTS = (301, 302, 303, 307, 308)
+    _STATE_MAP = {'idle': 'idle', 'processing': 'printing', 'simulating': 'simulating', 'busy': 'busy', 'changingtool': 'busy', 'paused': 'paused', 'pausing': 'pausing', 'resuming': 'resuming', 'cancelling': 'cancelling', 'halted': 'halted', 'off': 'off', 'updating': 'updating', 'starting': 'starting', 'disconnected': 'disconnected'}
+    _UNKNOWN_STATE_CODES = {'malformed_model', 'malformed_response', 'unrecognized_dsf_model', 'unrecognized_rrf_model', 'protocol_unrecognized'}
+
+    class _AdapterError(Exception):
+
+        def __init__(self, code: 'str'):
+            super().__init__(code)
+            self.code = code
+
+    class _Deadline:
+
+        def __init__(self, seconds: 'float'):
+            self._end = time.monotonic() + seconds
+
+        def remaining(self) -> 'float':
+            return self._end - time.monotonic()
+
+        def check(self) -> 'None':
+            if self.remaining() <= 0:
+                raise _AdapterError('timeout')
+
+        def socket_timeout(self) -> 'float':
+            self.check()
+            return max(0.05, min(TIMEOUT, self.remaining()))
+
+    class _Session:
+
+        def __init__(self, parsed, ssl_context, kind, key, deadline, rr_emulated=False):
+            self.parsed = parsed
+            self.ssl_context = ssl_context
+            self.kind = kind
+            self.key = key
+            self.deadline = deadline
+            self.rr_emulated = rr_emulated
+
+        def headers(self, accept='application/json'):
+            headers = [('Accept', accept)]
+            if self.key is not None:
+                headers.append(('X-Session-Key', self.key))
+            return headers
+
+    def poll(base: 'str', ssl_context: 'ssl.SSLContext | None', password: 'str'='', *, backend: 'str | None'=None, raise_if_access_denied=None) -> 'dict':
+        """Return a normalized status. The optional callback can surface a host denial."""
+        status = _empty_status()
+        session = None
+        try:
+            deadline = _Deadline(POLL_DEADLINE)
+            session = _open_session(base, ssl_context, password, deadline, backend)
+            model = _read_model(session)
+            if not _recognizable_model(session.kind, model):
+                status['state'] = 'unknown'
+                status['job_state'] = 'unknown'
+                status['error_code'] = 'unrecognized_dsf_model' if session.kind == PROTOCOL_DSF else 'unrecognized_rrf_model'
+                status.update(_protocol_fields(session))
+                return status
+            status.update(_normalize_model(model))
+            status.update(_protocol_fields(session))
+            status['online'] = True
+            idle = status['state'] == 'idle'
+            status['upload_ready'] = idle
+            status['upload_reason'] = '' if idle else 'state_%s' % status['state']
+            status['can_start'] = idle
+            return status
+        except _AdapterError as exc:
+            if raise_if_access_denied is not None:
+                raise_if_access_denied(exc)
+            status['error_code'] = exc.code
+            if exc.code in _UNKNOWN_STATE_CODES:
+                status['state'] = 'unknown'
+                status['job_state'] = 'unknown'
+            if session is not None:
+                status.update(_protocol_fields(session))
+            return status
+        except (OSError, http.client.HTTPException, ValueError, TypeError):
+            status['error_code'] = 'invalid_request'
+            return status
+        finally:
+            _close_session(session)
+
+    def upload(base: 'str', ssl_context: 'ssl.SSLContext | None', password: 'str', file_path: 'str | os.PathLike[str]', filename: 'str', *, backend: 'str | None'=None) -> 'dict':
+        """Upload a G-code file to ``0:/gcodes/`` and verify it by size.
+
+    Preconditions checked in the same session: protocol pin, machine state
+    ``idle`` (never overwrite or upload while a job runs). The result carries
+    ``verified`` (True only after a matching size was read back) and
+    ``verification`` (``size_match`` / ``unavailable``). Unknown outcomes are
+    reported as ``unknown_outcome`` and must not be retried blindly.
+    """
+        session = None
+        try:
+            safe_name = _validate_upload_name(filename)
+            path = Path(file_path)
+            info = path.stat()
+            if not path.is_file() or info.st_size <= 0:
+                raise ValueError('source must be a non-empty file')
+            size = info.st_size
+            crc = _crc32_of(path, size)
+            deadline = _Deadline(UPLOAD_DEADLINE)
+            session = _open_session(base, ssl_context, password, deadline, backend)
+            model = _read_model(session)
+            if not _recognizable_model(session.kind, model):
+                return _failure('status_unavailable', 'not_sent', session)
+            if _normalize_model(model)['state'] != 'idle':
+                return _failure('device_not_idle', 'not_sent', session)
+            if session.kind == PROTOCOL_DSF:
+                target = '/machine/file/0:/gcodes/' + urllib.parse.quote(safe_name, safe='')
+                status_code, body = _exchange(session, 'PUT', target, session.headers(), MAX_SMALL_BYTES, body_file=(path, size), mutating=True, content_type='application/octet-stream')
+                accepted = _write_status(status_code)
+                if accepted:
+                    return accepted
+                if status_code not in (200, 201, 204):
+                    return _failure('upload_rejected', 'rejected', session)
+                evidence = 'dsf-http-%d' % status_code
+            else:
+                query = _qs([('name', '0:/gcodes/' + safe_name), ('time', time.strftime('%Y-%m-%dT%H:%M:%S')), ('crc32', '%08x' % crc)])
+                status_code, body = _exchange(session, 'POST', '/rr_upload?' + query, session.headers(), MAX_SMALL_BYTES, body_file=(path, size), mutating=True, content_type='application/octet-stream')
+                accepted = _write_status(status_code)
+                if accepted:
+                    return accepted
+                if status_code != 200:
+                    return _failure('upload_rejected', 'rejected', session)
+                reply = _parse_json(body)
+                err = reply.get('err') if isinstance(reply, dict) else None
+                if not isinstance(err, int) or isinstance(err, bool):
+                    return _failure('unknown_outcome', 'unknown', session)
+                if err != 0:
+                    return _failure('upload_rejected', 'rejected', session)
+                evidence = 'rrf-upload-err0'
+            verdict, remote_size = _remote_file_size(session, safe_name)
+            result = {'ok': True, 'evidence_ref': evidence, 'protocol': session.kind, 'outcome': 'completed', 'size': size, 'verified': False, 'verification': 'unavailable'}
+            if verdict == 'found' and remote_size == size:
+                result.update(verified=True, verification='size_match')
+            elif verdict == 'found' and remote_size is not None:
+                result.update(ok=False, error_code='verification_failed', outcome='applied_unverified', verification='size_mismatch')
+            elif verdict == 'missing':
+                result.update(ok=False, error_code='verification_failed', outcome='applied_unverified', verification='missing')
+            return result
+        except _AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code, 'outcome': _outcome_of(exc.code)}
+        except (OSError, ValueError, TypeError):
+            return {'ok': False, 'error_code': 'invalid_request', 'outcome': 'not_sent'}
+        finally:
+            _close_session(session)
+
+    def start(base: 'str', ssl_context: 'ssl.SSLContext | None', password: 'str', filename: 'str', *, backend: 'str | None'=None, expected_size: 'int | None'=None) -> 'dict':
+        """Start printing an already-uploaded file via ``M32 "0:/gcodes/<name>"``.
+
+    Must only be called after explicit user confirmation. The G-code is built
+    from a strictly validated name (ASCII letters, digits, ``._()- `` and a
+    ``.gcode`` suffix); no caller-supplied G-code is ever sent. Preconditions:
+    protocol pin, state ``idle``, file present (and size equal to
+    ``expected_size`` when given). ``ok=True`` means *accepted*
+    (``outcome="accepted_pending_reconcile"``): confirm by polling for a
+    non-idle state. One request is sent, never repeated.
+    """
+        session = None
+        try:
+            name = _validate_start_name(filename)
+            if expected_size is not None and (not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0):
+                raise ValueError('invalid expected size')
+            deadline = _Deadline(OPERATION_DEADLINE)
+            session = _open_session(base, ssl_context, password, deadline, backend)
+            model = _read_model(session)
+            if not _recognizable_model(session.kind, model):
+                return _failure('status_unavailable', 'not_sent', session)
+            if _normalize_model(model)['state'] != 'idle':
+                return _failure('device_not_idle', 'not_sent', session)
+            verdict, remote_size = _remote_file_size(session, name)
+            if verdict == 'missing':
+                return _failure('file_not_found', 'not_sent', session)
+            if verdict != 'found':
+                return _failure('file_unverified', 'not_sent', session)
+            if expected_size is not None and remote_size != expected_size:
+                return _failure('file_size_mismatch', 'not_sent', session)
+            code = 'M32 "0:/gcodes/%s"' % name
+            if session.kind == PROTOCOL_DSF:
+                headers = session.headers('text/plain')
+                status_code, body = _exchange(session, 'POST', '/machine/code', headers, MAX_SMALL_BYTES, body_bytes=code.encode('ascii'), mutating=True, content_type='text/plain')
+                accepted = _write_status(status_code)
+                if accepted:
+                    return accepted
+                if not 200 <= status_code < 300:
+                    return _failure('start_rejected', 'rejected', session)
+                text = body.decode('utf-8', 'replace').lstrip().lower()
+                if text.startswith('error'):
+                    return _failure('start_rejected', 'rejected', session)
+            else:
+                target = '/rr_gcode?' + _qs([('gcode', code)])
+                status_code, body = _exchange(session, 'GET', target, session.headers(), MAX_SMALL_BYTES, mutating=True)
+                accepted = _write_status(status_code)
+                if accepted:
+                    return accepted
+                if status_code != 200:
+                    return _failure('start_rejected', 'rejected', session)
+                reply = _parse_json(body)
+                if not isinstance(reply, dict):
+                    return _failure('unknown_outcome', 'unknown', session)
+                err = reply.get('err')
+                if err not in (None, 0) or isinstance(err, bool):
+                    return _failure('start_rejected', 'rejected', session)
+            return {'ok': True, 'outcome': 'accepted_pending_reconcile', 'protocol': session.kind, 'evidence_ref': '%s-gcode-accepted' % session.kind}
+        except _AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code, 'outcome': _outcome_of(exc.code)}
+        except (OSError, ValueError, TypeError):
+            return {'ok': False, 'error_code': 'invalid_request', 'outcome': 'not_sent'}
+        finally:
+            _close_session(session)
+
+    def pause(*_args, **_kwargs) -> 'dict':
+        return _unsupported()
+
+    def resume(*_args, **_kwargs) -> 'dict':
+        return _unsupported()
+
+    def cancel(*_args, **_kwargs) -> 'dict':
+        return _unsupported()
+
+    def _unsupported() -> 'dict':
+        return {'ok': False, 'error_code': 'unsupported_unverified', 'outcome': 'not_sent'}
+
+    def _empty_status() -> 'dict':
+        return {'online': False, 'state': 'offline', 'job_state': 'unknown', 'raw_state': None, 'nozzle': None, 'target_nozzle': None, 'bed': None, 'target_bed': None, 'tools': [], 'active_tool': None, 'progress': None, 'filename': '', 'thumbnail': '', 'remaining_seconds': None, 'layer': None, 'total_layers': None, 'upload_ready': False, 'upload_reason': '', 'upload_permission': 'unverified', 'can_start': False, 'can_control': False, 'control_reason': 'pause_resume_cancel_unverified', 'protocol': None, 'rr_emulation': False, 'capabilities': dict(CAPABILITIES)}
+
+    def _protocol_fields(session) -> 'dict':
+        return {'protocol': session.kind, 'rr_emulation': bool(session.rr_emulated), 'backend': 'duet_dsf' if session.kind == PROTOCOL_DSF else 'duet_rrf'}
+
+    def _check_password(password):
+        if not isinstance(password, str) or len(password) > 256 or any((c in password for c in '\r\n\x00')):
+            raise _AdapterError('invalid_credentials')
+
+    def _open_session(base, ssl_context, password, deadline, backend=None):
+        pin = None
+        if backend is not None:
+            pin = _BACKEND_NAMES.get(str(backend).lower())
+            if pin is None:
+                raise ValueError('unknown backend pin')
+        parsed = _parse_base(base)
+        _check_password(password)
+        probe = _qs([('password', password), ('sessionKey', 'yes')], safe='')
+        probe_session = _Session(parsed, ssl_context, PROTOCOL_RRF, None, deadline)
+        status, body = _exchange(probe_session, 'GET', '/rr_connect?' + probe, [('Accept', 'application/json')], MAX_SMALL_BYTES)
+        if status == 404:
+            if pin == PROTOCOL_RRF:
+                raise _AdapterError('protocol_mismatch')
+            session = _connect_dsf(parsed, ssl_context, password, deadline, rr_emulated=False)
+        elif status in (401, 403):
+            raise _AdapterError('authentication_failed')
+        elif not 200 <= status < 300:
+            raise _AdapterError(_error_for_status(status))
+        else:
+            reply = _parse_json(body)
+            err = reply.get('err') if isinstance(reply, dict) else None
+            if not isinstance(err, int) or isinstance(err, bool):
+                raise _AdapterError('protocol_unrecognized')
+            if err == 1:
+                raise _AdapterError('authentication_failed')
+            if err == 2:
+                raise _AdapterError('no_sessions_available')
+            if err != 0:
+                raise _AdapterError('protocol_unrecognized')
+            if reply.get('isEmulated') is True:
+                _best_effort_get(probe_session, '/rr_disconnect')
+                session = _connect_dsf(parsed, ssl_context, password, deadline, rr_emulated=True)
+            else:
+                key = reply.get('sessionKey')
+                if isinstance(key, bool) or not isinstance(key, (str, int)):
+                    key = None
+                if key is not None:
+                    key = str(key)
+                    if not _SESSION_KEY.fullmatch(key):
+                        _best_effort_get(probe_session, '/rr_disconnect')
+                        raise _AdapterError('protocol_unrecognized')
+                session = _Session(parsed, ssl_context, PROTOCOL_RRF, key, deadline)
+        if pin is not None and session.kind != pin:
+            _close_session(session)
+            raise _AdapterError('protocol_mismatch')
+        return session
+
+    def _connect_dsf(parsed, ssl_context, password, deadline, rr_emulated):
+        probe = _Session(parsed, ssl_context, PROTOCOL_DSF, None, deadline)
+        status, body = _exchange(probe, 'GET', '/machine/connect?' + _qs([('password', password)], safe=''), [('Accept', 'application/json')], MAX_SMALL_BYTES)
+        if status in (401, 403):
+            raise _AdapterError('authentication_failed')
+        if not 200 <= status < 300:
+            raise _AdapterError(_error_for_status(status))
+        reply = _parse_json(body)
+        key = reply.get('sessionKey') if isinstance(reply, dict) else None
+        if not isinstance(key, str) or not _SESSION_KEY.fullmatch(key):
+            if isinstance(key, str) and 0 < len(key) <= 256 and key.isascii() and key.isprintable():
+                _close_session(_Session(parsed, ssl_context, PROTOCOL_DSF, key, deadline))
+            raise _AdapterError('authentication_failed')
+        return _Session(parsed, ssl_context, PROTOCOL_DSF, key, deadline, rr_emulated=rr_emulated)
+
+    def _best_effort_get(session, path):
+        try:
+            _exchange(session, 'GET', path, session.headers(), MAX_SMALL_BYTES)
+        except _AdapterError:
+            pass
+
+    def _close_session(session):
+        if session is None:
+            return
+        path = '/machine/disconnect' if session.kind == PROTOCOL_DSF else '/rr_disconnect'
+        try:
+            cleanup = _Session(session.parsed, session.ssl_context, session.kind, session.key, _Deadline(TIMEOUT))
+            _exchange(cleanup, 'GET', path, cleanup.headers(), MAX_SMALL_BYTES)
+        except Exception:
+            pass
+
+    def _parse_base(base):
+        if not isinstance(base, str):
+            raise ValueError('invalid base URL')
+        parsed = urllib.parse.urlsplit(base.strip().rstrip('/'))
+        if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+            raise ValueError('invalid base URL')
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError('credentials, query and fragment are forbidden in base URL')
+        if parsed.path not in ('', '/'):
+            raise ValueError('base URL must not contain a path')
+        parsed.port
+        return parsed
+
+    def _connection(parsed, ssl_context, timeout):
+        options = {'timeout': timeout}
+        if parsed.scheme.lower() == 'https':
+            options['context'] = ssl_context or ssl.create_default_context()
+            return http.client.HTTPSConnection(parsed.hostname, parsed.port, **options)
+        return http.client.HTTPConnection(parsed.hostname, parsed.port, **options)
+
+    def _exchange(session, method, target, headers, max_bytes, *, body_bytes=None, body_file=None, mutating=False, content_type=None):
+        """One HTTP exchange. Returns (status, body). Raises _AdapterError(code).
+
+    For ``mutating`` requests any failure after the request was dispatched
+    becomes ``unknown_outcome``; the request is never repeated.
+    """
+        deadline = session.deadline
+        source = None
+        conn = None
+        dispatched = False
+        try:
+            if body_file is not None:
+                source = body_file[0].open('rb')
+            conn = _connection(session.parsed, session.ssl_context, deadline.socket_timeout())
+            conn.putrequest(method, target)
+            for name, value in headers:
+                conn.putheader(name, value)
+            conn.putheader('Connection', 'close')
+            if body_file is not None:
+                conn.putheader('Content-Length', str(body_file[1]))
+            elif body_bytes is not None:
+                conn.putheader('Content-Length', str(len(body_bytes)))
+            if content_type and (body_file is not None or body_bytes is not None):
+                conn.putheader('Content-Type', content_type)
+            conn.endheaders()
+            dispatched = True
+            if body_bytes is not None:
+                conn.send(body_bytes)
+            elif body_file is not None:
+                remaining = body_file[1]
+                while remaining:
+                    deadline.check()
+                    chunk = source.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise OSError('source file changed during upload')
+                    conn.send(chunk)
+                    remaining -= len(chunk)
+            response = conn.getresponse()
+            status = response.status
+            if status in _REDIRECTS:
+                raise _AdapterError('redirect_rejected')
+            length = response.getheader('Content-Length')
+            if length and length.isdigit() and (int(length) > max_bytes):
+                raise _AdapterError('response_too_large')
+            data = bytearray()
+            while True:
+                deadline.check()
+                chunk = response.read1(READ_CHUNK)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > max_bytes:
+                    raise _AdapterError('response_too_large')
+            return (status, bytes(data))
+        except _AdapterError as exc:
+            if mutating and dispatched and (exc.code in ('timeout', 'response_too_large')):
+                raise _AdapterError('unknown_outcome') from None
+            raise
+        except (OSError, http.client.HTTPException) as exc:
+            if mutating and dispatched:
+                raise _AdapterError('unknown_outcome') from None
+            raise _AdapterError('timeout' if isinstance(exc, TimeoutError) else 'connection_failed') from None
+        finally:
+            if conn is not None:
+                conn.close()
+            if source is not None:
+                source.close()
+
+    def _error_for_status(status):
+        if status == 401:
+            return 'authentication_failed'
+        if status == 403:
+            return 'authorization_denied'
+        if status == 404:
+            return 'not_found'
+        if status == 502:
+            return 'dcs_incompatible'
+        if status == 503:
+            return 'device_busy'
+        return 'http_error'
+
+    def _qs(items, safe=':/'):
+        """Percent-encode a query (no '+' for spaces; ':' and '/' kept literal in paths)."""
+        return '&'.join(('%s=%s' % (key, urllib.parse.quote(value, safe=safe)) for key, value in items))
+
+    def _parse_json(body):
+        try:
+            return json.loads(body.decode('utf-8'))
+        except (UnicodeError, ValueError):
+            return None
+
+    def _get_json(session, path, max_bytes=MAX_SMALL_BYTES):
+        status, body = _exchange(session, 'GET', path, session.headers(), max_bytes)
+        if not 200 <= status < 300:
+            raise _AdapterError(_error_for_status(status))
+        value = _parse_json(body)
+        if value is None:
+            raise _AdapterError('malformed_response')
+        return value
+
+    def _write_status(status):
+        """Map write-time statuses that are definitive rejections."""
+        if status in (401, 403, 404, 502, 503):
+            return {'ok': False, 'error_code': _error_for_status(status), 'outcome': 'rejected'}
+        return None
+
+    def _failure(code, outcome, session=None):
+        result = {'ok': False, 'error_code': code, 'outcome': outcome}
+        if session is not None:
+            result['protocol'] = session.kind
+        return result
+
+    def _outcome_of(code):
+        if code == 'unknown_outcome':
+            return 'unknown'
+        return 'not_sent'
+
+    def _read_model(session):
+        if session.kind == PROTOCOL_DSF:
+            model = _get_json(session, '/machine/model', MAX_MODEL_BYTES)
+            if not isinstance(model, dict):
+                raise _AdapterError('malformed_model')
+            return model
+        model = {}
+        for key in ('state', 'job', 'heat', 'tools'):
+            reply = _get_json(session, '/rr_model?key=%s&flags=d99o' % key, MAX_MODEL_BYTES)
+            if not isinstance(reply, dict):
+                raise _AdapterError('malformed_model')
+            model[key] = reply.get('result')
+        state = model.get('state')
+        if isinstance(state, dict) and (not _is_int(state.get('currentTool'))):
+            reply = _get_json(session, '/rr_model?key=move.motionSystems&flags=d99o', MAX_MODEL_BYTES)
+            if isinstance(reply, dict) and isinstance(reply.get('result'), list):
+                model['move'] = {'motionSystems': reply['result']}
+        return model
+
+    def _recognizable_model(kind, model):
+        if not isinstance(model, dict):
+            return False
+        state = model.get('state')
+        if not (isinstance(state, dict) and isinstance(state.get('status'), str)):
+            return False
+        if kind == PROTOCOL_DSF:
+            directories = model.get('directories')
+            return isinstance(directories, dict) and isinstance(directories.get('gCodes'), str)
+        return True
+
+    def _is_int(value):
+        return isinstance(value, int) and (not isinstance(value, bool))
+
+    def _number_or_none(value):
+        if isinstance(value, dict):
+            value = value.get('value')
+        return value if isinstance(value, (int, float)) and (not isinstance(value, bool)) else None
+
+    def _dict(value):
+        return value if isinstance(value, dict) else {}
+
+    def _normalize_model(model):
+        state = _dict(model.get('state'))
+        job = _dict(model.get('job'))
+        raw = state.get('status')
+        normalized = _STATE_MAP.get(raw.lower(), 'unknown') if isinstance(raw, str) else 'unknown'
+        heaters = _dict(model.get('heat')).get('heaters')
+        heaters = heaters if isinstance(heaters, list) else None
+        heat = _dict(model.get('heat'))
+        active_tool = _active_tool_number(model)
+        tools = _normalize_tools(model.get('tools'), heaters, active_tool)
+        primary = None
+        for entry in tools:
+            if entry['index'] == active_tool:
+                primary = entry
+                break
+        if primary is None and tools:
+            primary = tools[0]
+        bed, target_bed = _bed_values(heat, heaters)
+        file_info = job.get('file')
+        filename = ''
+        size = None
+        if isinstance(file_info, dict):
+            if isinstance(file_info.get('fileName'), str):
+                filename = file_info['fileName']
+            size = file_info.get('size')
+        elif isinstance(job.get('fileName'), str):
+            filename = job['fileName']
+        return {'state': normalized, 'job_state': normalized, 'raw_state': raw if isinstance(raw, str) else None, 'nozzle': primary['current'] if primary else None, 'target_nozzle': primary['target'] if primary else None, 'bed': bed, 'target_bed': target_bed, 'tools': tools, 'active_tool': active_tool, 'progress': _progress(job, size, normalized), 'filename': filename, 'thumbnail': '', **_job_stats(job, file_info, normalized)}
+    _MAX_REMAINING_SECONDS = 30 * 86400
+    _MAX_LAYERS = 100000
+
+    def _whole_number(value, low, high):
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        return value if _is_int(value) and low <= value <= high else None
+
+    def _job_stats(job, file_info, normalized):
+        """Remaining seconds and layers from the object model (printing/paused only).
+
+    RRF object model: job.timesLeft.{file,filament,slicer} (seconds, null when
+    unknown), job.layer (current layer, null when unknown) and job.file.numLayers
+    (0 when unknown). Anything missing or implausible stays None."""
+        stats = {'remaining_seconds': None, 'layer': None, 'total_layers': None}
+        if normalized not in ('printing', 'paused'):
+            return stats
+        left = _dict(job.get('timesLeft'))
+        for key in ('file', 'filament', 'slicer'):
+            value = left.get(key)
+            if isinstance(value, (int, float)) and (not isinstance(value, bool)) and (value == value) and (0 <= value <= _MAX_REMAINING_SECONDS):
+                stats['remaining_seconds'] = int(round(value))
+                break
+        total = _whole_number(_dict(file_info).get('numLayers'), 1, _MAX_LAYERS)
+        layer = _whole_number(job.get('layer'), 0, _MAX_LAYERS)
+        if total is not None and layer is not None and (layer <= total):
+            stats['layer'], stats['total_layers'] = (layer, total)
+        return stats
+
+    def _progress(job, size, normalized):
+        position = job.get('filePosition')
+        if isinstance(position, (int, float)) and (not isinstance(position, bool)) and isinstance(size, (int, float)) and (not isinstance(size, bool)) and (size > 0):
+            return max(0, min(100, int(position * 100 / size)))
+        if normalized == 'idle':
+            return 0
+        return None
+
+    def _active_tool_number(model):
+        state = _dict(model.get('state'))
+        current = state.get('currentTool')
+        if _is_int(current):
+            return current if current >= 0 else None
+        systems = _dict(model.get('move')).get('motionSystems')
+        if isinstance(systems, list) and systems and isinstance(systems[0], dict):
+            current = systems[0].get('currentTool')
+            if _is_int(current) and current >= 0:
+                return current
+        return None
+
+    def _heater_at(heaters, index):
+        if heaters is None or not _is_int(index) or index < 0 or (index >= len(heaters)):
+            return None
+        heater = heaters[index]
+        return heater if isinstance(heater, dict) else None
+
+    def _heater_current(heater):
+        if heater is None:
+            return None
+        if heater.get('state') in ('fault', 'offline'):
+            return None
+        if heater.get('sensor') == -1:
+            return None
+        return _number_or_none(heater.get('current'))
+
+    def _first_number(values):
+        if isinstance(values, list) and values:
+            return _number_or_none(values[0])
+        return None
+
+    def _normalize_tools(raw_tools, heaters, active_tool):
+        if not isinstance(raw_tools, list):
+            return []
+        result = []
+        for tool in raw_tools:
+            if not isinstance(tool, dict) or not _is_int(tool.get('number')):
+                continue
+            tool_heaters = [i for i in tool.get('heaters') or [] if _is_int(i)] if isinstance(tool.get('heaters'), list) else []
+            current = _heater_current(_heater_at(heaters, tool_heaters[0])) if tool_heaters else None
+            tool_state = tool.get('state') if isinstance(tool.get('state'), str) else None
+            if tool_state == 'active':
+                target = _first_number(tool.get('active'))
+            elif tool_state == 'standby':
+                target = _first_number(tool.get('standby'))
+            else:
+                target = None
+            result.append({'index': tool['number'], 'name': tool.get('name') if isinstance(tool.get('name'), str) else '', 'current': current, 'target': target, 'state': tool_state, 'active': tool['number'] == active_tool, 'heaters': tool_heaters})
+        return result
+
+    def _bed_values(heat, heaters):
+        indices = []
+        legacy = heat.get('bedHeaters')
+        if isinstance(legacy, list):
+            indices = [i for i in legacy if _is_int(i) and i >= 0]
+        if not indices:
+            mapping = heat.get('bedHeaterMapping')
+            if isinstance(mapping, list):
+                for item in mapping:
+                    values = item if isinstance(item, list) else [item]
+                    indices = [i for i in values if _is_int(i) and i >= 0]
+                    if indices:
+                        break
+        if not indices:
+            return (None, None)
+        heater = _heater_at(heaters, indices[0])
+        if heater is None:
+            return (None, None)
+        state = heater.get('state')
+        if state == 'active':
+            target = _number_or_none(heater.get('active'))
+        elif state == 'standby':
+            target = _number_or_none(heater.get('standby'))
+        else:
+            target = None
+        return (_heater_current(heater), target)
+
+    def _remote_file_size(session, name):
+        """Return ("found", size|None) / ("missing", None) / ("unavailable", None)."""
+        try:
+            if session.kind == PROTOCOL_DSF:
+                target = '/machine/fileinfo/0:/gcodes/' + urllib.parse.quote(name, safe='')
+                try:
+                    info = _get_json(session, target, MAX_SMALL_BYTES)
+                except _AdapterError as exc:
+                    if exc.code == 'not_found':
+                        return ('missing', None)
+                    return ('unavailable', None)
+                if isinstance(info, dict):
+                    size = info.get('size')
+                    return ('found', size if _is_int(size) else None)
+                return ('unavailable', None)
+            query = _qs([('name', '0:/gcodes/' + name)])
+            try:
+                info = _get_json(session, '/rr_fileinfo?' + query, MAX_SMALL_BYTES)
+            except _AdapterError:
+                info = None
+            if isinstance(info, dict) and info.get('err') == 0 and _is_int(info.get('size')):
+                return ('found', info['size'])
+            return _rrf_listing_size(session, name)
+        except _AdapterError:
+            return ('unavailable', None)
+
+    def _rrf_listing_size(session, name):
+        first = 0
+        for _ in range(MAX_FILELIST_PAGES):
+            query = _qs([('dir', '0:/gcodes'), ('first', str(first))])
+            try:
+                page = _get_json(session, '/rr_filelist?' + query, MAX_MODEL_BYTES)
+            except _AdapterError:
+                return ('unavailable', None)
+            if not isinstance(page, dict) or page.get('err') not in (None, 0) or (not isinstance(page.get('files'), list)):
+                return ('unavailable', None)
+            for entry in page['files']:
+                if isinstance(entry, dict) and entry.get('name') == name and (entry.get('type') == 'f'):
+                    size = entry.get('size')
+                    return ('found', size if _is_int(size) else None)
+            nxt = page.get('next')
+            if not _is_int(nxt) or nxt == 0:
+                return ('missing', None)
+            if nxt <= first:
+                return ('unavailable', None)
+            first = nxt
+        return ('unavailable', None)
+
+    def _validate_upload_name(filename):
+        if not isinstance(filename, str) or not filename or len(filename) > MAX_NAME_LENGTH or _UPLOAD_NAME_FORBIDDEN.search(filename):
+            raise ValueError('unsafe filename')
+        if filename in ('.', '..') or filename != filename.strip() or filename.endswith('.'):
+            raise ValueError('unsafe filename')
+        if not filename.lower().endswith('.gcode'):
+            raise ValueError('only a plain .gcode filename is accepted')
+        return filename
+
+    def _validate_start_name(filename):
+        name = _validate_upload_name(filename)
+        if not _START_NAME.fullmatch(name) or '..' in name or name.startswith('.'):
+            raise ValueError('filename not allowed for start')
+        return name
+
+    def _crc32_of(path, size):
+        crc = 0
+        remaining = size
+        with path.open('rb') as source:
+            while remaining:
+                chunk = source.read(min(CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise OSError('source file changed')
+                crc = zlib.crc32(chunk, crc)
+                remaining -= len(chunk)
+        return crc & 4294967295
+    return dict(locals())
+
+
+def _pf_define_prusalink():
+    import http.client
+    import json
+    import math
+    import os
+    import re
+    import ssl
+    import urllib.parse
+    from pathlib import Path
+    _TIMEOUT = 6.0
+    _MAX_RESPONSE = 2 * 1024 * 1024
+    _CHUNK = 64 * 1024
+    _API_KEY_CAPABILITIES = ('x-api-key', 'api-key')
+
+    class _AdapterError(Exception):
+
+        def __init__(self, code: 'str'):
+            self.code = code
+            super().__init__(code)
+
+    def _base_parts(base: 'str'):
+        if not isinstance(base, str) or not base.strip():
+            raise _AdapterError('invalid_address')
+        parsed = urllib.parse.urlsplit(base.strip())
+        if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+            raise _AdapterError('invalid_address')
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise _AdapterError('invalid_address')
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise _AdapterError('invalid_address') from exc
+        prefix = parsed.path.rstrip('/')
+        return (parsed.scheme.lower(), parsed.hostname, port, prefix)
+
+    def _request(base, method, path, *, ssl_context=None, headers=None, body=None):
+        scheme, host, port, prefix = _base_parts(base)
+        connection_cls = http.client.HTTPSConnection if scheme == 'https' else http.client.HTTPConnection
+        options = {'timeout': _TIMEOUT}
+        if scheme == 'https':
+            options['context'] = ssl_context or ssl.create_default_context()
+        conn = connection_cls(host, port=port, **options)
+        target = prefix + path
+        try:
+            conn.putrequest(method, target, skip_accept_encoding=True)
+            conn.putheader('Accept', 'application/json')
+            conn.putheader('Connection', 'close')
+            for name, value in (headers or {}).items():
+                conn.putheader(name, value)
+            if body is not None:
+                conn.putheader('Content-Length', str(body[0]))
+                conn.putheader('Content-Type', 'application/octet-stream')
+            conn.endheaders()
+            if body is not None:
+                size, file_obj = body
+                remaining = size
+                while remaining:
+                    chunk = file_obj.read(min(_CHUNK, remaining))
+                    if not chunk:
+                        raise _AdapterError('source_changed')
+                    conn.send(chunk)
+                    remaining -= len(chunk)
+            response = conn.getresponse()
+            data = response.read(_MAX_RESPONSE + 1)
+            if len(data) > _MAX_RESPONSE:
+                raise _AdapterError('response_too_large')
+            return (response.status, dict(response.getheaders()), data)
+        except _AdapterError:
+            raise
+        except (TimeoutError, OSError, http.client.HTTPException, ssl.SSLError) as exc:
+            if isinstance(exc, (TimeoutError,)) or 'timed out' in str(exc).lower():
+                raise _AdapterError('timeout') from exc
+            raise _AdapterError('connection_failed') from exc
+        finally:
+            conn.close()
+
+    def _json_request(base, path, *, ssl_context=None, headers=None, allow_no_content=False):
+        status, response_headers, payload = _request(base, 'GET', path, ssl_context=ssl_context, headers=headers)
+        if status == 401:
+            raise _AdapterError('unauthorized')
+        if status == 204 and allow_no_content:
+            return None
+        if status != 200:
+            raise _AdapterError('http_%d' % status)
+        try:
+            value = json.loads(payload.decode('utf-8'))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _AdapterError('malformed_response') from exc
+        if not isinstance(value, dict):
+            raise _AdapterError('malformed_response')
+        return value
+
+    def _api_headers(apikey, version):
+        if not apikey:
+            return {}
+        capabilities = version.get('capabilities')
+        if not isinstance(capabilities, dict) or not any((capabilities.get(key) is True for key in _API_KEY_CAPABILITIES)):
+            raise _AdapterError('api_key_unsupported')
+        if not isinstance(apikey, str) or any((ch in apikey for ch in '\r\n')):
+            raise _AdapterError('invalid_api_key')
+        return {'X-Api-Key': apikey}
+
+    def _version(base, ssl_context):
+        value = _json_request(base, '/api/version', ssl_context=ssl_context)
+        if not isinstance(value.get('api'), str) or not value['api']:
+            raise _AdapterError('malformed_response')
+        return value
+
+    def _empty_status(state='offline', error=None):
+        result = {'online': False, 'state': state, 'job_state': '', 'nozzle': None, 'target_nozzle': None, 'bed': None, 'target_bed': None, 'progress': None, 'filename': '', 'thumbnail': '', 'upload_ready': False, 'can_control': False}
+        if error:
+            result['error_code'] = error
+        return result
+
+    def _number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+            return None
+        return value
+
+    def poll(base, ssl_context, apikey='', *, raise_if_access_denied=None):
+        """Read PrusaLink telemetry; no mutating requests are sent."""
+        try:
+            version = _version(base, ssl_context)
+            headers = _api_headers(apikey, version)
+            telemetry = _json_request(base, '/api/v1/status', ssl_context=ssl_context, headers=headers)
+            printer = telemetry.get('printer')
+            job = telemetry.get('job')
+            transfer = telemetry.get('transfer')
+            if not isinstance(printer, dict) or not isinstance(printer.get('state'), str):
+                raise _AdapterError('malformed_response')
+            if job is not None and (not isinstance(job, dict)):
+                raise _AdapterError('malformed_response')
+            if transfer is not None and (not isinstance(transfer, dict)):
+                raise _AdapterError('malformed_response')
+            state = printer['state'].upper()
+            job_state = (job or {}).get('state', '')
+            if not isinstance(job_state, str):
+                raise _AdapterError('malformed_response')
+            filename = ''
+            try:
+                detail = _json_request(base, '/api/v1/job', ssl_context=ssl_context, headers=headers, allow_no_content=True)
+                if isinstance(detail, dict):
+                    file_info = detail.get('file')
+                    if isinstance(file_info, dict):
+                        candidate = file_info.get('display_name') or file_info.get('name')
+                        if isinstance(candidate, str):
+                            filename = candidate
+                    if not job_state and isinstance(detail.get('state'), str):
+                        job_state = detail['state']
+            except _AdapterError as exc:
+                if exc.code not in ('http_204',):
+                    raise
+            busy = state in {'BUSY', 'PRINTING', 'PAUSED', 'ATTENTION'} or bool(transfer and transfer.get('type') not in (None, 'NO_TRANSFER'))
+            capability = version.get('capabilities')
+            upload_ready = isinstance(capability, dict) and capability.get('upload-by-put') is True and (not busy)
+            progress = _number((job or {}).get('progress'))
+            if progress is not None:
+                progress = max(0, min(100, progress))
+            return {'online': True, 'state': state.lower(), 'job_state': job_state.lower(), 'nozzle': _number(printer.get('temp_nozzle')), 'target_nozzle': _number(printer.get('target_nozzle')), 'bed': _number(printer.get('temp_bed')), 'target_bed': _number(printer.get('target_bed')), 'progress': progress, 'filename': filename, 'thumbnail': '', 'upload_ready': upload_ready, 'can_control': False}
+        except _AdapterError as exc:
+            if raise_if_access_denied is not None:
+                raise_if_access_denied(exc)
+            if exc.code == 'unauthorized':
+                return _empty_status(error='auth_required')
+            if exc.code == 'timeout':
+                return _empty_status(error='timeout')
+            return _empty_status(error=exc.code)
+
+    def _storage_list(base, ssl_context, headers):
+        value = _json_request(base, '/api/v1/storage', ssl_context=ssl_context, headers=headers)
+        items = value.get('storage_list')
+        if not isinstance(items, list):
+            raise _AdapterError('malformed_response')
+        for item in items:
+            if not isinstance(item, dict):
+                raise _AdapterError('malformed_response')
+            if not isinstance(item.get('path'), str) or not item['path'].startswith('/'):
+                raise _AdapterError('malformed_response')
+            if not isinstance(item.get('available'), bool):
+                raise _AdapterError('malformed_response')
+        return items
+
+    def _safe_filename(filename):
+        if not isinstance(filename, str) or not filename or filename in ('.', '..'):
+            return False
+        return '/' not in filename and '\\' not in filename and (not any((ord(char) < 32 or ord(char) == 127 for char in filename)))
+
+    def upload(base, ssl_context, apikey, file_path, filename):
+        """Upload a file to a discovered writable storage without starting a print.
+
+    Ambiguous network failures return ``outcome_unknown`` and are never retried.
+    """
+        try:
+            if not _safe_filename(filename):
+                raise _AdapterError('invalid_filename')
+            path = Path(file_path)
+            if not path.is_file():
+                raise _AdapterError('source_unavailable')
+            size = path.stat().st_size
+            version = _version(base, ssl_context)
+            headers = _api_headers(apikey, version)
+            capabilities = version.get('capabilities')
+            if not isinstance(capabilities, dict) or capabilities.get('upload-by-put') is not True:
+                raise _AdapterError('upload_capability_missing')
+            telemetry = _json_request(base, '/api/v1/status', ssl_context=ssl_context, headers=headers)
+            printer = telemetry.get('printer')
+            transfer = telemetry.get('transfer')
+            if not isinstance(printer, dict) or not isinstance(printer.get('state'), str):
+                raise _AdapterError('malformed_response')
+            if transfer is not None and (not isinstance(transfer, dict)):
+                raise _AdapterError('malformed_response')
+            if printer['state'].upper() in {'BUSY', 'PRINTING', 'PAUSED', 'ATTENTION'}:
+                raise _AdapterError('printer_busy')
+            if transfer and transfer.get('type') not in (None, 'NO_TRANSFER'):
+                raise _AdapterError('transfer_busy')
+            storages = _storage_list(base, ssl_context, headers)
+            writable = [item for item in storages if item['available'] is True and item.get('read_only') is False]
+            if not writable:
+                raise _AdapterError('no_writable_storage')
+            storage = next((item for item in writable if item.get('type') == 'LOCAL'), writable[0])
+            storage_path = storage['path'].strip('/')
+            if not storage_path or any((part in ('.', '..') for part in storage_path.split('/'))):
+                raise _AdapterError('malformed_storage_path')
+            encoded = '/'.join((urllib.parse.quote(part, safe='') for part in storage_path.split('/')))
+            encoded_name = urllib.parse.quote(filename, safe='')
+            target = '/api/v1/files/%s/%s' % (encoded, encoded_name)
+            with path.open('rb') as source:
+                try:
+                    status, _, _ = _request(base, 'PUT', target, ssl_context=ssl_context, headers={**headers, 'Print-After-Upload': '?0', 'Overwrite': '?0'}, body=(size, source))
+                except _AdapterError as exc:
+                    if exc.code == 'timeout':
+                        raise _AdapterError('outcome_unknown') from exc
+                    raise
+            if status == 201:
+                return {'ok': True, 'evidence_ref': 'PUT ' + target}
+            if status == 401:
+                raise _AdapterError('unauthorized')
+            if status == 409:
+                raise _AdapterError('file_exists_or_conflict')
+            if 300 <= status < 400:
+                raise _AdapterError('redirect_rejected')
+            raise _AdapterError('http_%d' % status)
+        except _AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code}
+        except OSError:
+            return {'ok': False, 'error_code': 'source_unavailable'}
+    return dict(locals())
+
+
+def _pf_define_repetier():
+    import http.client
+    import json
+    import math
+    import os
+    import re
+    import ssl
+    import urllib.parse
+    import uuid
+    _TIMEOUT = 6
+    _MAX_RESPONSE = 2 * 1024 * 1024
+    _CHUNK = 64 * 1024
+
+    class AdapterError(Exception):
+
+        def __init__(self, code, outcome='not_sent'):
+            self.code, self.outcome = (code, outcome)
+            super().__init__(code)
+
+    def valid_slug(value):
+        return isinstance(value, str) and 0 < len(value) <= 128 and (value not in ('.', '..')) and (re.fullmatch('[A-Za-z0-9_-]+', value) is not None)
+
+    def _parts(base):
+        if not isinstance(base, str) or not base or any((ord(c) < 33 or ord(c) == 127 for c in base)):
+            raise AdapterError('invalid_address')
+        try:
+            p = urllib.parse.urlsplit(base)
+            port = p.port
+        except ValueError as exc:
+            raise AdapterError('invalid_address') from exc
+        if p.scheme not in ('http', 'https') or not p.hostname or p.username is not None or (p.password is not None) or p.query or p.fragment or ('\\' in urllib.parse.unquote(base)) or any((ord(c) < 32 or ord(c) == 127 for c in urllib.parse.unquote(p.path))) or any((v in ('.', '..') for v in urllib.parse.unquote(p.path).split('/'))):
+            raise AdapterError('invalid_address')
+        return (p, port)
+
+    def _headers(key):
+        if not isinstance(key, str) or len(key) > 512 or any((ord(c) < 32 or ord(c) == 127 for c in key)):
+            raise AdapterError('invalid_api_key')
+        return {'X-Api-Key': key} if key else {}
+
+    def _request(base, ctx, key, path, *, mutation=False, file_path=None, fields=None, filename=None, is_current=lambda: True):
+        p, port = _parts(base)
+        headers = _headers(key)
+        connection = http.client.HTTPSConnection(p.hostname, port, timeout=_TIMEOUT, context=ctx or ssl.create_default_context()) if p.scheme == 'https' else http.client.HTTPConnection(p.hostname, port, timeout=_TIMEOUT)
+        source = None
+        dispatched = False
+        try:
+            prefix = suffix = b''
+            size = 0
+            if file_path is not None:
+                if not isinstance(filename, str) or not filename or filename in ('.', '..') or any((c in filename for c in '/\\"')) or any((ord(c) < 32 or ord(c) == 127 for c in filename)):
+                    raise AdapterError('invalid_filename')
+                source = open(file_path, 'rb')
+                size = os.fstat(source.fileno()).st_size
+                boundary = 'PrintFarm' + uuid.uuid4().hex
+                prefix = b''.join((('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode('utf-8') for k, v in fields.items()))
+                quoted = urllib.parse.quote(filename, safe='')
+                prefix += ('--%s\r\nContent-Disposition: form-data; name="filename"; filename="%s"; filename*=UTF-8\'\'%s\r\nContent-Type: application/octet-stream\r\n\r\n' % (boundary, filename.encode('ascii', 'replace').decode(), quoted)).encode('ascii')
+                suffix = ('\r\n--%s--\r\n' % boundary).encode('ascii')
+                headers.update({'Content-Type': 'multipart/form-data; boundary=' + boundary, 'Content-Length': str(len(prefix) + size + len(suffix))})
+            connection.putrequest('POST' if mutation else 'GET', p.path.rstrip('/') + path)
+            for k, v in {'Accept': 'application/json', 'Connection': 'close', **headers}.items():
+                connection.putheader(k, v)
+            if mutation and (not is_current()):
+                raise AdapterError('target_changed', 'not_sent')
+            dispatched = mutation
+            connection.endheaders()
+            if source:
+                connection.send(prefix)
+                remaining = size
+                while remaining:
+                    chunk = source.read(min(_CHUNK, remaining))
+                    if not chunk:
+                        raise AdapterError('unknown_outcome', 'unknown')
+                    connection.send(chunk)
+                    remaining -= len(chunk)
+                connection.send(suffix)
+            response = connection.getresponse()
+            payload = response.read(_MAX_RESPONSE + 1)
+            if response.status in (401, 403):
+                raise AdapterError('authorization_denied', 'rejected')
+            if 300 <= response.status < 400:
+                raise AdapterError('redirect_rejected', 'unknown' if mutation else 'not_sent')
+            if not 200 <= response.status < 300:
+                raise AdapterError('http_%d' % response.status, 'unknown' if mutation else 'not_sent')
+            if len(payload) > _MAX_RESPONSE:
+                raise AdapterError('malformed_response', 'unknown' if mutation else 'not_sent')
+            try:
+                value = json.loads(payload.decode('utf-8')) if payload.strip() else {} if mutation else None
+            except (ValueError, UnicodeError) as exc:
+                raise AdapterError('unknown_outcome' if mutation else 'malformed_response', 'unknown' if mutation else 'not_sent') from exc
+            if not isinstance(value, dict) and (not (not mutation and isinstance(value, list))):
+                raise AdapterError('unknown_outcome' if mutation else 'malformed_response', 'unknown' if mutation else 'not_sent')
+            if isinstance(value, dict) and (value.get('error') or value.get('ok') is False):
+                code = 'authorization_denied' if 'authoriz' in str(value.get('error', '')).lower() else 'request_rejected'
+                raise AdapterError(code, 'rejected')
+            return value
+        except AdapterError:
+            raise
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            raise AdapterError('unknown_outcome' if dispatched else 'connection_failed', 'unknown' if dispatched else 'not_sent') from exc
+        finally:
+            if source:
+                source.close()
+            connection.close()
+
+    def _info(base, ctx, key):
+        value = _request(base, ctx, key, '/printer/info')
+        if not isinstance(value, dict):
+            raise AdapterError('malformed_response')
+        if 'software' in value and value['software'] != 'Repetier-Server':
+            raise AdapterError('unsupported_server')
+        if not isinstance(value.get('version'), str) or not value['version'] or len(value['version']) > 64:
+            raise AdapterError('malformed_response')
+        if 'software' not in value:
+            _validate_printers(value.get('printers'))
+        return value
+
+    def _classic(info):
+        version = info.get('version')
+        match = re.fullmatch('(\\d+)\\.(\\d+)(?:\\.\\d+)?', version) if isinstance(version, str) else None
+        return bool(match and (0, 90) <= tuple(map(int, match.groups())) < (1, 5))
+
+    def _printer_list(base, ctx, key, slug=None):
+        value = _request(base, ctx, key, _bridge('listPrinter', slug, {}) if slug else '/printer/list')
+        items = value if slug else value.get('data') if isinstance(value, dict) else None
+        return _validate_printers(items)
+
+    def _validate_printers(items):
+        if not isinstance(items, list) or len(items) > 1000:
+            raise AdapterError('malformed_response')
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict) or not valid_slug(item.get('slug')) or item['slug'] in seen or (not isinstance(item.get('name'), str)) or (not 0 < len(item['name']) <= 256) or (not isinstance(item.get('active'), bool)) or (type(item.get('online')) not in (int, bool)) or (item['online'] not in (0, 1)):
+                raise AdapterError('malformed_response')
+            seen.add(item['slug'])
+        return items
+
+    def list_printers(base, ctx, apikey=''):
+        try:
+            _info(base, ctx, apikey)
+            return {'ok': True, 'printers': [{k: p[k] for k in ('slug', 'name', 'active', 'online')} for p in _printer_list(base, ctx, apikey)]}
+        except AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code}
+
+    def _bridge(command, slug, data):
+        return '/printer/api/' + urllib.parse.quote(slug, safe='') + '?' + urllib.parse.urlencode({'a': command, 'data': json.dumps(data, separators=(',', ':'))})
+
+    def _number(value):
+        return value if type(value) in (int, float) and math.isfinite(value) else None
+
+    def poll(base, ctx, apikey='', *, slug='', raise_if_access_denied=None):
+        status = {'online': False, 'state': 'unknown', 'job_state': 'unknown', 'nozzle': None, 'target_nozzle': None, 'bed': None, 'target_bed': None, 'progress': None, 'filename': '', 'thumbnail': '', 'upload_ready': False, 'can_start': False, 'can_control': False, 'repetier_slug': slug, 'repetier_url': base}
+        try:
+            if not valid_slug(slug):
+                raise AdapterError('printer_selection_required')
+            info = _info(base, ctx, apikey)
+            items = _printer_list(base, ctx, apikey, slug)
+            matches = [p for p in items if p['slug'] == slug]
+            if len(matches) != 1:
+                raise AdapterError('selected_printer_missing')
+            item = matches[0]
+            status['online'] = item['active'] and bool(item['online'])
+            if not status['online']:
+                status['state'] = 'offline'
+                return status
+            states = _request(base, ctx, apikey, _bridge('stateList', slug, {'includeHistory': False}))
+            state = states.get(slug) if isinstance(states, dict) else None
+            if not isinstance(state, dict):
+                raise AdapterError('malformed_response')
+            extruders = state.get('extruder')
+            active = state.get('activeExtruder')
+            if isinstance(extruders, list) and type(active) is int and (0 <= active < len(extruders)):
+                heater = extruders[active]
+                if isinstance(heater, dict):
+                    status.update(nozzle=_number(heater.get('tempRead')), target_nozzle=_number(heater.get('tempSet')))
+            beds = state.get('heatedBeds')
+            if isinstance(beds, list) and beds and isinstance(beds[0], dict):
+                status.update(bed=_number(beds[0].get('tempRead')), target_bed=_number(beds[0].get('tempSet')))
+            elif isinstance(state.get('heatedBed'), dict):
+                status.update(bed=_number(state['heatedBed'].get('tempRead')), target_bed=_number(state['heatedBed'].get('tempSet')))
+            job, paused, pause_state = (item.get('job'), item.get('paused'), item.get('pauseState'))
+            known = isinstance(job, str) and isinstance(paused, bool) and (type(pause_state) is int)
+            idle = known and job == 'none' and (paused is False) and (pause_state == 0) and ('jobid' not in item or (type(item['jobid']) is int and item['jobid'] == 0))
+            running = known and bool(job) and (job != 'none') and (type(item.get('jobid')) is int) and (item['jobid'] > 0)
+            if idle:
+                status.update(state='idle', job_state='idle')
+            elif running and (paused and pause_state > 0 or (not paused and pause_state == 0)):
+                status.update(state='paused' if paused else 'printing', job_state='paused' if paused else 'printing', filename=job[:512], progress=_number(item.get('done')))
+            ready = type(state.get('condition')) is int and state['condition'] == 1
+            writable = _classic(info) and ready
+            status.update(upload_ready=writable and idle, can_start=writable and idle, can_control=writable and status['job_state'] in ('printing', 'paused'))
+            if not _classic(info):
+                status['upload_reason'] = status['control_reason'] = 'repetierModeUnsupported'
+            elif not ready:
+                status['upload_reason'] = status['control_reason'] = 'repetierNotReady'
+            return status
+        except AdapterError as exc:
+            if raise_if_access_denied is not None:
+                raise_if_access_denied(exc)
+            status.update(online=False, upload_ready=False, can_start=False, can_control=False, error_code=exc.code)
+            return status
+
+    def upload(base, ctx, apikey, file_path, filename, *, slug='', start=False, is_current=lambda: True):
+        try:
+            live = poll(base, ctx, apikey, slug=slug)
+            if not live.get('upload_ready') or (start and (not live.get('can_start'))):
+                raise AdapterError(live.get('error_code') or 'not_ready')
+            fields = {'a': 'upload'}
+            if start:
+                fields.update(name=filename, autostart='true')
+            path = '/printer/%s/%s' % ('job' if start else 'model', urllib.parse.quote(slug, safe=''))
+            _request(base, ctx, apikey, path, mutation=True, file_path=file_path, filename=filename, fields=fields, is_current=is_current)
+            return {'ok': True, 'verified': False, 'evidence_ref': 'repetier:http_accepted'}
+        except AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code, 'outcome': exc.outcome}
+
+    def control(base, ctx, apikey, action, *, slug='', is_current=lambda: True):
+        commands = {'pause': ('send', {'cmd': '@pause User requested pause.'}), 'resume': ('continueJob', {}), 'cancel': ('stopJob', {})}
+        try:
+            if action not in commands:
+                raise AdapterError('unknown_action')
+            live = poll(base, ctx, apikey, slug=slug)
+            if not live['can_control'] or live['job_state'] not in ({'printing'} if action == 'pause' else {'paused'} if action == 'resume' else {'printing', 'paused'}):
+                raise AdapterError(live.get('error_code') or 'not_ready')
+            command, data = commands[action]
+            _request(base, ctx, apikey, _bridge(command, slug, data), mutation=True, is_current=is_current)
+            return {'ok': True, 'verified': False, 'evidence_ref': 'repetier:http_accepted'}
+        except AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code, 'outcome': exc.outcome}
+    return dict(locals())
+
+
+def _pf_define_u1_camera():
+    import base64
+    import email.utils
+    import hashlib
+    import http.client
+    import ipaddress
+    import io
+    import json
+    import os
+    import socket
+    import ssl
+    import threading
+    import time
+    import urllib.parse
+    import uuid
+    MAX_JPEG = 2 * 1024 * 1024
+    TIMEOUT = 4.0
+    KEEPALIVE = 2.0
+    FRAME_INTERVAL = 0.25
+    MISSING_GRACE = 6.0
+    MAX_TOKEN_RESPONSE = 4096
+    _GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+    def _connect_tcp(host, port, timeout):
+        """A TCP connection that OrcaSlicer can attribute to the host the user saved.
+
+    The host asks the user before a plugin connects. For a host name,
+    ``socket.create_connection`` reports the address the name resolved to, which
+    no saved permission names; ``http.client`` reports the name itself and the
+    host covers the connection it opens. Literal addresses connect directly.
+    """
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            connection = http.client.HTTPConnection(host, port, timeout=timeout)
+            connection.connect()
+            raw, connection.sock = (connection.sock, None)
+            connection.close()
+            return raw
+        return socket.create_connection((host, port), timeout=timeout)
+
+    class CameraError(Exception):
+        pass
+
+    def _parts(base):
+        if not isinstance(base, str) or any((ord(c) < 33 or ord(c) == 127 for c in base)):
+            raise CameraError('invalid_address')
+        try:
+            parsed = urllib.parse.urlsplit(base)
+            port = parsed.port
+        except ValueError as exc:
+            raise CameraError('invalid_address') from exc
+        decoded = urllib.parse.unquote(parsed.path)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None or (parsed.password is not None) or parsed.query or parsed.fragment or ('\\' in decoded) or any((ord(c) < 32 or ord(c) == 127 for c in decoded)) or any((part in ('.', '..') for part in decoded.split('/'))):
+            raise CameraError('invalid_address')
+        return (parsed, port)
+
+    class Session:
+        """One websocket and at most one HTTP request, closed on every exit."""
+
+        def __init__(self, base, key, context, primitives, is_current, publish):
+            self.parsed, self.port = _parts(base)
+            if not isinstance(key, str) or len(key.encode('utf-8')) > 512 or any((ord(c) < 32 or ord(c) == 127 for c in key)):
+                raise CameraError('invalid_key')
+            self.key, self.context, self.ws = (key, context, primitives)
+            self.is_current, self.publish = (is_current, publish)
+            self.id = uuid.uuid4().hex
+            self.stop = threading.Event()
+            self.wake = threading.Event()
+            self.lock = threading.Lock()
+            self.sock = self.http = self.http_socket = None
+            self.sequence = 0
+            self.pending_sequence = None
+
+        def acknowledge(self, sequence):
+            with self.lock:
+                if type(sequence) is not int or sequence != self.pending_sequence:
+                    return False
+                self.pending_sequence = None
+            self.wake.set()
+            return True
+
+        def _check(self):
+            if self.stop.is_set() or not self.is_current():
+                raise CameraError('session_expired')
+
+        def cancel(self):
+            self.stop.set()
+            self.wake.set()
+            with self.lock:
+                sock, connection, http_socket = (self.sock, self.http, self.http_socket)
+                self.sock = None
+                self.pending_sequence = None
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+            if connection is not None:
+                active_socket = http_socket or connection.sock
+                if active_socket is not None:
+                    try:
+                        active_socket.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        def _connect(self):
+            self._check()
+            parsed = self.parsed
+            token = self._one_shot_token() if self.key else None
+            self._check()
+            raw = _connect_tcp(parsed.hostname, self.port or (443 if parsed.scheme == 'https' else 80), TIMEOUT)
+            try:
+                self._check()
+                sock = (self.context or ssl.create_default_context()).wrap_socket(raw, server_hostname=parsed.hostname) if parsed.scheme == 'https' else raw
+            except Exception:
+                raw.close()
+                raise
+            with self.lock:
+                self.sock = sock
+            self._check()
+            reader = self.ws._Reader(sock, time.monotonic() + TIMEOUT)
+            nonce = base64.b64encode(os.urandom(16))
+            host = parsed.hostname if ':' not in parsed.hostname else '[' + parsed.hostname + ']'
+            if self.port is not None:
+                host += ':' + str(self.port)
+            path = parsed.path.rstrip('/') + '/websocket'
+            if token is not None:
+                path += '?token=' + urllib.parse.quote(token, safe='')
+            request = 'GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n' % (path, host, nonce.decode('ascii'))
+            self._check()
+            sock.sendall((request + '\r\n').encode('ascii'))
+            lines = reader.read_headers().decode('latin-1').split('\r\n')
+            if not lines[0].startswith('HTTP/1.1 101 ') and (not lines[0].startswith('HTTP/1.0 101 ')):
+                raise CameraError('websocket_rejected')
+            headers = {}
+            for line in lines[1:]:
+                name, sep, value = line.partition(':')
+                if not sep or name.lower() in headers:
+                    raise CameraError('malformed_handshake')
+                headers[name.lower()] = value.strip()
+            expected = base64.b64encode(hashlib.sha1(nonce + _GUID).digest()).decode('ascii')
+            if headers.get('sec-websocket-accept') != expected or headers.get('upgrade', '').lower() != 'websocket' or 'upgrade' not in headers.get('connection', '').lower().split(', '):
+                raise CameraError('malformed_handshake')
+            return (sock, reader)
+
+        def _start(self, sock, reader, correlation):
+            self._check()
+            reader.deadline = time.monotonic() + TIMEOUT
+            payload = {'jsonrpc': '2.0', 'method': 'camera.start_monitor', 'id': correlation, 'params': {'domain': 'lan', 'interval': 0, 'req_id': correlation}}
+            self.ws._send_frame(sock, 1, json.dumps(payload, separators=(',', ':')).encode(), reader.deadline)
+            for _ in range(32):
+                self._check()
+                raw = self.ws._read_message(sock, reader)
+                if len(raw) > 64 * 1024:
+                    raise CameraError('response_too_large')
+                value = json.loads(raw.decode('utf-8'))
+                if not isinstance(value, dict):
+                    raise CameraError('malformed_rpc')
+                if value.get('id') != correlation or type(value.get('id')) is not int:
+                    continue
+                if value.get('jsonrpc') != '2.0' or 'error' in value or 'result' not in value or (value['result'] is not None and (not isinstance(value['result'], dict))):
+                    raise CameraError('rpc_rejected')
+                result = value['result'] or {}
+                if result.get('state') == 'failed' or result.get('error'):
+                    raise CameraError('rpc_rejected')
+                return
+            raise CameraError('rpc_unmatched')
+
+        def _get(self, path, accept, limit, deadline):
+            self._check()
+
+            def remaining():
+                value = deadline - time.monotonic()
+                if value <= 0:
+                    raise CameraError('frame_timeout')
+                return value
+            options = {'timeout': remaining()}
+            connection_type = http.client.HTTPConnection
+            if self.parsed.scheme == 'https':
+                connection_type = http.client.HTTPSConnection
+                options['context'] = self.context or ssl.create_default_context()
+            owner = self
+
+            class GuardedConnection(connection_type):
+
+                def connect(self):
+                    owner._check()
+                    self.timeout = remaining()
+                    super().connect()
+                    with owner.lock:
+                        owner.http_socket = self.sock
+                    owner._check()
+                    remaining()
+
+                def send(self, data):
+                    owner._check()
+                    if self.sock is None:
+                        self.connect()
+                    owner._check()
+                    self.sock.settimeout(remaining())
+                    owner._check()
+                    return super().send(data)
+            connection = GuardedConnection(self.parsed.hostname, self.port, **options)
+            with self.lock:
+                self.http = connection
+            response = None
+            try:
+                self._check()
+                headers = {'Accept': accept, 'Cache-Control': 'no-cache', 'Connection': 'close'}
+                if self.key:
+                    headers['X-Api-Key'] = self.key
+                connection.request('GET', path, headers=headers)
+                with self.lock:
+                    self.http_socket = connection.sock
+                self._check()
+                with self.lock:
+                    active_socket = self.http_socket
+                self._check()
+                if active_socket is None:
+                    raise CameraError('camera_unavailable')
+
+                class DeadlineRaw(io.RawIOBase):
+
+                    def __init__(self, source):
+                        super().__init__()
+                        self.source = source
+
+                    def readable(self):
+                        return True
+
+                    def fileno(self):
+                        return self.source.fileno()
+
+                    def readinto(self, buffer):
+                        owner._check()
+                        active_socket.settimeout(remaining())
+                        count = self.source.readinto(buffer)
+                        owner._check()
+                        remaining()
+                        return count
+
+                    def close(self):
+                        if not self.closed:
+                            try:
+                                self.source.close()
+                            finally:
+                                super().close()
+
+                class ResponseSocket:
+
+                    def makefile(self, mode):
+                        return io.BufferedReader(DeadlineRaw(active_socket.makefile(mode, buffering=0)))
+                response = http.client.HTTPResponse(ResponseSocket())
+                response.begin()
+                self._check()
+                remaining()
+                if response.status == 404:
+                    return (None, None)
+                if response.status != 200 or response.getheader('Content-Type', '').split(';', 1)[0].strip().lower() != accept:
+                    raise CameraError('request_rejected')
+                chunks, size = ([], 0)
+                while size <= limit:
+                    self._check()
+                    remaining()
+                    chunk = response.read1(min(64 * 1024, limit + 1 - size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                payload = b''.join(chunks)
+                if response.length not in (None, 0):
+                    raise CameraError('incomplete_response')
+                if len(payload) > limit:
+                    raise CameraError('response_too_large')
+                self._check()
+                remaining()
+                return (payload, response.getheader('Last-Modified'))
+            except TimeoutError as exc:
+                raise CameraError('frame_timeout') from exc
+            finally:
+                try:
+                    if response is not None:
+                        response.close()
+                finally:
+                    connection.close()
+                    with self.lock:
+                        if self.http is connection:
+                            self.http = None
+                            self.http_socket = None
+
+        def _one_shot_token(self):
+            path = self.parsed.path.rstrip('/') + '/access/oneshot_token'
+            payload, _ = self._get(path, 'application/json', MAX_TOKEN_RESPONSE, time.monotonic() + TIMEOUT)
+            try:
+                value = json.loads(payload.decode('utf-8'))
+                token = value.get('result') if isinstance(value, dict) else None
+            except (AttributeError, ValueError, UnicodeError) as exc:
+                raise CameraError('invalid_token') from exc
+            if not isinstance(token, str) or not token or len(token.encode('utf-8')) > 512 or any((ord(c) < 33 or ord(c) == 127 for c in token)):
+                raise CameraError('invalid_token')
+            self._check()
+            return token
+
+        def _jpeg(self, deadline=None):
+            path = self.parsed.path.rstrip('/') + '/server/files/camera/monitor.jpg?cacheBust=' + str(time.monotonic_ns())
+            payload, modified = self._get(path, 'image/jpeg', MAX_JPEG, deadline if deadline is not None else time.monotonic() + TIMEOUT)
+            if payload is None:
+                return None
+            if len(payload) < 4 or not payload.startswith(b'\xff\xd8') or (not payload.endswith(b'\xff\xd9')):
+                raise CameraError('invalid_jpeg')
+            captured_at = None
+            if modified:
+                try:
+                    captured_at = email.utils.parsedate_to_datetime(modified).timestamp()
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            if captured_at is not None and (not -60 <= time.time() - captured_at <= 15):
+                raise CameraError('stale_frame')
+            self._check()
+            return {'image': 'data:image/jpeg;base64,' + base64.b64encode(payload).decode('ascii'), 'received_at': time.time(), 'captured_at': captured_at}
+
+        def run(self):
+            try:
+                sock, reader = self._connect()
+                correlation, missing_since = (1, None)
+                next_monitor = next_frame = time.monotonic()
+                while True:
+                    self.wake.clear()
+                    self._check()
+                    now = time.monotonic()
+                    if now >= next_monitor:
+                        next_monitor = now + KEEPALIVE
+                        self._start(sock, reader, correlation)
+                        correlation = correlation % (2 ** 31 - 1) + 1
+                        if next_monitor <= time.monotonic():
+                            next_monitor = time.monotonic() + KEEPALIVE
+                    self._check()
+                    with self.lock:
+                        ready = self.pending_sequence is None
+                    if ready and time.monotonic() >= next_frame:
+                        attempted_at = time.monotonic()
+                        try:
+                            frame = self._jpeg(min(next_monitor, time.monotonic() + TIMEOUT))
+                        except CameraError as exc:
+                            if str(exc) != 'frame_timeout':
+                                raise
+                            frame = None
+                        now = time.monotonic()
+                        next_frame = now + FRAME_INTERVAL
+                        if frame is None:
+                            if missing_since is None:
+                                missing_since = attempted_at
+                            if now - missing_since >= MISSING_GRACE:
+                                raise CameraError('frame_unavailable')
+                        else:
+                            missing_since = None
+                            self._check()
+                            with self.lock:
+                                self.sequence += 1
+                                self.pending_sequence = self.sequence
+                            self.publish({**frame, 'sessionId': self.id, 'sequence': self.sequence})
+                    with self.lock:
+                        ready = self.pending_sequence is None
+                    until = min(next_monitor, next_frame) if ready else next_monitor
+                    self.wake.wait(max(0, until - time.monotonic()))
+                    if self.stop.is_set():
+                        return
+            except CameraError:
+                raise
+            except (OSError, ValueError, http.client.HTTPException, self.ws._AdapterError) as exc:
+                raise CameraError('camera_unavailable') from exc
+            finally:
+                self.cancel()
+    return dict(locals())
+
+
+def _pf_define_creality():
+    import base64
+    import hashlib
+    import http.client
+    import ipaddress
+    import json
+    import math
+    import os
+    import re
+    import socket
+    import ssl
+    import struct
+    import time
+    import urllib.parse
+    from pathlib import Path
+    STATUS_TIMEOUT = 4.0
+    UPLOAD_TIMEOUT = 30.0
+    MAX_FRAME_BYTES = 256 * 1024
+    MAX_HANDSHAKE_BYTES = 8 * 1024
+    MAX_CONTROL_FRAMES = 8
+    MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+    CHUNK_SIZE = 64 * 1024
+    _WS_GUID = b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+    _STATUS_REQUEST = {'method': 'get', 'params': {'ReqPrinterPara': 1}}
+    _STATE_MAP = {1: 'printing', 5: 'paused', 2: 'complete', 3: 'failed', 4: 'aborted'}
+    _SAFE_FILENAME = re.compile('^[A-Za-z0-9][A-Za-z0-9._ +()\\-]*$')
+    _UPLOAD_OK_STATES = {'idle', 'complete', 'failed', 'aborted'}
+
+    class _AdapterError(Exception):
+
+        def __init__(self, code: 'str'):
+            super().__init__(code)
+            self.code = code
+
+    def ws_base(upload_url: 'str', ws_port: 'int') -> 'str':
+        """Build the status base the way the source driver does: upload host + ws_port."""
+        parsed = _parse_http(upload_url)
+        port = int(ws_port)
+        if not 1 <= port <= 65535:
+            raise ValueError('invalid WebSocket port')
+        host = parsed.hostname
+        return 'ws://%s:%d' % ('[%s]' % host if ':' in host else host, port)
+
+    def poll(base: 'str', ssl_context: 'ssl.SSLContext | None'=None, secret: 'str'='', *, raise_if_access_denied=None) -> 'dict':
+        """Read printer status over the stock WebSocket; never sends a mutating command.
+
+    ``base`` is ``ws://host:port``. ``ssl_context`` and ``secret`` are accepted
+    for interface parity: the confirmed protocol has no TLS and no credentials,
+    so neither is used or echoed anywhere.
+    """
+        status = _empty_status()
+        try:
+            message = _ws_request(base, _STATUS_REQUEST, STATUS_TIMEOUT)
+            status.update(_normalize(message))
+            status['online'] = True
+            status['backend'] = 'creality_stock'
+            status['can_control'] = False
+            status['upload_ready'] = False
+            status['error_code'] = 'writable_target_unverified'
+            return status
+        except _AdapterError as exc:
+            if raise_if_access_denied is not None:
+                raise_if_access_denied(exc)
+            status['error_code'] = exc.code
+            return status
+        except (OSError, ValueError):
+            status['error_code'] = 'connection_failed'
+            return status
+
+    def upload(base: 'str', ssl_context: 'ssl.SSLContext | None', secret: 'str', file_path: 'str | os.PathLike[str]', filename: 'str', *, status_base: 'str') -> 'dict':
+        """POST a G-code as multipart to ``<base>/<filename>``; never starts a print.
+
+    ``base`` is the configured ``upload_url``; ``status_base`` (``ws://host:port``)
+    is required so the printer can be checked idle first. A failure after the
+    request headers were sent is ``unknown_outcome`` and must not be retried
+    blindly.
+    """
+        try:
+            safe_name = _validate_filename(filename)
+            parsed = _parse_http(base)
+            path = Path(file_path)
+            size = path.stat().st_size
+            if not path.is_file() or size <= 0 or size > MAX_UPLOAD_BYTES:
+                return {'ok': False, 'error_code': 'invalid_request'}
+            current = poll(status_base, None, '')
+            if not current['online']:
+                return {'ok': False, 'error_code': current.get('error_code') or 'status_unavailable'}
+            if current['state'] not in _UPLOAD_OK_STATES:
+                return {'ok': False, 'error_code': 'printer_busy'}
+            target = (parsed.path.rstrip('/') or '') + '/' + urllib.parse.quote(safe_name, safe='')
+            boundary = 'pf' + hashlib.sha256(os.urandom(16)).hexdigest()[:24]
+            head = ('--%s\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n' % (boundary, safe_name)).encode('ascii')
+            tail = ('\r\n--%s--\r\n' % boundary).encode('ascii')
+            conn = _http_connection(parsed, ssl_context)
+            dispatched = False
+            try:
+                conn.putrequest('POST', target)
+                conn.putheader('Content-Type', 'multipart/form-data; boundary=' + boundary)
+                conn.putheader('Content-Length', str(len(head) + size + len(tail)))
+                conn.putheader('Connection', 'close')
+                conn.endheaders()
+                dispatched = True
+                conn.send(head)
+                remaining = size
+                with path.open('rb') as source:
+                    while remaining:
+                        chunk = source.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise OSError('source file changed during upload')
+                        conn.send(chunk)
+                        remaining -= len(chunk)
+                conn.send(tail)
+                response = conn.getresponse()
+                response.read(64 * 1024)
+                code = response.status
+                if 200 <= code < 300:
+                    return {'ok': True, 'evidence_ref': 'creality-http-%d' % code}
+                if 300 <= code < 400:
+                    return {'ok': False, 'error_code': 'redirect_rejected'}
+                if code in (401, 403):
+                    return {'ok': False, 'error_code': 'authentication_failed'}
+                return {'ok': False, 'error_code': 'upload_rejected'}
+            except (OSError, http.client.HTTPException):
+                return {'ok': False, 'error_code': 'unknown_outcome' if dispatched else 'connection_failed'}
+            finally:
+                conn.close()
+        except _AdapterError as exc:
+            return {'ok': False, 'error_code': exc.code}
+        except (OSError, ValueError, TypeError):
+            return {'ok': False, 'error_code': 'invalid_request'}
+
+    def _empty_status() -> 'dict':
+        return {'online': False, 'state': 'offline', 'job_state': 'unknown', 'nozzle': None, 'target_nozzle': None, 'bed': None, 'target_bed': None, 'progress': None, 'filename': '', 'thumbnail': '', 'upload_ready': False, 'can_control': False, 'elapsed_seconds': None, 'remaining_seconds': None, 'layer': None, 'total_layers': None}
+
+    def _number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+            return None
+        return value
+
+    def _normalize(data: 'dict') -> 'dict':
+        name = data.get('printFileName')
+        out = {'nozzle': None, 'target_nozzle': None, 'bed': None, 'target_bed': None, 'thumbnail': ''}
+        if not isinstance(name, str):
+            out.update(state='unknown', job_state='unknown', progress=None, filename='')
+            return out
+        name = name.strip()
+        if name == '':
+            out.update(state='idle', job_state='idle', progress=None, filename='')
+            return out
+        raw = data.get('state')
+        mapped = _STATE_MAP.get(raw) if isinstance(raw, int) and (not isinstance(raw, bool)) else None
+        state = mapped or 'unknown'
+        progress = _number(data.get('printProgress'))
+        if progress is not None and (not 0 <= progress <= 100):
+            progress = None
+        out.update(state=state, job_state=state, progress=progress, filename=name.rsplit('/', 1)[-1], elapsed_seconds=_non_negative(data.get('printJobTime')), remaining_seconds=_non_negative(data.get('printLeftTime')), layer=_non_negative(data.get('layer')), total_layers=_non_negative(data.get('TotalLayer')))
+        return out
+
+    def _non_negative(value):
+        value = _number(value)
+        return value if value is not None and value >= 0 else None
+
+    def _validate_filename(filename):
+        if not isinstance(filename, str) or len(filename) > 128 or (not _SAFE_FILENAME.fullmatch(filename)) or (not filename.lower().endswith('.gcode')):
+            raise _AdapterError('invalid_filename')
+        return filename
+
+    def _parse_http(base):
+        if not isinstance(base, str):
+            raise ValueError('invalid base URL')
+        parsed = urllib.parse.urlsplit(base.strip())
+        if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+            raise ValueError('invalid base URL')
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError('credentials, query and fragment are forbidden')
+        parsed.port
+        return parsed
+
+    def _http_connection(parsed, ssl_context):
+        options = {'timeout': UPLOAD_TIMEOUT}
+        if parsed.scheme.lower() == 'https':
+            options['context'] = ssl_context or ssl.create_default_context()
+            return http.client.HTTPSConnection(parsed.hostname, parsed.port, **options)
+        return http.client.HTTPConnection(parsed.hostname, parsed.port, **options)
+
+    def _connect_tcp(host, port, timeout):
+        """A TCP connection that OrcaSlicer can attribute to the host the user saved.
+
+    The host asks the user before a plugin connects. For a host name,
+    ``socket.create_connection`` reports the address the name resolved to, which
+    no saved permission names; ``http.client`` reports the name itself and the
+    host covers the connection it opens. Literal addresses connect directly.
+    """
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            connection = http.client.HTTPConnection(host, port, timeout=timeout)
+            connection.connect()
+            raw, connection.sock = (connection.sock, None)
+            connection.close()
+            return raw
+        return socket.create_connection((host, port), timeout=timeout)
+
+    def _ws_request(base, payload, timeout):
+        if not isinstance(base, str):
+            raise _AdapterError('invalid_request')
+        parsed = urllib.parse.urlsplit(base.strip())
+        if parsed.scheme.lower() != 'ws' or not parsed.hostname or parsed.port is None:
+            raise _AdapterError('invalid_request')
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise _AdapterError('invalid_request')
+        if parsed.path not in ('', '/'):
+            raise _AdapterError('invalid_request')
+        deadline = time.monotonic() + timeout
+        try:
+            sock = _connect_tcp(parsed.hostname, parsed.port, timeout)
+        except socket.timeout:
+            raise _AdapterError('timeout') from None
+        except OSError:
+            raise _AdapterError('connection_failed') from None
+        try:
+            reader = _Reader(sock, deadline)
+            _handshake(sock, reader, parsed)
+            _send_frame(sock, 1, json.dumps(payload).encode('utf-8'), deadline)
+            raw = _read_message(sock, reader)
+        except socket.timeout:
+            raise _AdapterError('timeout') from None
+        except _AdapterError:
+            raise
+        except OSError:
+            raise _AdapterError('connection_failed') from None
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        try:
+            value = json.loads(raw.decode('utf-8'))
+        except (UnicodeError, ValueError):
+            raise _AdapterError('malformed_response') from None
+        if not isinstance(value, dict) or 'state' not in value:
+            raise _AdapterError('unrecognized_response')
+        return value
+
+    class _Reader:
+
+        def __init__(self, sock, deadline):
+            self.sock = sock
+            self.deadline = deadline
+            self.buffer = b''
+
+        def _wait(self):
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                raise socket.timeout()
+            self.sock.settimeout(left)
+
+        def read(self, count):
+            while len(self.buffer) < count:
+                self._wait()
+                chunk = self.sock.recv(min(4096, max(count - len(self.buffer), 1)))
+                if not chunk:
+                    raise _AdapterError('connection_closed')
+                self.buffer += chunk
+            data, self.buffer = (self.buffer[:count], self.buffer[count:])
+            return data
+
+        def read_headers(self):
+            while b'\r\n\r\n' not in self.buffer:
+                if len(self.buffer) > MAX_HANDSHAKE_BYTES:
+                    raise _AdapterError('handshake_failed')
+                self._wait()
+                chunk = self.sock.recv(1024)
+                if not chunk:
+                    raise _AdapterError('connection_closed')
+                self.buffer += chunk
+            head, _, self.buffer = self.buffer.partition(b'\r\n\r\n')
+            if len(head) > MAX_HANDSHAKE_BYTES:
+                raise _AdapterError('handshake_failed')
+            return head
+
+    def _handshake(sock, reader, parsed):
+        key = base64.b64encode(os.urandom(16))
+        host = parsed.hostname if ':' not in parsed.hostname else '[%s]' % parsed.hostname
+        request = ('GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n' % (host, parsed.port, key.decode('ascii'))).encode('ascii')
+        reader._wait()
+        sock.sendall(request)
+        lines = reader.read_headers().decode('latin-1').split('\r\n')
+        parts = lines[0].split(' ', 2)
+        if len(parts) < 2 or not parts[0].startswith('HTTP/1.'):
+            raise _AdapterError('handshake_failed')
+        if parts[1] in ('401', '403'):
+            raise _AdapterError('authentication_failed')
+        if parts[1] in ('301', '302', '303', '307', '308'):
+            raise _AdapterError('redirect_rejected')
+        if parts[1] != '101':
+            raise _AdapterError('handshake_failed')
+        headers = {}
+        for line in lines[1:]:
+            name, sep, value = line.partition(':')
+            if not sep:
+                raise _AdapterError('handshake_failed')
+            headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1(key + _WS_GUID).digest()).decode('ascii')
+        if headers.get('upgrade', '').lower() != 'websocket' or 'upgrade' not in headers.get('connection', '').lower() or headers.get('sec-websocket-accept') != expected:
+            raise _AdapterError('handshake_failed')
+
+    def _send_frame(sock, opcode, payload, deadline):
+        mask = os.urandom(4)
+        length = len(payload)
+        if length < 126:
+            head = struct.pack('!BB', 128 | opcode, 128 | length)
+        elif length < 65536:
+            head = struct.pack('!BBH', 128 | opcode, 128 | 126, length)
+        else:
+            head = struct.pack('!BBQ', 128 | opcode, 128 | 127, length)
+        masked = bytes((b ^ mask[i % 4] for i, b in enumerate(payload)))
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout()
+        sock.settimeout(left)
+        sock.sendall(head + mask + masked)
+
+    def _read_frame(reader):
+        b0, b1 = reader.read(2)
+        fin, rsv, opcode = (b0 & 128, b0 & 112, b0 & 15)
+        if rsv or b1 & 128:
+            raise _AdapterError('malformed_frame')
+        length = b1 & 127
+        if length == 126:
+            length = struct.unpack('!H', reader.read(2))[0]
+        elif length == 127:
+            length = struct.unpack('!Q', reader.read(8))[0]
+        if length > MAX_FRAME_BYTES:
+            raise _AdapterError('frame_too_large')
+        if opcode >= 8 and (length > 125 or not fin):
+            raise _AdapterError('malformed_frame')
+        return (bool(fin), opcode, reader.read(length))
+
+    def _read_message(sock, reader):
+        parts = []
+        total = 0
+        started = False
+        controls = 0
+        while True:
+            fin, opcode, payload = _read_frame(reader)
+            if opcode == 8:
+                raise _AdapterError('connection_closed')
+            if opcode == 9:
+                controls += 1
+                if controls > MAX_CONTROL_FRAMES:
+                    raise _AdapterError('malformed_frame')
+                _send_frame(sock, 10, payload, reader.deadline)
+                continue
+            if opcode == 10:
+                controls += 1
+                if controls > MAX_CONTROL_FRAMES:
+                    raise _AdapterError('malformed_frame')
+                continue
+            if opcode == 1 and (not started):
+                started = True
+            elif opcode == 0 and started:
+                pass
+            else:
+                raise _AdapterError('malformed_frame')
+            total += len(payload)
+            if total > MAX_FRAME_BYTES:
+                raise _AdapterError('frame_too_large')
+            parts.append(payload)
+            if fin:
+                return b''.join(parts)
+    return dict(locals())
+
+
+def _pf_define_flashforge():
+    import hashlib
+    import http.client
+    import json
+    import math
+    import os
+    import re
+    import socket
+    import ssl
+    import time
+    import urllib.parse
+    from pathlib import Path
+    HTTP_PORT = 8898
+    TCP_PORT = 8899
+    STATUS_TIMEOUT = 6.0
+    UPLOAD_TIMEOUT = 30.0
+    UPLOAD_DEADLINE = 1800.0
+    OPERATION_TIMEOUT = 15.0
+    MAX_BODY_BYTES = 256 * 1024
+    MAX_SMALL_BYTES = 64 * 1024
+    MAX_TCP_REPLY = 16 * 1024
+    MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+    CHUNK_SIZE = 64 * 1024
+    MAX_CREDENTIAL_LENGTH = 64
+    MODELS = {35: {'model': 'Adventurer 5M', 'family': 'adventurer_5m'}, 36: {'model': 'Adventurer 5M Pro', 'family': 'adventurer_5m'}, 38: {'model': 'AD5X', 'family': 'ad5x'}}
+    HARDWARE_VERIFIED: 'dict' = {}
+    _STATE_MAP = {'ready': 'idle', 'completed': 'complete', 'printing': 'printing', 'heating': 'printing', 'pausing': 'printing', 'pause': 'paused', 'error': 'error', 'busy': 'busy', 'canceling': 'busy', 'cancel': 'busy', 'calibrate_doing': 'busy', 'downloading': 'busy', 'cloud_slicing': 'busy', 'sending': 'busy', 'unzipping': 'busy'}
+    _SAFE_FILENAME = re.compile('^[A-Za-z0-9][A-Za-z0-9._-]*$')
+    _PID_HEX = re.compile('^[0-9A-Fa-f]{1,4}$')
+    _CONTROL_CHARS = re.compile('[\\x00-\\x1f\\x7f]')
+    _HTTP_CODE_MAP = {1: 'authentication_failed', -2: 'lan_mode_disabled', -1: 'invalid_request', 2: 'printer_busy', 5: 'printer_busy'}
+    CAPABILITIES = {'status': 'implemented', 'upload': 'implemented_disabled_until_hardware_verified', 'start': 'implemented_disabled_until_hardware_verified_5m_only', 'pause': 'unsupported_unverified', 'resume': 'unsupported_unverified', 'cancel': 'unsupported_unverified', 'tcp_status': 'implemented_opt_in', 'tcp_upload': 'unsupported_unverified', 'tcp_start': 'unsupported_unverified'}
+
+    class _AdapterError(Exception):
+
+        def __init__(self, code: 'str'):
+            super().__init__(code)
+            self.code = code
+
+    def poll(base: 'str', ssl_context: 'ssl.SSLContext | None'=None, secret: 'str'='', *, serial_number: 'str'='', raise_if_access_denied=None) -> 'dict':
+        """Read-only status via ``POST /detail``. The optional callback can surface a host denial.
+
+    ``base`` is ``http://host`` (port 8898 implied) or ``http://host:port``.
+    ``secret`` is the check code; ``serial_number`` is the printer serial.
+    ``ssl_context`` is accepted for interface parity and unused: the printer
+    API is plain HTTP.
+    """
+        status = _empty_status()
+        try:
+            deadline = time.monotonic() + STATUS_TIMEOUT
+            target = _parse_base(base)
+            creds = _credentials(serial_number, secret)
+            reply = _json_call(target, '/detail', {'serialNumber': creds[0], 'checkCode': creds[1]}, deadline, MAX_BODY_BYTES)
+            detail = _checked_detail(reply)
+            pid = _read_pid(detail)
+            if pid is None:
+                raise _AdapterError('identity_unverified')
+            if pid not in MODELS:
+                raise _AdapterError('unsupported_model')
+            status.update(_normalize(detail))
+            status.update(model=MODELS[pid]['model'], model_family=MODELS[pid]['family'], identity_verified=True)
+            status['online'] = True
+            _apply_write_gate(status, pid)
+            return status
+        except _AdapterError as exc:
+            if raise_if_access_denied is not None:
+                raise_if_access_denied(exc)
+            status['error_code'] = exc.code
+            if exc.code not in ('connection_failed', 'timeout'):
+                status['state'] = 'unknown'
+            return status
+        except (OSError, ValueError, TypeError):
+            status['error_code'] = 'invalid_request'
+            return status
+
+    def upload(base: 'str', ssl_context: 'ssl.SSLContext | None', secret: 'str', file_path: 'str | os.PathLike[str]', filename: 'str', *, serial_number: 'str'='') -> 'dict':
+        """``POST /uploadGcode`` with ``printNow: "false"``; never starts a print.
+
+    Disabled (``unsupported_unverified``, nothing sent) until the identified
+    model is listed in ``HARDWARE_VERIFIED`` with ``upload: True``. The printer
+    is polled first and must be ``idle`` and a recognized model. A failure or
+    unreadable reply after the request was dispatched is ``unknown_outcome``
+    and must not be retried blindly. Verification is reported as unavailable.
+    """
+        if not any((entry.get('upload') for entry in HARDWARE_VERIFIED.values())):
+            return _result(False, 'unsupported_unverified', 'not_sent')
+        try:
+            safe_name = _validate_filename(filename)
+            path = Path(file_path)
+            size = path.stat().st_size
+            if not path.is_file() or size <= 0 or size > MAX_UPLOAD_BYTES:
+                return _result(False, 'invalid_request', 'not_sent')
+            target = _parse_base(base)
+            creds = _credentials(serial_number, secret)
+            gate = _preflight(base, secret, serial_number, 'upload')
+            if gate is not None:
+                return gate
+            boundary = 'pf' + hashlib.sha256(os.urandom(16)).hexdigest()[:24]
+            head = ('--%s\r\nContent-Disposition: form-data; name="gcodeFile"; filename="%s"\r\nContent-Type: application/octet-stream\r\n\r\n' % (boundary, safe_name)).encode('ascii')
+            tail = ('\r\n--%s--\r\n' % boundary).encode('ascii')
+            headers = [('Content-Type', 'multipart/form-data; boundary=' + boundary), ('Content-Length', str(len(head) + size + len(tail))), ('serialNumber', creds[0]), ('checkCode', creds[1]), ('fileSize', str(size)), ('printNow', 'false'), ('levelingBeforePrint', 'false')]
+            conn = http.client.HTTPConnection(target[0], target[1], timeout=UPLOAD_TIMEOUT)
+            dispatched = False
+            deadline = time.monotonic() + UPLOAD_DEADLINE
+            try:
+                conn.putrequest('POST', '/uploadGcode', skip_accept_encoding=True)
+                for name, value in headers:
+                    conn.putheader(name, value)
+                conn.putheader('Connection', 'close')
+                conn.endheaders()
+                dispatched = True
+                conn.send(head)
+                remaining = size
+                with path.open('rb') as source:
+                    while remaining:
+                        if time.monotonic() > deadline:
+                            raise TimeoutError()
+                        chunk = source.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise OSError('source file changed during upload')
+                        conn.send(chunk)
+                        remaining -= len(chunk)
+                conn.send(tail)
+                response = conn.getresponse()
+                body = _read_response(response, MAX_SMALL_BYTES, deadline)
+                if response.status != 200:
+                    return _result(False, 'upload_rejected', 'rejected')
+                verdict = _envelope_code(_parse_json(body))
+                if verdict == 0:
+                    return {'ok': True, 'outcome': 'completed_unverified', 'evidence_ref': 'flashforge-http-code-0', 'size': size, 'verified': False, 'verification': 'unavailable'}
+                if verdict is None:
+                    return _result(False, 'unknown_outcome', 'unknown')
+                return _result(False, _HTTP_CODE_MAP.get(verdict, 'upload_rejected'), 'rejected')
+            except _AdapterError as exc:
+                if dispatched and exc.code in ('timeout', 'response_too_large', 'malformed_response', 'redirect_rejected'):
+                    return _result(False, 'unknown_outcome', 'unknown')
+                return _result(False, exc.code, 'unknown' if dispatched else 'not_sent')
+            except (OSError, http.client.HTTPException):
+                return _result(False, 'unknown_outcome' if dispatched else 'connection_failed', 'unknown' if dispatched else 'not_sent')
+            finally:
+                conn.close()
+        except _AdapterError as exc:
+            return _result(False, exc.code, 'not_sent')
+        except (OSError, ValueError, TypeError):
+            return _result(False, 'invalid_request', 'not_sent')
+
+    def start(base: 'str', ssl_context: 'ssl.SSLContext | None', secret: 'str', filename: 'str', *, serial_number: 'str'='', leveling_before_print: 'bool'=False) -> 'dict':
+        """``POST /printGcode`` {fileName, levelingBeforePrint} for an uploaded file.
+
+    Only for the 5M family (pid 0x23/0x24) and only after the model is marked
+    ``start: True`` in ``HARDWARE_VERIFIED``; AD5X and everything else return
+    ``unsupported_unverified``. Requires state ``ready`` (a ``completed``
+    printer may still need its plate cleared). Must follow explicit user
+    confirmation. One request is sent and never repeated; ``ok=True`` means
+    accepted (``accepted_pending_reconcile``) and must be confirmed by polling.
+    """
+        if not any((entry.get('start') for pid, entry in HARDWARE_VERIFIED.items() if MODELS.get(pid, {}).get('family') == 'adventurer_5m')):
+            return _result(False, 'unsupported_unverified', 'not_sent')
+        try:
+            safe_name = _validate_filename(filename)
+            if not isinstance(leveling_before_print, bool):
+                raise ValueError('invalid leveling flag')
+            target = _parse_base(base)
+            creds = _credentials(serial_number, secret)
+            gate = _preflight(base, secret, serial_number, 'start')
+            if gate is not None:
+                return gate
+            deadline = time.monotonic() + OPERATION_TIMEOUT
+            body = {'serialNumber': creds[0], 'checkCode': creds[1], 'fileName': safe_name, 'levelingBeforePrint': leveling_before_print}
+            try:
+                reply = _json_call(target, '/printGcode', body, deadline, MAX_SMALL_BYTES, mutating=True)
+            except _AdapterError as exc:
+                return _result(False, exc.code, 'unknown' if exc.code == 'unknown_outcome' else 'not_sent')
+            verdict = _envelope_code(reply)
+            if verdict == 0:
+                return {'ok': True, 'outcome': 'accepted_pending_reconcile', 'evidence_ref': 'flashforge-http-code-0'}
+            if verdict is None:
+                return _result(False, 'unknown_outcome', 'unknown')
+            mapped = 'file_not_found' if verdict == 3 else _HTTP_CODE_MAP.get(verdict, 'start_rejected')
+            return _result(False, mapped, 'rejected')
+        except _AdapterError as exc:
+            return _result(False, exc.code, 'not_sent')
+        except (OSError, ValueError, TypeError):
+            return _result(False, 'invalid_request', 'not_sent')
+
+    def pause(*_args, **_kwargs) -> 'dict':
+        return _result(False, 'unsupported_unverified', 'not_sent')
+
+    def resume(*_args, **_kwargs) -> 'dict':
+        return _result(False, 'unsupported_unverified', 'not_sent')
+
+    def cancel(*_args, **_kwargs) -> 'dict':
+        return _result(False, 'unsupported_unverified', 'not_sent')
+
+    def upload_tcp(*_args, **_kwargs) -> 'dict':
+        """TCP M28/M29 upload: chunk acknowledgements are not confirmed."""
+        return _result(False, 'unsupported_unverified', 'not_sent')
+
+    def start_tcp(*_args, **_kwargs) -> 'dict':
+        """TCP ``~M23`` start: not confirmed for any model we can identify."""
+        return _result(False, 'unsupported_unverified', 'not_sent')
+
+    def _empty_status() -> 'dict':
+        return {'online': False, 'state': 'offline', 'job_state': 'unknown', 'raw_state': None, 'nozzle': None, 'target_nozzle': None, 'bed': None, 'target_bed': None, 'progress': None, 'filename': '', 'thumbnail': '', 'upload_ready': False, 'upload_reason': '', 'can_start': False, 'can_control': False, 'control_reason': 'pause_resume_cancel_unverified', 'elapsed_seconds': None, 'remaining_seconds': None, 'layer': None, 'total_layers': None, 'model': None, 'model_family': None, 'firmware': '', 'identity_verified': False, 'printer_error_code': '', 'backend': 'flashforge_http', 'error_code': '', 'capabilities': dict(CAPABILITIES)}
+
+    def _apply_write_gate(status: 'dict', pid: 'int') -> 'None':
+        entry = HARDWARE_VERIFIED.get(pid, {})
+        idle = status['state'] == 'idle'
+        if not entry.get('upload'):
+            status['upload_ready'] = False
+            status['upload_reason'] = 'hardware_unverified'
+        elif not idle:
+            status['upload_ready'] = False
+            status['upload_reason'] = 'state_%s' % status['state']
+        else:
+            status['upload_ready'] = True
+            status['upload_reason'] = ''
+        start_ok = bool(entry.get('start')) and MODELS[pid]['family'] == 'adventurer_5m' and idle
+        status['can_start'] = start_ok
+
+    def _normalize(detail: 'dict') -> 'dict':
+        raw = detail.get('status')
+        if not isinstance(raw, str):
+            return {'state': 'unknown', 'job_state': 'unknown'}
+        state = _STATE_MAP.get(raw.strip().lower(), 'unknown')
+        out = {'state': state, 'job_state': state, 'raw_state': _clean(raw, 32), 'nozzle': _temperature(detail.get('rightTemp')), 'target_nozzle': _temperature(detail.get('rightTargetTemp')), 'bed': _temperature(detail.get('platTemp')), 'target_bed': _temperature(detail.get('platTargetTemp')), 'firmware': _clean(detail.get('firmwareVersion'), 32), 'printer_error_code': _clean(detail.get('errorCode'), 32), 'layer': _non_negative_int(detail.get('printLayer')), 'total_layers': _non_negative_int(detail.get('targetPrintLayer'))}
+        if state == 'unknown':
+            return out
+        name = detail.get('printFileName')
+        if state != 'idle' and isinstance(name, str):
+            out['filename'] = _clean(name.replace('\\', '/').rsplit('/', 1)[-1], 128)
+        ratio = _number(detail.get('printProgress'))
+        if state != 'idle' and ratio is not None and (0 <= ratio <= 1):
+            out['progress'] = round(ratio * 100, 2)
+        out['elapsed_seconds'] = _non_negative(detail.get('printDuration')) if state != 'idle' else None
+        if raw.strip().lower() == 'printing':
+            out['remaining_seconds'] = _non_negative(detail.get('estimatedTime'))
+        return out
+
+    def _number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (not math.isfinite(value)):
+            return None
+        return value
+
+    def _non_negative(value):
+        value = _number(value)
+        return value if value is not None and value >= 0 else None
+
+    def _non_negative_int(value):
+        value = _non_negative(value)
+        return int(value) if value is not None else None
+
+    def _temperature(value):
+        value = _number(value)
+        return value if value is not None and -20 <= value <= 500 else None
+
+    def _clean(value, limit):
+        if not isinstance(value, str):
+            return ''
+        return _CONTROL_CHARS.sub('', value).strip()[:limit]
+
+    def _read_pid(detail: 'dict'):
+        """String -> base-16 (firmware form), int -> decimal; anything else unknown."""
+        pid = detail.get('pid')
+        if isinstance(pid, bool):
+            return None
+        if isinstance(pid, int):
+            return pid if pid >= 0 else None
+        if isinstance(pid, str) and _PID_HEX.fullmatch(pid.strip()):
+            return int(pid.strip(), 16)
+        return None
+
+    def _checked_detail(reply) -> 'dict':
+        code = _envelope_code(reply)
+        if code is None:
+            raise _AdapterError('unrecognized_response')
+        if code != 0:
+            raise _AdapterError(_HTTP_CODE_MAP.get(code, 'printer_rejected'))
+        detail = reply.get('detail')
+        if not isinstance(detail, dict) or not detail:
+            raise _AdapterError('unrecognized_response')
+        return detail
+
+    def _envelope_code(reply):
+        """Integer ``code`` (int or numeric string, as the Orca client accepts)."""
+        if not isinstance(reply, dict):
+            return None
+        value = reply.get('code')
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and re.fullmatch('-?\\d{1,6}', value.strip()):
+            return int(value.strip())
+        return None
+
+    def _result(ok: 'bool', error_code: 'str', outcome: 'str') -> 'dict':
+        return {'ok': ok, 'error_code': error_code, 'outcome': outcome}
+
+    def _validate_filename(filename):
+        if not isinstance(filename, str) or len(filename) > 64 or (not _SAFE_FILENAME.fullmatch(filename)) or (not filename.lower().endswith('.gcode')):
+            raise _AdapterError('invalid_filename')
+        return filename
+
+    def _credentials(serial_number, secret):
+        for value in (serial_number, secret):
+            if not isinstance(value, str) or not value.strip():
+                raise _AdapterError('credentials_required')
+            if len(value) > MAX_CREDENTIAL_LENGTH or _CONTROL_CHARS.search(value) or (not value.isascii()):
+                raise _AdapterError('invalid_request')
+        return (serial_number.strip(), secret.strip())
+
+    def _parse_base(base):
+        if not isinstance(base, str):
+            raise _AdapterError('invalid_request')
+        parsed = urllib.parse.urlsplit(base.strip())
+        if parsed.scheme.lower() != 'http' or not parsed.hostname:
+            raise _AdapterError('invalid_request')
+        if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+            raise _AdapterError('invalid_request')
+        if parsed.path not in ('', '/'):
+            raise _AdapterError('invalid_request')
+        try:
+            port = parsed.port or HTTP_PORT
+        except ValueError:
+            raise _AdapterError('invalid_request') from None
+        return (parsed.hostname, port)
+
+    def _preflight(base, secret, serial_number, action):
+        """Identify the printer and require a state that allows the write."""
+        current = poll(base, None, secret, serial_number=serial_number)
+        if not current['online'] or not current['identity_verified']:
+            return _result(False, current.get('error_code') or 'status_unavailable', 'not_sent')
+        pid = next((p for p, m in MODELS.items() if m['model'] == current['model']))
+        entry = HARDWARE_VERIFIED.get(pid, {})
+        if not entry.get(action) or (action == 'start' and MODELS[pid]['family'] != 'adventurer_5m'):
+            return _result(False, 'unsupported_unverified', 'not_sent')
+        if current['state'] != 'idle':
+            return _result(False, 'printer_busy', 'not_sent')
+        return None
+
+    def _json_call(target, path, body, deadline, max_bytes, *, mutating=False):
+        payload = json.dumps(body).encode('utf-8')
+        conn = http.client.HTTPConnection(target[0], target[1], timeout=_left(deadline))
+        dispatched = False
+        try:
+            conn.putrequest('POST', path, skip_accept_encoding=True)
+            conn.putheader('Content-Type', 'application/json')
+            conn.putheader('Content-Length', str(len(payload)))
+            conn.putheader('Connection', 'close')
+            conn.endheaders(payload)
+            dispatched = True
+            response = conn.getresponse()
+            data = _read_response(response, max_bytes, deadline)
+            if response.status != 200:
+                raise _AdapterError('http_error')
+            reply = _parse_json(data)
+            if reply is None:
+                raise _AdapterError('malformed_response')
+            return reply
+        except _AdapterError as exc:
+            if mutating and dispatched and (exc.code in ('timeout', 'response_too_large', 'malformed_response')):
+                raise _AdapterError('unknown_outcome') from None
+            raise
+        except socket.timeout:
+            raise _AdapterError('unknown_outcome' if mutating and dispatched else 'timeout') from None
+        except http.client.RemoteDisconnected:
+            raise _AdapterError('unknown_outcome' if mutating and dispatched else 'connection_failed') from None
+        except http.client.HTTPException:
+            raise _AdapterError('unknown_outcome' if mutating and dispatched else 'malformed_response') from None
+        except OSError:
+            raise _AdapterError('unknown_outcome' if mutating and dispatched else 'connection_failed') from None
+        finally:
+            conn.close()
+
+    def _read_response(response, max_bytes, deadline):
+        if 300 <= response.status < 400:
+            raise _AdapterError('redirect_rejected')
+        length = response.getheader('Content-Length')
+        if length and length.isdigit() and (int(length) > max_bytes):
+            raise _AdapterError('response_too_large')
+        data = bytearray()
+        while True:
+            if time.monotonic() > deadline:
+                raise _AdapterError('timeout')
+            chunk = response.read1(16 * 1024)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > max_bytes:
+                raise _AdapterError('response_too_large')
+        return bytes(data)
+
+    def _parse_json(body):
+        try:
+            return json.loads(body.decode('utf-8'))
+        except (UnicodeError, ValueError):
+            return None
+
+    def _left(deadline):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _AdapterError('timeout')
+        return left
+    _TCP_TYPES = {'flashforge adventurer 5m': 35, 'flashforge adventurer 5m pro': 36}
+    _TCP_STATE = {'READY': 'idle', 'IDLE': 'idle', 'BUILDING_COMPLETED': 'complete', 'PAUSED': 'paused', 'BUSY': 'busy'}
+    _NUM = '(-?\\d+(?:\\.\\d+)?)'
+
+    def poll_tcp(base: 'str', *, serial_number: 'str'='', timeout: 'float | None'=None) -> 'dict':
+        """Read-only status over TCP 8899 (``M601`` session, ``M115``, ``M119``, ``M105``, ``M27``, ``M602``).
+
+    ``base`` is ``tcp://host[:8899]``. Takes the printer's single control
+    session while running (other clients may be refused) and always releases
+    it. Identity comes from the ``M115`` "Machine Type" line (exact match for
+    the 5M / 5M Pro); AD5X and legacy models are not confirmed for TCP and
+    report ``unsupported_model``. ``serial_number`` is optional: when given it
+    must equal the ``SN:`` reported by ``M115`` (``identity_mismatch``).
+    The TCP path never sets ``upload_ready`` or ``can_control``.
+    """
+        status = _empty_status()
+        status['backend'] = 'flashforge_tcp'
+        status['upload_reason'] = 'tcp_read_only'
+        status['control_reason'] = 'tcp_read_only'
+        sock = None
+        acquired = False
+        try:
+            host, port = _parse_tcp(base)
+            expected = None
+            if serial_number:
+                expected = _credentials(serial_number, 'x')[0]
+            deadline = time.monotonic() + (STATUS_TIMEOUT if timeout is None else timeout)
+            try:
+                sock = socket.create_connection((host, port), timeout=_left(deadline))
+            except socket.timeout:
+                raise _AdapterError('timeout') from None
+            except OSError:
+                raise _AdapterError('connection_failed') from None
+            reader = _TcpReader(sock, deadline)
+            first = reader.command('M601 S1')
+            if 'control failed' in first.lower():
+                raise _AdapterError('control_session_busy')
+            if 'control success' not in first.lower():
+                raise _AdapterError('unrecognized_response')
+            acquired = True
+            info = reader.command('M115')
+            machine = _tcp_field(info, 'Machine Type')
+            pid = _TCP_TYPES.get(machine.strip().lower()) if machine else None
+            if pid is None:
+                raise _AdapterError('unsupported_model' if machine else 'identity_unverified')
+            if expected is not None and _tcp_field(info, 'SN').strip() != expected:
+                raise _AdapterError('identity_mismatch')
+            endstop = reader.command('M119')
+            temps = reader.command('M105')
+            progress = reader.command('M27')
+            machine_status = _tcp_field(endstop, 'MachineStatus').strip().upper()
+            if not machine_status:
+                raise _AdapterError('unrecognized_response')
+            state = _tcp_state(machine_status)
+            status.update(state=state, job_state=state, raw_state=_clean(machine_status, 32), model=MODELS[pid]['model'], model_family=MODELS[pid]['family'], identity_verified=True, firmware=_clean(_tcp_field(info, 'Firmware'), 32))
+            status.update(_tcp_temperatures(temps))
+            if state != 'idle':
+                status['filename'] = _clean(_tcp_field(endstop, 'CurrentFile').replace('\\', '/').rsplit('/', 1)[-1], 128)
+                status.update(_tcp_progress(progress))
+            status['online'] = True
+            return status
+        except _AdapterError as exc:
+            status['error_code'] = exc.code
+            if exc.code not in ('connection_failed', 'timeout'):
+                status['state'] = 'unknown'
+            return status
+        except (OSError, ValueError, TypeError):
+            status['error_code'] = 'invalid_request'
+            return status
+        finally:
+            if sock is not None:
+                if acquired:
+                    try:
+                        sock.settimeout(1.0)
+                        sock.sendall(b'~M602\r\n')
+                        sock.recv(512)
+                    except OSError:
+                        pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    class _TcpReader:
+
+        def __init__(self, sock, deadline):
+            self.sock = sock
+            self.deadline = deadline
+            self.buffer = b''
+
+        def command(self, text):
+            self.sock.settimeout(_left(self.deadline))
+            try:
+                self.sock.sendall(('~' + text + '\r\n').encode('ascii'))
+                while True:
+                    reply = self._complete()
+                    if reply is not None:
+                        return reply
+                    self.sock.settimeout(_left(self.deadline))
+                    chunk = self.sock.recv(2048)
+                    if not chunk:
+                        raise _AdapterError('connection_closed')
+                    self.buffer += chunk
+                    if len(self.buffer) > MAX_TCP_REPLY:
+                        raise _AdapterError('response_too_large')
+            except socket.timeout:
+                raise _AdapterError('timeout') from None
+            except OSError:
+                raise _AdapterError('connection_failed') from None
+
+        def _complete(self):
+            text = self.buffer.decode('ascii', 'replace')
+            last = text.rstrip().rsplit('\n', 1)[-1].strip()
+            done = last == 'ok' or (text.endswith('\n') and re.search('control failed', text, re.IGNORECASE)) or (text.endswith('\n') and last.startswith('Error'))
+            if not done:
+                return None
+            self.buffer = b''
+            return text
+
+    def _parse_tcp(base):
+        if not isinstance(base, str):
+            raise _AdapterError('invalid_request')
+        parsed = urllib.parse.urlsplit(base.strip())
+        if parsed.scheme.lower() != 'tcp' or not parsed.hostname or parsed.path not in ('', '/') or (parsed.username is not None) or parsed.query or parsed.fragment:
+            raise _AdapterError('invalid_request')
+        try:
+            return (parsed.hostname, parsed.port or TCP_PORT)
+        except ValueError:
+            raise _AdapterError('invalid_request') from None
+
+    def _tcp_field(text, name):
+        match = re.search('^%s:[ \\t]*(.*?)\\r?$' % re.escape(name), text, re.MULTILINE)
+        return match.group(1) if match else ''
+
+    def _tcp_state(machine_status):
+        if machine_status in _TCP_STATE:
+            return _TCP_STATE[machine_status]
+        if machine_status.startswith('BUILDING') and machine_status != 'BUILDING_COMPLETED':
+            return 'printing'
+        return 'unknown'
+
+    def _tcp_temperatures(text):
+        out = {}
+        for key, label in (('nozzle', 'T0'), ('bed', 'B')):
+            match = re.search('\\b%s:\\s*%s\\s*/\\s*%s' % (label, _NUM, _NUM), text)
+            if match:
+                current, target = (_temperature(float(match.group(1))), _temperature(float(match.group(2))))
+                out[key] = current
+                out['target_' + key] = target
+        return out
+
+    def _tcp_progress(text):
+        out = {}
+        match = re.search('SD printing byte\\s+(\\d+)\\s*/\\s*(\\d+)', text)
+        if match and int(match.group(2)) > 0 and (int(match.group(1)) <= int(match.group(2))):
+            out['progress'] = round(int(match.group(1)) * 100 / int(match.group(2)), 2)
+        layer = re.search('Layer:\\s*(\\d+)\\s*/\\s*(\\d+)', text)
+        if layer:
+            out['layer'], out['total_layers'] = (int(layer.group(1)), int(layer.group(2)))
+        return out
+    return dict(locals())
+
+
+def _pf_define_settings():
+    import json
+    import re
+    OUTBOX = 'outbox'
+    DASHBOARD = 'dashboard'
+    POLL_CHOICES = (5, 15, 30, 60)
+    AUTO_DELETE_CHOICES = (30, 90, 180, 365)
+    KEEP_LAST_CHOICES = (0, 3, 5, 10, 20)
+    _DEFAULTS = {OUTBOX: {'keep_copies': True, 'journal_orca_events': True, 'profile_hint': True, 'auto_delete': False, 'auto_delete_days': 90, 'keep_last': 0}, DASHBOARD: {'keep_history': True, 'poll_seconds': 15, 'pause_hidden': True}}
+    _CHOICES = {'poll_seconds': POLL_CHOICES, 'auto_delete_days': AUTO_DELETE_CHOICES, 'keep_last': KEEP_LAST_CHOICES}
+    _TOKEN_RE = re.compile('[A-Za-z0-9_.:-]{1,80}')
+
+    def defaults(kind):
+        """Explicit default config (what "Restore defaults" writes)."""
+        return dict(_DEFAULTS.get(kind, {}))
+
+    def _parse(raw):
+        if isinstance(raw, (str, bytes, bytearray)):
+            try:
+                raw = json.loads(raw)
+            except (ValueError, TypeError):
+                return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def normalize(kind, raw):
+        """Valid settings for `kind` from any stored value (JSON text, dict, junk)."""
+        result = defaults(kind)
+        data = _parse(raw)
+        for key, default in result.items():
+            value = data.get(key, default)
+            if isinstance(default, bool):
+                if isinstance(value, bool):
+                    result[key] = value
+            elif isinstance(value, int) and (not isinstance(value, bool)) and (value in _CHOICES[key]):
+                result[key] = value
+        if kind == DASHBOARD:
+            token = data.get('clear_history_token')
+            result['clear_history_token'] = token if isinstance(token, str) and _TOKEN_RE.fullmatch(token) else ''
+        return result
+
+    def fields(kind, text):
+        """Page field specs; `text(key, **values)` supplies localized labels."""
+
+        def check(key, label, hint=''):
+            return {'key': key, 'type': 'bool', 'label': text(label), 'hint': text(hint) if hint else ''}
+        if kind == OUTBOX:
+            return [check('keep_copies', 'cfgKeepCopies', 'cfgKeepCopiesHint'), check('journal_orca_events', 'cfgJournalOrca', 'cfgJournalOrcaHint'), check('profile_hint', 'cfgProfileHint', 'cfgProfileHintHint'), check('auto_delete', 'cfgAutoDelete', 'cfgAutoDeleteHint'), {'key': 'auto_delete_days', 'type': 'select', 'label': text('cfgAutoDeleteAge'), 'hint': '', 'requires': 'auto_delete', 'options': [[d, text('cfgDays', days=d)] for d in AUTO_DELETE_CHOICES]}, {'key': 'keep_last', 'type': 'select', 'label': text('cfgKeepLast'), 'hint': text('cfgKeepLastHint'), 'options': [[n, text('cfgKeepAll') if n == 0 else str(n)] for n in KEEP_LAST_CHOICES]}]
+        if kind == DASHBOARD:
+            return [check('keep_history', 'cfgKeepHistory', 'cfgKeepHistoryHint'), {'key': 'poll_seconds', 'type': 'select', 'label': text('cfgPollInterval'), 'hint': '', 'options': [[s, text('cfgSeconds', seconds=s)] for s in POLL_CHOICES]}, check('pause_hidden', 'cfgPauseHidden', 'cfgPauseHiddenHint')]
+        return []
+    _PAGE = '<!DOCTYPE html>\n<html lang="__LANG__"><head><meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<style>\n  :root { color-scheme: light dark; }\n  * { box-sizing: border-box; }\n  body { margin:0; padding:14px 16px; background:var(--orca-bg,#1e1e2e); color:var(--orca-fg,#e0e0e0);\n         font-family:var(--orca-font,sans-serif); font-size:13px; line-height:1.4; }\n  .row { padding:9px 0; border-bottom:1px solid var(--orca-border,#3c3c4c); }\n  .row:last-of-type { border-bottom:0; }\n  .row.sub { padding-left:26px; }\n  label { display:flex; align-items:flex-start; gap:9px; cursor:pointer; }\n  label.sel { cursor:default; flex-wrap:wrap; align-items:center; }\n  input[type=checkbox] { margin:2px 0 0; width:15px; height:15px; accent-color:var(--orca-accent,#009688); flex:0 0 auto; }\n  select { font:inherit; color:var(--orca-fg,#e0e0e0); background:var(--orca-bg,#1e1e2e);\n           border:1px solid var(--orca-border,#3c3c4c); border-radius:5px; padding:4px 8px; min-height:28px; }\n  select:disabled, input:disabled + span { opacity:.5; }\n  .hint { margin:2px 0 0 24px; font-size:11px; color:var(--orca-muted,#a0a0a0); }\n  .row.sub .hint, label.sel + .hint { margin-left:0; }\n  button { font:inherit; padding:5px 12px; border-radius:5px; cursor:pointer;\n           background:transparent; color:var(--orca-fg,#e0e0e0); border:1px solid var(--orca-border,#3c3c4c); }\n  button.danger { background:var(--orca-accent,#009688); color:var(--orca-accent-fg,#fff); border-color:var(--orca-accent,#009688); }\n  :focus-visible { outline:2px solid var(--orca-accent,#009688); outline-offset:2px; }\n  #confirm { margin-top:8px; padding:10px; border:1px solid var(--orca-border,#3c3c4c); border-radius:6px; }\n  #confirm .btns { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }\n  #note { margin-top:6px; font-size:11px; color:var(--orca-muted,#a0a0a0); }\n</style></head><body>\n<div id="form"></div>\n<script>\n(function(){\n  var spec = __SPEC__;\n  var current = {};\n  var controls = {};\n  var form = document.getElementById(\'form\');\n\n  function normalized(raw){\n    raw = (raw && typeof raw === \'object\') ? raw : {};\n    var out = {};\n    spec.fields.forEach(function(f){\n      var def = spec.defaults[f.key], v = raw[f.key];\n      if (f.type === \'bool\') out[f.key] = (typeof v === \'boolean\') ? v : def;\n      else {\n        var ok = typeof v === \'number\' && f.options.some(function(o){ return o[0] === v; });\n        out[f.key] = ok ? v : def;\n      }\n    });\n    return out;\n  }\n  function el(tag, attrs, text){\n    var node = document.createElement(tag);\n    Object.keys(attrs || {}).forEach(function(k){ node.setAttribute(k, attrs[k]); });\n    if (text) node.textContent = text;\n    return node;\n  }\n  function values(){\n    var out = {};\n    spec.fields.forEach(function(f){\n      var c = controls[f.key];\n      out[f.key] = f.type === \'bool\' ? c.checked : Number(c.value);\n    });\n    return out;\n  }\n  function save(extra){\n    var out = values();\n    if (spec.clear && current.clear_history_token) out.clear_history_token = current.clear_history_token;\n    if (extra) Object.keys(extra).forEach(function(k){ out[k] = extra[k]; });\n    if (window.orca && window.orca.saveConfig) window.orca.saveConfig(out);\n  }\n  function syncEnabled(){\n    spec.fields.forEach(function(f){\n      if (f.requires) controls[f.key].disabled = !controls[f.requires].checked;\n    });\n  }\n  spec.fields.forEach(function(f, i){\n    var row = el(\'div\', {\'class\': \'row\' + (f.requires ? \' sub\' : \'\')});\n    var hintId = \'hint\' + i, c;\n    if (f.type === \'bool\') {\n      var lab = el(\'label\');\n      c = el(\'input\', {type: \'checkbox\', id: \'f\' + i});\n      lab.appendChild(c); lab.appendChild(el(\'span\', {}, f.label));\n      row.appendChild(lab);\n    } else {\n      var l2 = el(\'label\', {\'class\': \'sel\', \'for\': \'f\' + i});\n      l2.appendChild(el(\'span\', {}, f.label));\n      c = el(\'select\', {id: \'f\' + i});\n      f.options.forEach(function(o){ c.appendChild(el(\'option\', {value: String(o[0])}, o[1])); });\n      l2.appendChild(c); row.appendChild(l2);\n    }\n    if (f.hint) { row.appendChild(el(\'div\', {\'class\': \'hint\', id: hintId}, f.hint)); c.setAttribute(\'aria-describedby\', hintId); }\n    c.addEventListener(\'change\', function(){ syncEnabled(); save(); });\n    controls[f.key] = c;\n    form.appendChild(row);\n  });\n\n  if (spec.permissionGuidance)\n    form.appendChild(el(\'div\', {\'class\': \'row\'}, spec.permissionGuidance));\n\n  var clearBtn = null;\n  if (spec.clear) {\n    var row = el(\'div\', {\'class\': \'row\'});\n    clearBtn = el(\'button\', {type: \'button\', id: \'clear\'}, spec.clear.label);\n    row.appendChild(clearBtn);\n    var box = el(\'div\', {id: \'confirm\', role: \'alertdialog\', \'aria-labelledby\': \'confirm-text\'});\n    box.hidden = true;\n    box.appendChild(el(\'div\', {id: \'confirm-text\'}, spec.clear.confirm));\n    var btns = el(\'div\', {\'class\': \'btns\'});\n    var ok = el(\'button\', {type: \'button\', \'class\': \'danger\'}, spec.clear.label);\n    var cancel = el(\'button\', {type: \'button\'}, spec.clear.cancel);\n    btns.appendChild(ok); btns.appendChild(cancel); box.appendChild(btns);\n    row.appendChild(box);\n    var note = el(\'div\', {id: \'note\', role: \'status\', \'aria-live\': \'polite\'});\n    row.appendChild(note);\n    form.appendChild(row);\n    var closeBox = function(focusBack){\n      box.hidden = true; clearBtn.disabled = false;\n      if (focusBack) clearBtn.focus();\n    };\n    clearBtn.addEventListener(\'click\', function(){\n      box.hidden = false; clearBtn.disabled = true; note.textContent = \'\'; cancel.focus();\n    });\n    cancel.addEventListener(\'click\', function(){ closeBox(true); });\n    box.addEventListener(\'keydown\', function(e){\n      if (e.key === \'Escape\') { e.preventDefault(); closeBox(true); }\n      else if (e.key === \'Tab\') {\n        var first = cancel, last = ok;\n        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }\n        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }\n      }\n    });\n    ok.addEventListener(\'click\', function(){\n      if (!spec.clear.scope) { closeBox(true); return; }\n      var token = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()\n        : (Date.now().toString(36) + \'-\' + Math.random().toString(36).slice(2, 12));\n      closeBox(true);\n      save({clear_history_token: spec.clear.scope + \':\' + token});\n      note.textContent = spec.clear.done;\n    });\n  }\n\n  function apply(raw){\n    current = normalized(raw);\n    if (spec.clear) current.clear_history_token =\n      (raw && typeof raw.clear_history_token === \'string\') ? raw.clear_history_token : \'\';\n    spec.fields.forEach(function(f){\n      var c = controls[f.key];\n      if (f.type === \'bool\') c.checked = !!current[f.key]; else c.value = String(current[f.key]);\n    });\n    syncEnabled();\n  }\n  if (window.orca && window.orca.onConfig) window.orca.onConfig(apply);\n  else apply(window.orca && window.orca.getConfig ? window.orca.getConfig() : {});\n})();\n</script></body></html>\n'
+
+    def build_page(kind, text, language='en', clear=None):
+        """HTML for the capability's settings tab, labels from `text(key, **values)`."""
+        spec = {'kind': kind, 'defaults': defaults(kind), 'fields': fields(kind, text)}
+        if kind == DASHBOARD:
+            spec['permissionGuidance'] = text('networkPermissionRequired')
+        if clear:
+            spec['clear'] = clear
+        payload = json.dumps(spec, ensure_ascii=False).replace('<', '\\u003c')
+        lang = re.sub('[^A-Za-z0-9-]', '', str(language or 'en').replace('_', '-')) or 'en'
+        return _PAGE.replace('__LANG__', lang).replace('__SPEC__', payload)
+    return dict(locals())
+
+
+def _pf_define_credentials():
+    import hashlib
+    import json
+    import os
+    import sys
+    import threading
+    import uuid
+    FIELDS = ('apikey', 'access_code')
+    USERNAME = 'Print Farm'
+
+    class Unavailable(Exception):
+        pass
+
+    def preload():
+        """Import the platform provider's modules; create nothing and touch no store.
+
+    Importing the keyring packages reads their files and lists folders. OrcaSlicer
+    asks the user about reads like that while a plugin works, but not while it
+    loads, so the plugin imports them then and the first credential use stays
+    silent. Raises ImportError when the provider is not installed.
+    """
+        if sys.platform == 'win32':
+            from keyring.backends.Windows import WinVaultKeyring
+        elif sys.platform == 'darwin':
+            from keyring.backends.macOS import Keyring
+        elif sys.platform.startswith('linux'):
+            from keyring.backends.SecretService import Keyring
+        else:
+            raise Unavailable()
+
+    def system_backend():
+        if sys.platform == 'win32':
+            from keyring.backends.Windows import WinVaultKeyring
+
+            class Provider(WinVaultKeyring):
+
+                def set_properties_from_env(self):
+                    pass
+            result = Provider()
+            result.persist = 'local_machine'
+        elif sys.platform == 'darwin':
+            from keyring.backends.macOS import Keyring
+
+            class Provider(Keyring):
+
+                def set_properties_from_env(self):
+                    pass
+            result = Provider()
+            result.keychain = None
+        elif sys.platform.startswith('linux'):
+            from keyring.backends.SecretService import Keyring
+
+            class Provider(Keyring):
+
+                def set_properties_from_env(self):
+                    pass
+            result = Provider()
+        else:
+            raise Unavailable()
+        return result
+
+    def binding(root, card, field):
+        parts = [os.path.normcase(os.path.realpath(root)), card.get('owner_scope_uuid'), card.get('target_uuid'), card.get('url'), card.get('type'), card.get('target_selector'), field]
+        if card.get('type') == 'repetier':
+            parts.append(card.get('repetier_slug'))
+        return hashlib.sha256(json.dumps(parts, ensure_ascii=True, separators=(',', ':')).encode()).hexdigest()
+
+    def service(root, card, field, ref):
+        if not isinstance(ref, dict) or set(ref) != {'id', 'binding'}:
+            raise Unavailable()
+        try:
+            identity = str(uuid.UUID(ref['id']))
+        except (ValueError, TypeError, AttributeError):
+            raise Unavailable() from None
+        digest = binding(root, card, field)
+        if ref['binding'] != digest or identity != ref['id']:
+            raise Unavailable()
+        return 'PrintFarm:' + digest + ':' + identity
+
+    class Vault:
+
+        def __init__(self, factory=system_backend):
+            self.factory = factory
+            self.cache = {}
+            self.epoch = 0
+            self.lock = threading.RLock()
+            self.access_lock = threading.Lock()
+
+        def clear(self):
+            with self.lock:
+                self.epoch += 1
+                self.cache.clear()
+
+        def write(self, root, card, field, value, is_current=lambda: True):
+            if not isinstance(value, str) or not value or len(value.encode('utf-8')) > 512:
+                raise Unavailable()
+            with self.lock:
+                epoch = self.epoch
+            if not is_current():
+                raise Unavailable()
+            ref = {'id': str(uuid.uuid4()), 'binding': binding(root, card, field)}
+            try:
+                provider = self.factory()
+                name = service(root, card, field, ref)
+                if not is_current():
+                    raise Unavailable()
+                provider.set_password(name, USERNAME, value)
+                if not is_current() or provider.get_password(name, USERNAME) != value:
+                    raise Unavailable()
+            except Exception:
+                raise Unavailable() from None
+            with self.lock:
+                if epoch != self.epoch or not is_current():
+                    raise Unavailable()
+            return ref
+
+        def read(self, root, card, field, ref, is_current=lambda: True):
+            name = service(root, card, field, ref)
+            with self.lock:
+                epoch = self.epoch
+            with self.access_lock:
+                with self.lock:
+                    if epoch != self.epoch or not is_current():
+                        raise Unavailable()
+                    cached = name in self.cache
+                    value = self.cache.get(name)
+                if not cached:
+                    try:
+                        value = self.factory().get_password(name, USERNAME)
+                        if not isinstance(value, str) or not value or len(value.encode('utf-8')) > 512:
+                            raise Unavailable()
+                    except Exception:
+                        value = None
+                    with self.lock:
+                        if epoch != self.epoch or not is_current():
+                            raise Unavailable()
+                        self.cache[name] = value
+                if value is None or not is_current():
+                    raise Unavailable()
+                return value
+    return dict(locals())
+
+
+_pf_artifact = _pf_embedded_helper('print_artifact', _pf_define_artifact, 'Bounded inspection and immutable staging for manually supplied print artifacts.\n\nThis module has no Orca/Qt dependencies. Callers provide a Python-owned source\npath and an explicit staging directory on the intended filesystem; browser\nmessages must never supply either path.\n')
+_pf_transfer = _pf_embedded_helper('artifact_transfer', _pf_define_transfer, 'Bounded, stateful receiver for artifact chunks sent by the plugin WebView.\n\nThe caller supplies a Python-owned storage directory and a stable owner key\n(for example, the identity of the open dashboard window). Browser messages\nmust never supply filesystem paths. The module intentionally uses only the\nstandard library so its reviewed definitions can be embedded by the plugin\npackager.\n')
+_pf_upload = _pf_embedded_helper('upload_transport', _pf_define_upload, 'Bounded, non-redirecting multipart file uploads using the standard library.')
+_pf_journal = _pf_embedded_helper('operation_journal', _pf_define_journal, 'Crash-safe local journal for Print Farm operation intents and outcomes.\n\nThis module records a durable intent before a caller sends any network bytes.\nIt does not perform transport work and cannot promise exactly-once effects from\nprinters. An interrupted dispatch is conservatively held as unknown.\n')
+_pf_scheduler = _pf_embedded_helper('action_scheduler', _pf_define_scheduler, "Bounded, per-target serial action scheduler for print-farm operations.\n\nThe scheduler keeps each target's actions in FIFO order while allowing actions\nfor other targets to run concurrently. Control actions are selected ahead of\nordinary work on different idle targets, so a long upload cannot hold up a\ncancel or pause for another printer.\n")
+_pf_approval = _pf_embedded_helper('operation_approval', _pf_define_approval, 'Single-use in-memory approvals for starting an exact print plan.\n\nApprovals are deliberately ephemeral: they are bound to one session epoch,\nexpire quickly, and are consumed before the comparison result is returned.\nThis module does not establish printer compatibility; callers must only create\nan approval after making that decision from trusted binding evidence.\n')
+_pf_duet = _pf_embedded_helper('duet_adapter', _pf_define_duet, 'Duet / RepRapFirmware (standalone) / Duet Software Framework adapter.\n\nOne connection type ("duet") speaks two wire protocols; the protocol is chosen\n*inside* this module by a non-actuating probe and is reported as ``protocol``:\n\n* ``rrf``  - standalone RepRapFirmware HTTP API (``rr_connect``, ``rr_model``,\n  ``rr_upload``, ``rr_fileinfo``, ``rr_filelist``, ``rr_gcode``,\n  ``rr_disconnect``).\n* ``dsf``  - Duet Software Framework REST API (``/machine/*``). This also\n  covers a DSF that answers ``rr_connect`` in rr-emulation mode: such a reply\n  carries ``isEmulated: true`` and is NOT proof of standalone firmware, so the\n  adapter switches to ``/machine/*``.\n\nProtocol selection rules (fail closed):\n\n* ``rr_connect`` is probed first. Only a plain HTTP 404 there allows trying\n  ``/machine/connect``. 401/403/5xx, a timeout, or a non-JSON reply never lets\n  the adapter try another protocol (no silent route change for writes).\n* Callers can pin the protocol they polled with ``backend="rrf"|"dsf"``; a\n  differing detection result yields ``protocol_mismatch`` and nothing is\n  written.\n\nWrites: ``upload`` (to ``0:/gcodes/``) and ``start`` (``M32``, built from a\nstrictly validated file name only). Pause/resume/cancel are *not* implemented:\nno first-hand source for their exact wire form has been verified, so those\nfunctions return ``unsupported_unverified`` without any I/O.\n\nA transport failure after a mutating request was dispatched is reported as\n``unknown_outcome`` and the request is never repeated.\n\nSecrets (the password, session keys) are never placed in exceptions, error\ncodes, status dictionaries or logs; the module does not log.\n')
+_pf_prusalink = _pf_embedded_helper('prusalink_adapter', _pf_define_prusalink, "PrusaLink upload-only adapter using the pinned public OpenAPI contract.\n\nThis adapter deliberately does not implement Digest authentication or print\ncontrol. API-key authentication is sent only when explicitly advertised in the\nserver's /api/version capabilities.\n")
+_pf_repetier = _pf_embedded_helper('repetier_adapter', _pf_define_repetier, 'Repetier-Server HTTP bridge, with explicit printer selection and no retries.\n\nContract: prgdoc.repetier-server.com/v1/docs/en/web-api/{direct,bridge}.md,\nwebsocket/{jobs,events}.md and types/PrinterState.md (2026-10-28).\nOnly the classic server-managed jobs of 0.90--1.4.x permit writes.\n')
+_pf_u1_camera = _pf_embedded_helper('u1_camera', _pf_define_u1_camera, 'Explicit stock Snapmaker U1 snapshot monitoring, owned by an open overlay.\n\nThe RPC is websocket-only in Snapmaker/u1-moonraker repeater.py. A correlated\nresponse acknowledges transport; only the subsequently fetched JPEG is shown.\nNo URL from a response is used, and no global stop-monitor command is sent.\n\nProtocol reference: lanwen/orca-snapmaker-u1-camera-plugin v0.5.0,\ndf55c9124ebe038f85cb1d1180592d14951773db. The one-shot authentication\nflow follows that implementation. Its MIT notice is retained below.\n\nCopyright (c) 2026 lanwen\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the "Software"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n')
+_pf_creality = _pf_embedded_helper('creality_adapter', _pf_define_creality, 'Creality stock firmware adapter for the Ender 5 Max (DWIN-style WebSocket).\n\nWire facts come only from the 3D Vault ``creality-websocket`` driver plugin\n(commit dc217534c74177048d715c68fc091fed33d565b9, see creality/SOURCE_NOTES.md):\nan unauthenticated ``ws://host:port/`` text-frame JSON channel and a plain HTTP\nmultipart upload. Nothing here is transferred from the K1/K2 code in Orca.\n\nNot confirmed by that source and therefore reported as ``None``/``False``:\ntemperatures, pause/cancel, print start acknowledgement, authentication, and\nany proof that the upload target is writable. ``upload_ready`` and\n``can_control`` stay ``False`` until hardware evidence exists; print start is\ndeliberately not implemented.\n')
+_pf_flashforge = _pf_embedded_helper('flashforge_adapter', _pf_define_flashforge, 'FlashForge adapter: Adventurer 5M / 5M Pro / AD5X over the LAN HTTP API.\n\nWire facts come only from the sources pinned in flashforge/SOURCE_NOTES.md\n(Parallel-7 flashforge-api-docs, OrcaSlicer Flashforge.cpp, ff-5mp-api-py).\nNo source was checked against our own hardware, so:\n\n* ``poll`` is read-only (``POST :8898/detail``) and identifies the model from\n  ``detail.pid`` (never from the user-editable ``name``). An empty, partial or\n  unrecognized reply is ``unknown``, never ``idle``.\n* ``upload`` and ``start`` are implemented to the documented wire format but\n  stay OFF until a model is listed in ``HARDWARE_VERIFIED``; until then they\n  return ``unsupported_unverified`` without any I/O and ``poll`` reports\n  ``upload_ready=False`` / ``can_control=False`` with a reason.\n* Pause/resume/cancel, thumbnails, AD5X start / material-station mapping,\n  Creator 5 and the legacy Adventurer 3/4 families are not implemented.\n* ``poll_tcp`` is an opt-in read-only fallback over TCP 8899. It takes the\n  single printer control session (``~M601 S1``), which can lock out other\n  clients while it runs, and always releases it (``~M602``).\n\nCredentials are the printer serial number and the check code (printer\nsettings menu). They are one secret pair: neither appears in any returned\ndict, error code or exception text; printer ``message`` strings are never\npropagated. The module does not log.\n')
+_pf_settings = _pf_embedded_helper('plugin_settings', _pf_define_settings, "Print Farm settings: defaults, validation and the Plugins-dialog page.\n\nStdlib only. The host stores each capability's config as open JSON, so nothing\nhere may hold a secret. Anything unknown, mistyped or out of range falls back\nto the default; extra keys are ignored.\n")
+_pf_credentials = _pf_embedded_helper('credential_store', _pf_define_credentials, 'Explicit operating-system credential providers and immutable bound entries.')
 
 
 # Orca asks the user before a plugin creates its first thread. Asked on the UI
@@ -495,7 +5049,7 @@ _UI_LOCALE_ALIASES = {
 # build_package.py replaces this empty mapping in release artifacts. The JSON
 # files remain authoritative in the source tree while the installable wheel
 # stays a single OrcaSlicer plugin module.
-_EMBEDDED_UI_COPY = {}
+_EMBEDDED_UI_COPY = {"ca":{"accessCode":"Codi d'accés","add":"Afegir","addConfiguredTitle":"Afegiu una impressora configurada a OrcaSlicer","addPrinter":"Afegir una impressora…","all":"totes","bambuError":"Error de la impressora {code}","bambuLayer":"capa {current}/{total}","bambuLeftHM":"Resten {hours} h {minutes} min","bambuLeftM":"Resten {minutes} min","bed":"Llit","busy":"{printer}: la impressora està ocupada ({state})","busyNotStarted":"{printer}: la impressora està ocupada ({state}); no s'ha iniciat.","cameraButton":"Càmera en directe","cameraCapturedAt":"Capturat {time}","cameraClose":"Tancar la càmera","cameraLoadFailed":"La imatge no s'ha carregat aquí. Aquesta finestra pot bloquejar les imatges de la xarxa local.","cameraLoading":"S'està connectant amb la càmera…","cameraMode":"Càmera","cameraModeAuto":"Webcam configurada","cameraModeU1":"Càmera original Snapmaker U1","cameraNativeSession":"Sessió de càmera oberta","cameraNone":"Aquesta impressora no té cap càmera configurada.","cameraOpenWindow":"Obrir la càmera en una finestra","cameraPermissionDenied":"Treball en segon pla denegat. Permet-lo i torna a obrir la càmera.","cameraReceivedAt":"Rebut {time}","cameraTitle":"Càmera: {printer}","cameraUnavailable":"No s'ha pogut accedir a la càmera.","cancel":"Cancel·lar","cfgAutoDelete":"Suprimir automàticament les còpies antigues","cfgAutoDeleteAge":"Suprimir còpies de més de","cfgAutoDeleteHint":"Desactivat per defecte. Es comprova a l'inici i un cop al dia; només se suprimeixen còpies d'aquest connector, mai fitxers en ús.","cfgClearConfirm":"Voleu esborrar el diari d'impressió? Aquesta acció no es pot desfer.","cfgClearDone":"Sol·licitat. El diari s'esborra la propera vegada que el tauler llegeixi els paràmetres.","cfgClearHistory":"Esborrar el diari d'impressió","cfgDays":"{days} dies","cfgJournalOrca":"Registrar al diari els enviaments i impressions iniciats des d'Orca","cfgJournalOrcaHint":"Només els treballs que notifica el mateix OrcaSlicer.","cfgKeepAll":"Tots","cfgKeepCopies":"Conservar còpies dels fitxers laminats","cfgKeepCopiesHint":"Permet enviar un laminat a una impressora més tard. Si està desactivat, no es copia res.","cfgKeepHistory":"Conservar el diari d'impressió","cfgKeepHistoryHint":"Si està desactivat, no es registren entrades noves; les existents es conserven.","cfgKeepLast":"Conserva només els últims laminats per impressora","cfgKeepLastHint":"En desar un laminat nou se suprimeixen les còpies antigues no enviades de la mateixa impressora. Les còpies vinculades al registre d’impressió es conserven.","cfgPauseHidden":"No consultar mentre el tauler no sigui visible","cfgPauseHiddenHint":"Estalvia peticions de xarxa mentre la pestanya o la finestra està oculta.","cfgPollInterval":"Interval de consulta de les impressores","cfgProfileHint":"Avís si el connector no està seleccionat al perfil de procés","cfgProfileHintHint":"Es mostra al tauler quan un laminat no ha arribat a aquest connector.","cfgSeconds":"{seconds} s","close":"Tancar","comingLater":"properament","commandFailed":"{printer}: {action} ha fallat — {error}","commandSent":"{printer}: {action} enviat.","confirmTitle":"Voleu iniciar la impressió en diverses impressores?","confirmUploadTitle":"Voleu pujar el fitxer a les impressores seleccionades?","connectionOptions":"Connexió","connectionOptionsFailed":"No s’ha pogut desar. Comprova l’adreça.","connectionOptionsHelp":"Fes servir el mateix host i indica el port web.","connectionSave":"Desa","connectionTypeTitle":"Tipus de connexió. Les funcions disponibles depenen del protocol de la impressora i de l'estat actual.","controlsUnverified":"Pausa i aturada no estan disponibles per a aquesta connexió (no verificat al maquinari)","crealityWsPortPlaceholder":"Port WS (9999)","crealityWsPortTitle":"Opcional. Port del WebSocket d'estat de la impressora. 9999 és un valor per defecte no confirmat; canvieu-lo si la vostra impressora fa servir un altre port.","credentialLegacyWarning":"Les claus de {count} impressores encara són en text pla. Mou-les al magatzem del sistema. Les còpies antigues es conserven.","credentialMigrate":"Mou les claus","credentialMigrationConfirm":"Vols moure les claus al magatzem del sistema? Les còpies antigues es conserven.","credentialMigrationDone":"Claus mogudes al magatzem del sistema.","credentialRetry":"Reintenta l’accés","credentialSaveFailed":"No s’han pogut desar les claus de manera segura. Impressora no desada.","credentialUnavailable":"Magatzem del sistema no disponible. Connexió bloquejada.","dashboardOpened":"S'ha obert el tauler de Print Farm.","duetPasswordPlaceholder":"Contrasenya de la màquina Duet","errorNeedsAccessCode":"cal un codi d'accés a la impressora","errorNeedsBambuCredentials":"calen la IP, el codi d'accés i el número de sèrie de la impressora","errorNoAddress":"falta l'adreça de la impressora","errorOutcomeUnknown":"potser la impressora ha rebut la sol·licitud o potser no; comproveu la impressora abans de tornar-ho a provar","errorPrintCommand":"l'ordre d'impressió ha fallat: {error}","errorUnknownAction":"acció de la impressora desconeguda","errorUnknownSerial":"pujat, però encara es desconeix el número de sèrie de la impressora; inicieu la impressió des de la mateixa impressora","errorUnsupportedBackend":"aquest tipus de connexió d'impressora no és compatible","errorUpload":"la pujada ha fallat: {error}","errorUploadUnverified":"el fitxer s'ha pujat, però no s'ha pogut verificar-ne la mida a la impressora, així que no s'ha iniciat la impressió","errorUploadedNotStarted":"el fitxer s'ha pujat, però no s'ha iniciat la impressió: {error}","feedbackButton":"Comentaris","feedbackCopied":"Copiat","feedbackCopy":"Copia","feedbackHelp":"Copia l’adreça en un navegador i usa el botó de comentaris del lloc. No s’envien dades d’impressores. “Beta Feedback”.","file3mfWarning":".3mf només s'inicia en impressores Bambu; les altres esperen G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"L'enviament ha fallat: no s'ha pogut llegir el fitxer.","fileTargetMismatch":"{printer}: el fitxer de la cua no correspon a aquesta impressora; la impressió no s'ha iniciat.","flashforgeCheckCodePlaceholder":"Codi de verificació (a la pantalla de la impressora)","flashforgeCheckCodeTitle":"Codi de verificació de la pantalla de la impressora. El mode LAN ha d'estar activat a la impressora.","flashforgeErrAuth":"Número de sèrie o codi de verificació incorrecte.","flashforgeErrCredentials":"Introduïu el número de sèrie i el codi de verificació.","flashforgeErrIdentity":"No s'ha pogut verificar el model de la impressora.","flashforgeErrLanMode":"Activeu el mode LAN a la impressora.","flashforgeErrUnsupportedModel":"Aquest model de FlashForge no és compatible (només Adventurer 5M, 5M Pro i AD5X).","flashforgeSerialPlaceholder":"Número de sèrie","flashforgeSerialTitle":"Número de sèrie de la impressora que apareix a la seva pantalla (Configuració > Quant a o Xarxa). El mode LAN ha d'estar activat.","fleetAttention":"Requereixen atenció","fleetIdle":"Lliures","fleetPrinting":"Imprimint","foundOnNetwork":"trobat a la xarxa","genericError":"error","history":"Historial d'impressió","historyCoverage":"Historial d'impressió observat localment. Inclou les impressions iniciades per Print Farm i els treballs detectats mentre aquest tauler estava obert; pot faltar el que va passar mentre OrcaSlicer no estava en execució.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Encara no s'han observat impressions per a aquesta impressora.","historyFromOrca":"notificat per OrcaSlicer","historyLoading":"S'està carregant l'historial d'impressió…","historyObserved":"observat per Print Farm","historyProgress":"{progress}%","historyStartedHere":"iniciat per Print Farm","historyStateCancelled":"cancel·lat","historyStateCompleted":"completat","historyStateEnded":"acabat","historyStateFailed":"fallit","historyStatePaused":"en pausa","historyStatePrinting":"imprimint","historyStateSent":"enviat","historyTitle":"Historial d'impressió — {printer}","historyUnknownFile":"Fitxer desconegut","integrationUnavailable":"La integració de la impressora encara no està disponible","journalActiveCount":"{count} actives","journalAllCount":"{count} registres","journalBlockedByHold":"una operació anterior d'aquesta impressora està sense resoldre; obriu el diari d'impressió i allibereu el bloqueig després de comprovar la impressora","journalButton":"Diari d'impressió","journalCompletedCount":"{count} completades","journalEmptyAll":"Encara no hi ha impressions registrades.","journalFileDelete":"Suprimir el fitxer","journalFileUnsent":"Laminat, no enviat","journalHoldLocked":"Aquesta operació encara s'està enviant i encara no es pot alliberar.","journalHoldReleased":"Bloqueig alliberat. L'operació anterior continua sense verificar.","journalHoldState":"Estat: {state}","journalHoldUnavailable":"No hi ha detalls de l'operació sense resoldre. Proveu de tornar a obrir el diari d'impressió.","journalHoldsHeading":"Operacions sense resoldre: comproveu en persona la impressora, el treball i el llit abans d'alliberar un bloqueig.","journalNoResults":"No hi ha impressions que coincideixin.","journalPrinter":"Impressora","journalReleaseConfirm":"Voleu alliberar aquest bloqueig després de comprovar en persona la impressora, el treball i el llit de «{target}»? Només desbloqueja un intent futur; no marca la impressió anterior com a correcta ni la torna a provar.","journalReleaseHold":"Alliberar bloqueig","journalResend":"Tornar a enviar…","journalResultsCount":"{count} resultats","journalSearchLabel":"Cerca al diari d'impressió","journalSearchPlaceholder":"Cerca per fitxer o impressora…","journalSendConfirm":"Voleu pujar {name} a {printer} sense iniciar la impressió?","journalStoreUnavailable":"El diari d'impressió no està disponible. Comproveu l'emmagatzematge local del connector.","journalTitle":"Diari d'impressió","legacyImportBlocked":"Les dades romanen a la carpeta anterior. Aquest conjunt no es pot importar automàticament.","legacyImportButton":"Importa dades antigues","legacyImportConfirm":"Això copia les dades i les credencials locals a l'emmagatzematge local d'aquest connector d'OrcaSlicer. La còpia antiga es conservarà. Voleu continuar?","legacyImportDetail":"S'han trobat dades antigues: {printers} impressores, {history} registres de l'historial, {outbox} elements de la cua i {files} fitxers.","legacyImportDone":"Importació completada.","legacyImportFailed":"No s’han pogut importar les dades antigues.","loading":"S'està carregant…","massFailed":", {count} amb error","massResult":"Enviat a {count} impressora(s){failed}.","namePlaceholder":"Nom","networkPermissionRequired":"Permet l’accés a la impressora a OrcaSlicer. Si està disponible, ves a Connectors → Print Farm → Permisos. Després, fes clic a «Actualitzar» a la targeta d’aquesta impressora.","noPrinters":"No s'han trobat impressores. Configureu un amfitrió d'impressió a OrcaSlicer o afegiu-ne un a dalt.","notReachable":"{printer}: la impressora no és accessible","notReachableNotStarted":"{printer}: la impressora no és accessible; no s'ha iniciat.","nozzle":"Broquet","octoprintApiKeyPlaceholder":"Clau d'API d'OctoPrint","open":"Interfície web","operatorStartCheck":"He comprovat que el fitxer laminat i la placa seleccionada són adequats per a aquesta impressora, que els materials i les eines són correctes i que el llit és lliure.","other":"Altres","outboxCopiesOff":"Les còpies dels laminats estan desactivades als paràmetres del connector.","outboxFallbackName":"laminat {stamp}","outboxHintText":"No hi ha cap connector Printers Outbox seleccionat al perfil de procés: les còpies dels laminats no es desen.","outboxHintWhere":"Seleccioneu-lo a Processar → Altres → Connector del flux de laminat.","outboxNotReady":"El fitxer G-code encara no està preparat","outboxPrinterUsage":"Impressora: {name} · carpeta: {folder} · {count} fitxers · {size}. Reviseu o elimineu els fitxers a sota.","outboxQueued":"{name} posat a la cua per a {target}","outboxRemoveFailed":"No s'ha pogut eliminar el fitxer desat. Continua a la llista perquè pugueu tornar-ho a provar.","outboxStorageCleanBlocked":"Les restes només es poden suprimir mentre no hi hagi cap pujada ni impressió en curs i l'índex de fitxers estigui en bon estat.","outboxStorageCleanButton":"Suprimir restes ({count} fitxers, {size})","outboxStorageCleanConfirm":"Voleu suprimir {count} fitxers sobrants ({size}) de l'emmagatzematge de Print Farm? Els fitxers a la cua de les impressores no es toquen.","outboxStorageCleanDone":"S'han suprimit {count} fitxers sobrants ({size}).","outboxStorageCleanFailed":"No s'han pogut suprimir {count} fitxers: {paths}. Torneu-ho a provar.","outboxStorageEmpty":"No s’han trobat fitxers de cua ni còpies de recuperació.","outboxStorageEntry":"{label}: {count} fitxers · {size} · {path}","outboxStorageKindIncoming":"Pujades preparades","outboxStorageKindIndex":"Índex de la cua","outboxStorageKindIndexBackup":"Còpia de seguretat de l'índex de la cua","outboxStorageKindLoose":"Fitxers solts o orfes","outboxStorageKindRecovery":"Fitxers de recuperació antics","outboxStorageKindUnassigned":"Fitxers sense assignar","outboxStorageManualCleanup":"Els fitxers sobrants (solts, pujades preparades, còpies de recuperació, còpies de l'índex) se suprimeixen amb el botó de sota. Els fitxers a la cua de les impressores s'eliminen un a un.","outboxStorageScanFailed":"No s'han pogut analitzar tots els camins d'emmagatzematge: {paths}. Els totals poden ser incomplets.","outboxStorageWarning":"L'emmagatzematge creix; elimineu els fitxers de les cues que ja no necessiteu.","outboxUnassigned":"Fitxers sense assignar: {count} · {size}. Reviseu-los i elimineu-los manualment a sota.","outboxWriteFailed":"No s'ha pogut conservar el fitxer G-code","outboxWrongStep":"No és el pas de postprocessament del G-code","pause":"Pausa","plateLabel":"Placa","preparedUploadDiscardFailed":"No s'ha pogut eliminar la còpia temporal de la càrrega; reviseu l'emmagatzematge.","print":"Imprimir…","printShort":"Imprimir","printerBusy":"La impressora està ocupada","printerIpPlaceholder":"192.168.0.42 (IP de la impressora)","printerNotOnline":"La impressora no està en línia","prusalinkApiKeyPlaceholder":"Clau d'API de PrusaLink","queueLess":"Mostra menys","queueMore":"Mostra {count} més","refresh":"Actualitzar","remove":"Eliminar","removeRetainedTitle":"Elimina la còpia conservada","repetierApiKeyPlaceholder":"Clau d'API d'Repetier","repetierLoadFailed":"No s’ha pogut carregar la impressora Repetier. Comprova l’adreça, la clau i la llista.","repetierLoadPrinters":"Carrega impressores","repetierModeUnsupported":"Escriptura no verificada per a aquesta versió o connexió. Només estat.","repetierNotReady":"El servidor no ha confirmat que la impressora accepti ordres.","repetierRequestAccepted":"Petició acceptada; la feina pot esperar a la cua del servidor. El proper estat confirmarà la impressió.","repetierSelectPrinter":"Tria una impressora","resume":"Reprendre","select":"seleccionar","selectAllTitle":"Seleccioneu o deseleccioneu totes les impressores disponibles","selfSigned":"autosignat","selfSignedTitle":"Activeu-ho només per a una impressora servida per HTTPS amb un certificat autosignat. Les impressores HTTP simples a la xarxa local no ho necessiten.","send":"Enviar","sendFailed":"{printer}: ha fallat l'enviament — {error}","sendSelected":"Enviar el G-code a la selecció…","sendSelectedCount":"Enviar el G-code a {count} seleccionades…","sendToPrinterTitle":"Enviar a aquesta impressora i iniciar la impressió","sendingFile":"S'està enviant {name} a {count} impressora(s)…","sentToPrint":"enviat per imprimir","serialAuto":"Número de sèrie (automàtic)","serialTitle":"El número de sèrie es detecta automàticament. Introduïu-ne un només per fixar una impressora concreta. S'utilitza el port MQTT 8883.","startApprovalExpired":"La confirmació d'inici ha caducat o els paràmetres han canviat; torneu-ho a comprovar.","startBedClear":"El llit està lliure i a punt per a una nova impressió.","startBlocked":"Inici bloquejat per a {printer}: {reason}","startCompatibilityUnknown":"No s'ha pogut confirmar la compatibilitat del fitxer laminat amb aquesta impressora. Podeu pujar-lo sense iniciar la impressió.","startConfirmMissing":"Inici cancel·lat: confirmeu que el llit està lliure i, quan es demani, que el fitxer és adequat per a la impressora.","startFileCheck":"He comprovat que aquest fitxer està laminat per a aquesta impressora concreta.","startImmediately":"Iniciar la impressió just després de la càrrega","startPrint":"Iniciar la impressió","startReasonFileKind":"Aquest tipus de fitxer no es pot iniciar en aquesta impressora.","startReasonNoStart":"Iniciar impressions des de Print Farm encara no està disponible per a aquesta connexió. Podeu pujar el fitxer.","startReasonPlate":"La placa seleccionada no coincideix amb aquest fitxer.","startReasonProfileMatch":"El fitxer s'ha laminat amb el perfil d'OrcaSlicer d'aquesta impressora.","startReasonProfileUnknown":"Print Farm no pot saber pel fitxer per a quina impressora s'ha laminat.","startReasonProject":"És un fitxer de projecte sense laminar. Lamineu-lo primer.","startReasonSlicedOnly":"Aquesta impressora només inicia fitxers 3MF laminats, no G-code simple.","startReasonUnsupported":"Aquest tipus de connexió encara no és compatible.","startReviewTitle":"Confirmeu cada impressió","startVerdictCompatible":"Compatible","startVerdictIncompatible":"Incompatible","startVerdictUnknown":"Comproveu-ho manualment","startWillStart":"Impressores que s'iniciaran: {count}","stateAborted":"avortat","stateBusy":"ocupat","stateChecking":"comprovant","stateComplete":"completat","stateError":"error","stateFailed":"fallit","stateIdle":"inactiu","stateOffline":"fora de línia","stateOnline":"en línia","statePaused":"en pausa","statePrinting":"imprimint","stateStandby":"en espera","stateUnavailable":"encara no disponible","stateUnknown":"desconegut","stop":"Aturar","storageBar":"Emmagatzematge: {count} fitxers · {size}","storageGroupTitle":"{name} · {count} fitxers · {size}","storageMore":"{count} més…","supportPlanned":"El suport de {type} està previst, però encara no està disponible.","sure":"Confirmar?","tlsCertificateChanged":"El certificat de la impressora ha canviat. Connexió bloquejada.","tlsPermissionRequired":"Permet l’accés a la impressora a OrcaSlicer i repeteix la comprovació del certificat.","tlsProbeFailed":"No s’ha pogut llegir el certificat. Comprova la impressora i torna-ho a provar.","tlsTrustBusy":"La impressora està ocupada. Espera que acabi l’operació.","tlsTrustButton":"Certificats…","tlsTrustConfirm":"Confia en aquest certificat","tlsTrustCurrent":"SHA-256 desat","tlsTrustDetails":"Detalls","tlsTrustFtps":"Fitxers (FTPS 990)","tlsTrustIntro":"Confirma els certificats només en una xarxa de confiança. La primera connexió no verifica la identitat de la impressora.","tlsTrustMqtt":"Estat i ordres (MQTT 8883)","tlsTrustNoPin":"No confirmat","tlsTrustObserved":"SHA-256 rebut","tlsTrustProbe":"Llegir i confiar","tlsTrustReplacement":"El certificat no coincideix amb el desat. Confirma el certificat nou només si esperaves aquest canvi, per exemple després de substituir o restablir la impressora.","tlsTrustRequired":"Confirma el certificat de la impressora abans de connectar-t’hi.","tlsTrustSaveFailed":"No s’ha pogut desar la confirmació del certificat.","tlsTrustSaved":"Certificat confirmat.","tlsTrustStale":"La configuració de la impressora ha canviat o la confirmació ha caducat. Torna a llegir el certificat.","tlsTrustTitle":"Certificats de Bambu","tlsTrustWorking":"S’està llegint el certificat…","toolActive":"eina activa","toolDetails":"{tool} · Actual: {current} · Objectiu: {target} · {state}","toolInactive":"eina inactiva","toolViewOnly":"Només mostra detalls; no canvia l’eina activa","unassignedDelete":"Suprimir","unassignedDeleteAll":"Suprimir-ho tot","unassignedDeleteAllConfirm":"Voleu suprimir els {count} fitxers sense impressora associada ({size}) de l'emmagatzematge de Print Farm? Les còpies a les impressores no es veuen afectades.","unassignedDeleteConfirm":"Voleu suprimir {name} ({size}) de l'emmagatzematge de Print Farm? Les còpies a les impressores no es veuen afectades.","unassignedHeading":"Fitxers sense impressora assignada: {count} · {size}","unassignedNoPrinter":"Cap impressora està preparada. Ha d'estar en línia, inactiva i acceptar pujades.","unassignedSend":"Enviar a una impressora…","unassignedUpload":"Només pujar","unassignedUploadStart":"Pujar i iniciar","unassignedWhy":"Cap impressora del tauler coincideix amb el perfil d'impressora d'aquest fitxer. Podeu enviar-lo una vegada a la impressora que trieu; no es crea cap vincle.","unavailableSuffix":"encara no disponible","unmatchedQueued":"{count} fitxer(s) a la cua no coincideixen amb cap impressora del tauler","uploadShort":"Pujar","uploadToPrinterTitle":"Pujar el fitxer a aquesta impressora sense iniciar la impressió","uploadToPrinters":"Pujar {name} a {count} impressora(s):","uploadUnverifiedHardware":"La pujada no està disponible: encara no verificada al maquinari","uploadedNotStarted":"pujat (no iniciat)","useAms":"Utilitzar AMS (Bambu)","webuiAddress":"Adreça web (opcional)","webuiFallbackHelp":"Si la pàgina continua carregant, copia l’adreça en un navegador. El port web es configura a Connexió.","webuiHelp":"La pàgina no es carrega?"},"cs":{"accessCode":"Přístupový kód","add":"Přidat","addConfiguredTitle":"Přidejte tiskárnu nakonfigurovanou v OrcaSlicer","addPrinter":"Přidat tiskárnu…","all":"všechny","bambuError":"Chyba tiskárny {code}","bambuLayer":"vrstva {current}/{total}","bambuLeftHM":"Zbývá {hours} h {minutes} min","bambuLeftM":"Zbývá {minutes} min","bed":"Podložka","busy":"{printer}: tiskárna je zaneprázdněna ({state})","busyNotStarted":"{printer}: tiskárna je zaneprázdněná ({state}) — tisk nebyl spuštěn.","cameraButton":"Živá kamera","cameraCapturedAt":"Pořízeno {time}","cameraClose":"Zavřít kameru","cameraLoadFailed":"Obraz se zde nenačetl. Toto okno může blokovat obrázky z místní sítě.","cameraLoading":"Připojování ke kameře…","cameraMode":"Kamera","cameraModeAuto":"Nastavená webkamera","cameraModeU1":"Původní kamera Snapmaker U1","cameraNativeSession":"Relace kamery otevřena","cameraNone":"Na této tiskárně není nastavena žádná kamera.","cameraOpenWindow":"Otevřít kameru v okně","cameraPermissionDenied":"Práce na pozadí byla zamítnuta. Povol ji a znovu otevři kameru.","cameraReceivedAt":"Přijato {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Ke kameře se nelze připojit.","cancel":"Zrušit","cfgAutoDelete":"Automaticky mazat staré kopie","cfgAutoDeleteAge":"Mazat kopie starší než","cfgAutoDeleteHint":"Ve výchozím stavu vypnuto. Kontrola při spuštění a jednou denně; mažou se jen kopie tohoto pluginu, nikdy soubory v používání.","cfgClearConfirm":"Vymazat deník tisku? Akci nelze vrátit.","cfgClearDone":"Požadavek uložen. Deník se vymaže, až panel příště přečte nastavení.","cfgClearHistory":"Vymazat deník tisku","cfgDays":"{days} dní","cfgJournalOrca":"Zapisovat do deníku odeslání a tisky spuštěné z Orca","cfgJournalOrcaHint":"Jen úlohy, které hlásí sám OrcaSlicer.","cfgKeepAll":"Všechny","cfgKeepCopies":"Ukládat kopie slicovaných souborů","cfgKeepCopiesHint":"Umožní později poslat slicovaný soubor na tiskárnu. Při vypnutí se nic nekopíruje.","cfgKeepHistory":"Ukládat deník tisku","cfgKeepHistoryHint":"Při vypnutí se nové záznamy nezapisují; stávající zůstanou.","cfgKeepLast":"Ponechat jen nejnovější slicy na tiskárnu","cfgKeepLastHint":"Při uložení nového slicu se smažou starší neodeslané kopie stejné tiskárny. Kopie propojené s tiskovým deníkem zůstanou.","cfgPauseHidden":"Nedotazovat, dokud panel není viditelný","cfgPauseHiddenHint":"Šetří síťové požadavky, dokud je karta nebo okno skryté.","cfgPollInterval":"Interval dotazování tiskáren","cfgProfileHint":"Upozornění, když není plugin vybrán v profilu procesu","cfgProfileHintHint":"Zobrazí se v panelu, když slicovaný soubor nedorazil k tomuto pluginu.","cfgSeconds":"{seconds} s","close":"Zavřít","comingLater":"připravujeme","commandFailed":"{printer}: {action} se nezdařilo — {error}","commandSent":"{printer}: {action} odesláno.","confirmTitle":"Spustit tisk na více tiskárnách?","confirmUploadTitle":"Nahrát soubor do vybraných tiskáren?","connectionOptions":"Připojení","connectionOptionsFailed":"Uložení selhalo. Zkontroluj adresu.","connectionOptionsHelp":"Použij stejný hostitel a uveď webový port.","connectionSave":"Uložit","connectionTypeTitle":"Typ připojení. Dostupné funkce závisí na protokolu tiskárny a aktuálním stavu.","controlsUnverified":"Pozastavení a zastavení nejsou pro toto připojení k dispozici (neověřeno na hardwaru)","crealityWsPortPlaceholder":"Port WS (9999)","crealityWsPortTitle":"Volitelné. Port stavového WebSocketu tiskárny. 9999 je nepotvrzená výchozí hodnota; změňte ji, pokud tiskárna používá jiný port.","credentialLegacyWarning":"Klíče pro {count} tiskáren jsou stále v prostém textu. Přesuňte je do systémového úložiště. Staré zálohy zůstanou.","credentialMigrate":"Přesunout klíče","credentialMigrationConfirm":"Přesunout klíče do systémového úložiště? Staré zálohy zůstanou.","credentialMigrationDone":"Klíče přesunuty do systémového úložiště.","credentialRetry":"Zkusit přístup znovu","credentialSaveFailed":"Klíče nelze bezpečně uložit. Tiskárna nebyla uložena.","credentialUnavailable":"Systémové úložiště není dostupné. Připojení zablokováno.","dashboardOpened":"Řídicí panel Print Farm byl otevřen.","duetPasswordPlaceholder":"Heslo zařízení Duet","errorNeedsAccessCode":"je vyžadován přístupový kód tiskárny","errorNeedsBambuCredentials":"je vyžadována IP adresa tiskárny, přístupový kód a sériové číslo","errorNoAddress":"chybí adresa tiskárny","errorOutcomeUnknown":"tiskárna mohla požadavek přijmout, nebo ne; před dalším pokusem tiskárnu zkontrolujte","errorPrintCommand":"příkaz k tisku selhal: {error}","errorUnknownAction":"neznámá akce tiskárny","errorUnknownSerial":"nahráno, ale sériové číslo tiskárny je stále neznámé – spusťte tisk přímo z tiskárny","errorUnsupportedBackend":"tento typ připojení tiskárny není podporován","errorUpload":"nahrávání se nezdařilo: {error}","errorUploadUnverified":"soubor byl nahrán, ale jeho velikost se nepodařilo ověřit na tiskárně, proto tisk nebyl spuštěn","errorUploadedNotStarted":"soubor byl nahrán, ale tisk nebyl spuštěn: {error}","feedbackButton":"Zpětná vazba","feedbackCopied":"Zkopírováno","feedbackCopy":"Kopírovat","feedbackHelp":"Zkopíruj adresu do prohlížeče a použij tlačítko zpětné vazby webu. Data tiskáren se neodesílají. “Beta Feedback”.","file3mfWarning":".3mf se spouští pouze na tiskárnách Bambu — ostatní očekávají G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Odeslání se nezdařilo: soubor nelze přečíst.","fileTargetMismatch":"{printer}: soubor ve frontě neodpovídá této tiskárně; tisk nebyl spuštěn.","flashforgeCheckCodePlaceholder":"Kontrolní kód (na obrazovce tiskárny)","flashforgeCheckCodeTitle":"Kontrolní kód z obrazovky tiskárny. Na tiskárně musí být zapnutý režim LAN.","flashforgeErrAuth":"Nesprávné sériové číslo nebo kontrolní kód.","flashforgeErrCredentials":"Zadejte sériové číslo a kontrolní kód.","flashforgeErrIdentity":"Model tiskárny se nepodařilo ověřit.","flashforgeErrLanMode":"Zapněte na tiskárně režim LAN.","flashforgeErrUnsupportedModel":"Tento model FlashForge není podporován (pouze Adventurer 5M, 5M Pro a AD5X).","flashforgeSerialPlaceholder":"Sériové číslo","flashforgeSerialTitle":"Sériové číslo tiskárny z její obrazovky (Nastavení > O tiskárně nebo Síť). Musí být zapnutý režim LAN.","fleetAttention":"Vyžadují pozornost","fleetIdle":"Volné","fleetPrinting":"Tisknou","foundOnNetwork":"nalezeno v síti","genericError":"chyba","history":"Historie tisku","historyCoverage":"Lokálně pozorovaná historie tisku. Zahrnuje tisky spuštěné z Print Farm a úlohy zaznamenané při otevřeném řídicím panelu; to, co proběhlo, když OrcaSlicer nebyl spuštěný, může chybět.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Pro tuto tiskárnu zatím nebyly pozorovány žádné výtisky.","historyFromOrca":"nahlášeno OrcaSlicerem","historyLoading":"Načítání historie tisku…","historyObserved":"pozorováno aplikací Print Farm","historyProgress":"{progress}%","historyStartedHere":"spuštěno z Print Farm","historyStateCancelled":"zrušeno","historyStateCompleted":"dokončeno","historyStateEnded":"ukončeno","historyStateFailed":"nepodařilo","historyStatePaused":"pozastaveno","historyStatePrinting":"tiskne se","historyStateSent":"odesláno","historyTitle":"Historie tisku — {printer}","historyUnknownFile":"Neznámý soubor","integrationUnavailable":"Integrace tiskárny zatím není k dispozici","journalActiveCount":"Aktivní: {count}","journalAllCount":"Záznamů: {count}","journalBlockedByHold":"dřívější operace této tiskárny není vyřešena; otevřete deník tisku a po kontrole tiskárny ji uvolněte","journalButton":"Deník tisku","journalCompletedCount":"Dokončeno: {count}","journalEmptyAll":"Zatím nejsou zaznamenány žádné tisky.","journalFileDelete":"Smazat soubor","journalFileUnsent":"Slice, neodesláno","journalHoldLocked":"Tato operace se stále odesílá a zatím ji nelze uvolnit.","journalHoldReleased":"Zámek uvolněn. Stará operace zůstává neověřená.","journalHoldState":"Stav: {state}","journalHoldUnavailable":"Podrobnosti nevyřešené operace nejsou dostupné. Zkuste znovu otevřít deník tisku.","journalHoldsHeading":"Nevyřešené operace – před uvolněním zámku zkontrolujte na místě tiskárnu, úlohu a podložku.","journalNoResults":"Žádné odpovídající tisky.","journalPrinter":"Tiskárna","journalReleaseConfirm":"Uvolnit tento zámek poté, co jste na místě zkontrolovali tiskárnu, úlohu a podložku pro „{target}“? Odemkne to jen budoucí pokus; starý tisk se neoznačí jako úspěšný ani se nezopakuje.","journalReleaseHold":"Uvolnit zámek","journalResend":"Odeslat znovu…","journalResultsCount":"Výsledků: {count}","journalSearchLabel":"Hledat v deníku tisku","journalSearchPlaceholder":"Hledat soubor nebo tiskárnu…","journalSendConfirm":"Nahrát {name} na {printer} bez spuštění tisku?","journalStoreUnavailable":"Deník tisku není dostupný. Zkontrolujte místní úložiště pluginu.","journalTitle":"Deník tisku","legacyImportBlocked":"Data zůstávají v původní složce. Tuto sadu nelze automaticky importovat.","legacyImportButton":"Importovat starší data","legacyImportConfirm":"Tím se zkopírují data a místní přihlašovací údaje do místního úložiště pluginu OrcaSlicer. Stará kopie zůstane zachována. Pokračovat?","legacyImportDetail":"Nalezena starší data: tiskárny: {printers}, záznamy historie: {history}, položky fronty: {outbox}, soubory: {files}.","legacyImportDone":"Import dokončen.","legacyImportFailed":"Starší data se nepodařilo importovat.","loading":"Načítání…","massFailed":", selhalo: {count}","massResult":"Odesláno na tiskárny: {count}{failed}.","namePlaceholder":"Název","networkPermissionRequired":"Povolte v OrcaSlicer přístup k tiskárně. Pokud je tato možnost dostupná, otevřete Pluginy → Print Farm → Oprávnění. Poté klikněte na „Obnovit“ na kartě této tiskárny.","noPrinters":"Nebyly nalezeny žádné tiskárny. Nastavte hostitele tiskárny v OrcaSlicer nebo ho přidejte výše.","notReachable":"{printer}: tiskárna není dostupná","notReachableNotStarted":"{printer}: tiskárna není dosažitelná — tisk nebyl spuštěn.","nozzle":"Tryska","octoprintApiKeyPlaceholder":"Klíč API OctoPrint","open":"Webové rozhraní","operatorStartCheck":"Potvrzuji, že slicovaný soubor a vybraná podložka odpovídají této tiskárně, materiály a nástroje jsou správné a podložka je volná.","other":"Ostatní","outboxCopiesOff":"Kopie slicovaných souborů jsou vypnuté v nastavení pluginu.","outboxFallbackName":"slicování {stamp}","outboxHintText":"V profilu procesu není vybrán plugin Printers Outbox – kopie slicovaných souborů se neukládají.","outboxHintWhere":"Vyberte jej v Proces → Ostatní → Plugin slicovacího řetězce.","outboxNotReady":"Soubor G-code není připraven","outboxPrinterUsage":"Tiskárna: {name} · složka: {folder} · {count} souborů · {size}. Níže je můžete zkontrolovat nebo odstranit.","outboxQueued":"{name} zařazen do fronty pro {target}","outboxRemoveFailed":"Uložený soubor se nepodařilo odstranit. Zůstává v seznamu, abyste to mohli zkusit znovu.","outboxStorageCleanBlocked":"Zbytky lze smazat, jen když neprobíhá nahrávání ani tisk a index souborů je v pořádku.","outboxStorageCleanButton":"Smazat zbytky ({count} souborů, {size})","outboxStorageCleanConfirm":"Smazat {count} zbylých souborů ({size}) z úložiště Print Farm? Soubory ve frontách tiskáren zůstanou nedotčeny.","outboxStorageCleanDone":"Smazáno zbylých souborů: {count} ({size}).","outboxStorageCleanFailed":"Nepodařilo se smazat soubory ({count}): {paths}. Zkuste to znovu.","outboxStorageEmpty":"Nebyly nalezeny žádné soubory fronty ani kopie pro obnovu.","outboxStorageEntry":"{label}: {count} souborů · {size} · {path}","outboxStorageKindIncoming":"Připravená nahrání","outboxStorageKindIndex":"Index fronty","outboxStorageKindIndexBackup":"Záloha indexu fronty","outboxStorageKindLoose":"Volné nebo osiřelé soubory","outboxStorageKindRecovery":"Starší soubory pro obnovu","outboxStorageKindUnassigned":"Nepřiřazené soubory","outboxStorageManualCleanup":"Zbylé soubory (volné soubory, připravená nahrání, záložní kopie, zálohy indexu) smažete tlačítkem níže. Soubory ve frontách tiskáren se odstraňují po jednom.","outboxStorageScanFailed":"Některé cesty úložiště se nepodařilo zkontrolovat: {paths}. Součty mohou být neúplné.","outboxStorageWarning":"Úložiště roste; odstraňte soubory z front, které už nepotřebujete.","outboxUnassigned":"Nepřiřazené soubory: {count} · {size}. Níže je můžete ručně zkontrolovat a odstranit.","outboxWriteFailed":"Soubor G-code se nepodařilo uchovat","outboxWrongStep":"Toto není krok post-processingu G-code","pause":"Pauza","plateLabel":"Podložka","preparedUploadDiscardFailed":"Dočasnou kopii nahraného souboru se nepodařilo odstranit; zkontrolujte úložiště.","print":"Tisk…","printShort":"Tisk","printerBusy":"Tiskárna je zaneprázdněná","printerIpPlaceholder":"192.168.0.42 (IP tiskárny)","printerNotOnline":"Tiskárna není online","prusalinkApiKeyPlaceholder":"Klíč API PrusaLink","queueLess":"Zobrazit méně","queueMore":"Zobrazit dalších {count}","refresh":"Obnovit","remove":"Odstranit","removeRetainedTitle":"Odstranit uloženou kopii","repetierApiKeyPlaceholder":"Klíč API Repetier","repetierLoadFailed":"Tiskárnu Repetier nelze načíst. Zkontroluj adresu, klíč a seznam.","repetierLoadPrinters":"Načíst tiskárny","repetierModeUnsupported":"Zápis pro tuto verzi nebo připojení nebyl ověřen. Pouze stav.","repetierNotReady":"Server nepotvrdil připravenost tiskárny přijímat příkazy.","repetierRequestAccepted":"Požadavek přijat; úloha může čekat ve frontě serveru. Další stav potvrdí tisk.","repetierSelectPrinter":"Vybrat tiskárnu","resume":"Pokračovat","select":"vybrat","selectAllTitle":"Vyberte nebo zrušte výběr všech dostupných tiskáren","selfSigned":"samopodepsaný","selfSignedTitle":"Povolte jen pro tiskárnu dostupnou přes HTTPS se samopodepsaným certifikátem. Běžné tiskárny s HTTP v místní síti to nepotřebují.","send":"Odeslat","sendFailed":"{printer}: odeslání se nezdařilo — {error}","sendSelected":"Odeslat G-code na výběr…","sendSelectedCount":"Odeslat G-code na vybrané ({count})…","sendToPrinterTitle":"Odeslat na tuto tiskárnu a spustit tisk","sendingFile":"Odesílání {name} na tiskárny ({count})…","sentToPrint":"odesláno k tisku","serialAuto":"Sériové číslo (auto)","serialTitle":"Sériové číslo se zjišťuje automaticky. Zadejte ho jen k připnutí konkrétní tiskárny. Používá se port MQTT 8883.","startApprovalExpired":"Potvrzení spuštění vypršelo nebo se změnily parametry; zkontrolujte je znovu.","startBedClear":"Podložka je volná a připravená na nový tisk.","startBlocked":"Spuštění zablokováno pro {printer}: {reason}","startCompatibilityUnknown":"Nepodařilo se ověřit, že slicovaný soubor je kompatibilní s touto tiskárnou. Lze jej nahrát bez spuštění tisku.","startConfirmMissing":"Spuštění zrušeno: potvrďte, že je podložka volná a tam, kde se to žádá, že soubor tiskárně vyhovuje.","startFileCheck":"Ověřeno: tento soubor je slicován přesně pro tuto tiskárnu.","startImmediately":"Po nahrání ihned spustit tisk","startPrint":"Spustit tisk","startReasonFileKind":"Tento typ souboru nelze na této tiskárně spustit.","startReasonNoStart":"Spouštění tisku z Print Farm zatím není pro toto připojení dostupné. Soubor můžete nahrát.","startReasonPlate":"Vybraná podložka neodpovídá tomuto souboru.","startReasonProfileMatch":"Soubor byl slicován pro profil OrcaSlicer této tiskárny.","startReasonProfileUnknown":"Print Farm ze souboru nepozná, pro kterou tiskárnu byl slicován.","startReasonProject":"Toto je neslicovaný soubor projektu. Nejprve jej slicujte.","startReasonSlicedOnly":"Tato tiskárna spouští jen slicované soubory 3MF, ne holý G-code.","startReasonUnsupported":"Tento typ připojení zatím není podporován.","startReviewTitle":"Potvrďte každý tisk","startVerdictCompatible":"Kompatibilní","startVerdictIncompatible":"Nekompatibilní","startVerdictUnknown":"Zkontrolujte ručně","startWillStart":"Tiskárny ke spuštění: {count}","stateAborted":"přerušeno","stateBusy":"zaneprázdněno","stateChecking":"kontroluje se","stateComplete":"dokončeno","stateError":"chyba","stateFailed":"selhalo","stateIdle":"nečinný","stateOffline":"offline","stateOnline":"online","statePaused":"pozastaveno","statePrinting":"tiskne","stateStandby":"pohotovostní režim","stateUnavailable":"zatím není k dispozici","stateUnknown":"neznámé","stop":"Zastavit","storageBar":"Úložiště: {count} souborů · {size}","storageGroupTitle":"{name} · {count} souborů · {size}","storageMore":"Dalších {count}…","supportPlanned":"Podpora {type} je plánována, ale zatím není k dispozici.","sure":"Potvrdit?","tlsCertificateChanged":"Certifikát tiskárny se změnil. Připojení je zablokováno.","tlsPermissionRequired":"Povol přístup k tiskárně v OrcaSliceru a zopakuj kontrolu certifikátu.","tlsProbeFailed":"Certifikát nelze načíst. Zkontrolujte tiskárnu a zkuste to znovu.","tlsTrustBusy":"Tiskárna se používá. Počkejte na dokončení operace.","tlsTrustButton":"Certifikáty…","tlsTrustConfirm":"Důvěřovat tomuto certifikátu","tlsTrustCurrent":"Uložený SHA-256","tlsTrustDetails":"Podrobnosti","tlsTrustFtps":"Soubory (FTPS 990)","tlsTrustIntro":"Certifikáty potvrzujte pouze v síti, které důvěřujete. První připojení neověřuje identitu tiskárny.","tlsTrustMqtt":"Stav a příkazy (MQTT 8883)","tlsTrustNoPin":"Nepotvrzeno","tlsTrustObserved":"Přijatý SHA-256","tlsTrustProbe":"Přečíst a důvěřovat","tlsTrustReplacement":"Certifikát se liší od uloženého. Náhradní certifikát potvrďte pouze tehdy, pokud jste tuto změnu očekávali, například po výměně nebo resetu tiskárny.","tlsTrustRequired":"Před připojením potvrďte certifikát tiskárny.","tlsTrustSaveFailed":"Potvrzení certifikátu se nepodařilo uložit.","tlsTrustSaved":"Certifikát potvrzen.","tlsTrustStale":"Nastavení tiskárny se změnilo nebo potvrzení vypršelo. Načtěte certifikát znovu.","tlsTrustTitle":"Certifikáty Bambu","tlsTrustWorking":"Načítání certifikátu…","toolActive":"aktivní nástroj","toolDetails":"{tool} · Aktuální: {current} · Cílová: {target} · {state}","toolInactive":"neaktivní nástroj","toolViewOnly":"Pouze zobrazení; nemění aktivní nástroj","unassignedDelete":"Smazat","unassignedDeleteAll":"Smazat vše","unassignedDeleteAllConfirm":"Smazat všech {count} souborů bez přiřazené tiskárny ({size}) z úložiště Print Farm? Kopie na tiskárnách zůstanou beze změny.","unassignedDeleteConfirm":"Smazat {name} ({size}) z úložiště Print Farm? Kopie na tiskárnách nejsou dotčeny.","unassignedHeading":"Soubory bez přiřazené tiskárny: {count} · {size}","unassignedNoPrinter":"Žádná tiskárna není připravena. Musí být online, nečinná a přijímat nahrávání.","unassignedSend":"Odeslat na tiskárnu…","unassignedUpload":"Jen nahrát","unassignedUploadStart":"Nahrát a spustit","unassignedWhy":"Žádná tiskárna v panelu neodpovídá profilu tiskárny v tomto souboru. Můžete jej jednorázově odeslat na zvolenou tiskárnu; nic se nepropojí.","unavailableSuffix":"zatím není k dispozici","unmatchedQueued":"Soubory ve frontě bez odpovídající tiskárny na řídicím panelu: {count}","uploadShort":"Nahrát","uploadToPrinterTitle":"Nahrát soubor do této tiskárny bez spuštění tisku","uploadToPrinters":"Nahrát {name} na tiskárny ({count}):","uploadUnverifiedHardware":"Nahrání není k dispozici: zatím neověřeno na hardwaru","uploadedNotStarted":"nahráno (nespuštěno)","useAms":"Použít AMS (Bambu)","webuiAddress":"Webová adresa (volitelné)","webuiFallbackHelp":"Pokud se stránka stále načítá, zkopíruj adresu do prohlížeče. Port lze nastavit v Připojení.","webuiHelp":"Stránka se nenačítá?"},"de":{"accessCode":"Zugangscode","add":"Hinzufügen","addConfiguredTitle":"In OrcaSlicer eingerichteten Drucker hinzufügen","addPrinter":"Drucker hinzufügen…","all":"alle","bambuError":"Druckerfehler {code}","bambuLayer":"Schicht {current}/{total}","bambuLeftHM":"Noch {hours} h {minutes} min","bambuLeftM":"Noch {minutes} min","bed":"Bett","busy":"{printer}: Drucker ist beschäftigt ({state})","busyNotStarted":"{printer}: Drucker ist beschäftigt ({state}) – nicht gestartet.","cameraButton":"Live-Kamera","cameraCapturedAt":"Aufgenommen {time}","cameraClose":"Kamera schließen","cameraLoadFailed":"Das Bild konnte hier nicht geladen werden. Dieses Fenster blockiert möglicherweise Bilder aus dem lokalen Netzwerk.","cameraLoading":"Verbindung zur Kamera wird hergestellt…","cameraMode":"Kamera","cameraModeAuto":"Konfigurierte Webcam","cameraModeU1":"Originalkamera des Snapmaker U1","cameraNativeSession":"Kamerasitzung geöffnet","cameraNone":"Für diesen Drucker ist keine Kamera eingerichtet.","cameraOpenWindow":"Kamera im Fenster öffnen","cameraPermissionDenied":"Hintergrundarbeit wurde verweigert. Erlauben und Kamera erneut öffnen.","cameraReceivedAt":"Empfangen {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Die Kamera ist nicht erreichbar.","cancel":"Abbrechen","cfgAutoDelete":"Alte Kopien automatisch löschen","cfgAutoDeleteAge":"Kopien löschen, die älter sind als","cfgAutoDeleteHint":"Standardmäßig aus. Prüfung beim Start und einmal täglich; nur Kopien dieses Plugins werden entfernt, nie Dateien in Benutzung.","cfgClearConfirm":"Druckjournal löschen? Das lässt sich nicht rückgängig machen.","cfgClearDone":"Angefordert. Das Journal wird geleert, sobald das Panel die Einstellungen das nächste Mal liest.","cfgClearHistory":"Druckjournal löschen","cfgDays":"{days} Tage","cfgJournalOrca":"Aus Orca gesendete und gestartete Drucke im Journal erfassen","cfgJournalOrcaHint":"Nur Aufträge, die OrcaSlicer selbst meldet.","cfgKeepAll":"Alle","cfgKeepCopies":"Kopien der geslicten Dateien behalten","cfgKeepCopiesHint":"Damit lässt sich ein Slice später an einen Drucker senden. Ist die Option aus, wird nichts kopiert.","cfgKeepHistory":"Druckjournal speichern","cfgKeepHistoryHint":"Wenn aus, werden keine neuen Einträge erfasst; vorhandene bleiben.","cfgKeepLast":"Nur die neuesten Slices pro Drucker behalten","cfgKeepLastHint":"Beim Speichern eines neuen Slices werden ältere, nicht gesendete Kopien desselben Druckers gelöscht. Mit dem Druckjournal verknüpfte Kopien bleiben.","cfgPauseHidden":"Nicht abfragen, solange das Panel nicht sichtbar ist","cfgPauseHiddenHint":"Spart Netzwerkanfragen, solange Tab oder Fenster verborgen sind.","cfgPollInterval":"Abfrageintervall der Drucker","cfgProfileHint":"Hinweis, wenn das Plugin im Prozessprofil nicht gewählt ist","cfgProfileHintHint":"Wird im Panel angezeigt, wenn ein Slice dieses Plugin nicht erreicht hat.","cfgSeconds":"{seconds} s","close":"Schließen","comingLater":"folgt später","commandFailed":"{printer}: {action} fehlgeschlagen – {error}","commandSent":"{printer}: {action} gesendet.","confirmTitle":"Druck auf mehreren Druckern starten?","confirmUploadTitle":"Datei auf die ausgewählten Drucker hochladen?","connectionOptions":"Verbindung","connectionOptionsFailed":"Speichern fehlgeschlagen. Adresse prüfen.","connectionOptionsHelp":"Druckerhost beibehalten und Web-Port ausdrücklich angeben.","connectionSave":"Speichern","connectionTypeTitle":"Verbindungstyp. Die verfügbaren Funktionen hängen vom Druckerprotokoll und vom aktuellen Zustand ab.","controlsUnverified":"Pause und Stopp sind für diese Verbindung nicht verfügbar (nicht auf Hardware verifiziert)","crealityWsPortPlaceholder":"WS-Port (9999)","crealityWsPortTitle":"Optional. Port des Status-WebSockets des Druckers. 9999 ist ein unbestätigter Standardwert; ändern Sie ihn, wenn Ihr Drucker einen anderen Port nutzt.","credentialLegacyWarning":"Schlüssel für {count} Drucker sind noch im Klartext gespeichert. In den Systemspeicher verschieben; alte Sicherungen bleiben.","credentialMigrate":"Schlüssel verschieben","credentialMigrationConfirm":"Schlüssel in den Systemspeicher verschieben? Alte Sicherungen bleiben.","credentialMigrationDone":"Schlüssel im Systemspeicher gespeichert.","credentialRetry":"Zugriff wiederholen","credentialSaveFailed":"Schlüssel konnten nicht sicher gespeichert werden. Drucker nicht gespeichert.","credentialUnavailable":"System-Schlüsselspeicher nicht verfügbar. Keine Druckerverbindung.","dashboardOpened":"Print-Farm-Dashboard geöffnet.","duetPasswordPlaceholder":"Duet-Gerätepasswort","errorNeedsAccessCode":"Es ist ein Druckerzugangscode erforderlich","errorNeedsBambuCredentials":"Drucker-IP, Zugangscode und Seriennummer sind erforderlich","errorNoAddress":"Druckeradresse fehlt","errorOutcomeUnknown":"der Drucker hat die Anfrage möglicherweise erhalten oder nicht; prüfen Sie den Drucker, bevor Sie es erneut versuchen","errorPrintCommand":"Druckbefehl fehlgeschlagen: {error}","errorUnknownAction":"Unbekannte Druckeraktion","errorUnknownSerial":"hochgeladen, aber die Seriennummer des Druckers ist noch unbekannt – am Drucker selbst starten","errorUnsupportedBackend":"Diese Druckeranbindung wird nicht unterstützt","errorUpload":"Hochladen fehlgeschlagen: {error}","errorUploadUnverified":"die Datei wurde hochgeladen, ihre Größe konnte aber auf dem Drucker nicht verifiziert werden, daher wurde der Druck nicht gestartet","errorUploadedNotStarted":"die Datei wurde hochgeladen, der Druck wurde aber nicht gestartet: {error}","feedbackButton":"Feedback","feedbackCopied":"Kopiert","feedbackCopy":"Kopieren","feedbackHelp":"Adresse in einen Browser kopieren und die Feedback-Schaltfläche der Website verwenden. Keine Druckerdaten werden gesendet. “Beta Feedback”.","file3mfWarning":".3mf lässt sich nur auf Bambu-Druckern starten – andere erwarten G-Code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Senden fehlgeschlagen: Die Datei konnte nicht gelesen werden.","fileTargetMismatch":"{printer}: Die Datei in der Warteschlange passt nicht zu diesem Drucker – nicht gestartet.","flashforgeCheckCodePlaceholder":"Check-Code (auf dem Druckerbildschirm)","flashforgeCheckCodeTitle":"Check-Code vom Druckerbildschirm. Am Drucker muss der LAN-Modus aktiviert sein.","flashforgeErrAuth":"Falsche Seriennummer oder falscher Check-Code.","flashforgeErrCredentials":"Seriennummer und Check-Code eingeben.","flashforgeErrIdentity":"Das Druckermodell konnte nicht verifiziert werden.","flashforgeErrLanMode":"Aktivieren Sie den LAN-Modus am Drucker.","flashforgeErrUnsupportedModel":"Dieses FlashForge-Modell wird nicht unterstützt (nur Adventurer 5M, 5M Pro und AD5X).","flashforgeSerialPlaceholder":"Seriennummer","flashforgeSerialTitle":"Seriennummer des Druckers vom Druckerbildschirm (Einstellungen > Info oder Netzwerk). Der LAN-Modus muss aktiv sein.","fleetAttention":"Benötigen Aufmerksamkeit","fleetIdle":"Frei","fleetPrinting":"Drucken","foundOnNetwork":"im Netzwerk gefunden","genericError":"Fehler","history":"Druckverlauf","historyCoverage":"Lokal beobachteter Druckverlauf. Er enthält von Print Farm gestartete Drucke und Aufträge, die bei geöffnetem Dashboard erkannt wurden; Aufträge, die liefen, während OrcaSlicer nicht geöffnet war, können fehlen.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Für diesen Drucker wurden noch keine Drucke beobachtet.","historyFromOrca":"von OrcaSlicer gemeldet","historyLoading":"Druckverlauf wird geladen…","historyObserved":"beobachtet von Print Farm","historyProgress":"{progress}%","historyStartedHere":"von Print Farm gestartet","historyStateCancelled":"abgebrochen","historyStateCompleted":"abgeschlossen","historyStateEnded":"beendet","historyStateFailed":"fehlgeschlagen","historyStatePaused":"pausiert","historyStatePrinting":"druckt","historyStateSent":"gesendet","historyTitle":"Druckverlauf – {printer}","historyUnknownFile":"Unbekannte Datei","integrationUnavailable":"Die Druckerintegration ist noch nicht verfügbar","journalActiveCount":"{count} aktiv","journalAllCount":"{count} erfasst","journalBlockedByHold":"ein früherer Vorgang für diesen Drucker ist ungeklärt; öffnen Sie das Druckjournal und geben Sie die Sperre nach Prüfung des Druckers frei","journalButton":"Druckjournal","journalCompletedCount":"{count} abgeschlossen","journalEmptyAll":"Noch keine Drucke erfasst.","journalFileDelete":"Datei löschen","journalFileUnsent":"Slice, nicht gesendet","journalHoldLocked":"Dieser Vorgang wird noch gesendet und kann noch nicht freigegeben werden.","journalHoldReleased":"Sperre freigegeben. Der alte Vorgang bleibt ungeprüft.","journalHoldState":"Status: {state}","journalHoldUnavailable":"Details zum ungeklärten Vorgang sind nicht verfügbar. Öffnen Sie das Druckjournal erneut.","journalHoldsHeading":"Ungeklärte Vorgänge – vor dem Freigeben einer Sperre Drucker, Auftrag und Druckplatte vor Ort prüfen.","journalNoResults":"Keine passenden Drucke gefunden.","journalPrinter":"Drucker","journalReleaseConfirm":"Sperre freigeben, nachdem Sie Drucker, Auftrag und Druckplatte für „{target}“ vor Ort geprüft haben? Dadurch wird nur ein künftiger Versuch entsperrt; der alte Druck wird weder als erfolgreich markiert noch wiederholt.","journalReleaseHold":"Sperre freigeben","journalResend":"Erneut senden…","journalResultsCount":"{count} Ergebnisse","journalSearchLabel":"Druckjournal durchsuchen","journalSearchPlaceholder":"Datei oder Drucker suchen…","journalSendConfirm":"{name} auf {printer} hochladen, ohne den Druck zu starten?","journalStoreUnavailable":"Das Druckjournal ist nicht verfügbar. Prüfen Sie den lokalen Plugin-Speicher.","journalTitle":"Druckjournal","legacyImportBlocked":"Die Daten bleiben im bisherigen Speicherordner. Dieser Bestand kann nicht automatisch importiert werden.","legacyImportButton":"Alte Daten importieren","legacyImportConfirm":"Dabei werden Daten und lokale Zugangsdaten in den lokalen Speicher dieses OrcaSlicer-Plugins kopiert. Die alte Kopie bleibt erhalten. Fortfahren?","legacyImportDetail":"Alte Daten gefunden: {printers} Drucker, {history} Verlaufseinträge, {outbox} Warteschlangeneinträge, {files} Dateien.","legacyImportDone":"Import abgeschlossen.","legacyImportFailed":"Die alten Daten konnten nicht importiert werden.","loading":"Wird geladen…","massFailed":", {count} fehlgeschlagen","massResult":"An {count} Drucker gesendet{failed}.","namePlaceholder":"Name","networkPermissionRequired":"Erlaube in OrcaSlicer den Zugriff auf den Drucker. Falls verfügbar, nutze Plugins → Print Farm → Berechtigungen. Klicke anschließend auf „Aktualisieren“ auf dieser Druckerkarte.","noPrinters":"Keine Drucker gefunden. Richten Sie in OrcaSlicer einen Druckerhost ein oder fügen Sie oben einen hinzu.","notReachable":"{printer}: Drucker ist nicht erreichbar","notReachableNotStarted":"{printer}: Drucker ist nicht erreichbar – nicht gestartet.","nozzle":"Düse","octoprintApiKeyPlaceholder":"OctoPrint-API-Schlüssel","open":"Weboberfläche","operatorStartCheck":"Ich habe geprüft, dass die geslicte Datei und die gewählte Platte zu diesem Drucker passen, Material und Werkzeuge stimmen und das Druckbett frei ist.","other":"Sonstiges","outboxCopiesOff":"Kopien von Slices sind in den Plugin-Einstellungen ausgeschaltet.","outboxFallbackName":"Slicing {stamp}","outboxHintText":"Im Prozessprofil ist kein Printers-Outbox-Plugin ausgewählt – Kopien der Slices werden nicht gespeichert.","outboxHintWhere":"Auswahl unter Prozess → Sonstiges → Slicing-Pipeline-Plugin.","outboxNotReady":"G-Code-Datei noch nicht bereit","outboxPrinterUsage":"Drucker: {name} · Ordner: {folder} · {count} Dateien · {size}. Dateien unten prüfen oder entfernen.","outboxQueued":"{name} für {target} in die Warteschlange gestellt","outboxRemoveFailed":"Die gespeicherte Datei konnte nicht entfernt werden. Sie bleibt für einen erneuten Versuch gelistet.","outboxStorageCleanBlocked":"Reste können nur gelöscht werden, solange kein Upload und kein Druckvorgang läuft und der Dateiindex intakt ist.","outboxStorageCleanButton":"Reste löschen ({count} Dateien, {size})","outboxStorageCleanConfirm":"{count} übrig gebliebene Dateien ({size}) aus dem Print-Farm-Speicher löschen? Dateien in den Druckerwarteschlangen bleiben unberührt.","outboxStorageCleanDone":"{count} übrig gebliebene Dateien gelöscht ({size}).","outboxStorageCleanFailed":"{count} Dateien konnten nicht gelöscht werden: {paths}. Bitte erneut versuchen.","outboxStorageEmpty":"Keine Warteschlangendateien oder Wiederherstellungskopien gefunden.","outboxStorageEntry":"{label}: {count} Dateien · {size} · {path}","outboxStorageKindIncoming":"Vorbereitete Uploads","outboxStorageKindIndex":"Warteschlangenindex","outboxStorageKindIndexBackup":"Sicherung des Warteschlangenindex","outboxStorageKindLoose":"Lose oder verwaiste Dateien","outboxStorageKindRecovery":"Alte Wiederherstellungsdateien","outboxStorageKindUnassigned":"Nicht zugewiesene Dateien","outboxStorageManualCleanup":"Übrig gebliebene Dateien (lose Dateien, vorbereitete Uploads, Wiederherstellungskopien, Index-Sicherungen) lassen sich mit der Schaltfläche unten löschen. Dateien in den Druckerwarteschlangen werden einzeln entfernt.","outboxStorageScanFailed":"Nicht alle Speicherpfade konnten durchsucht werden: {paths}. Die Summen können unvollständig sein.","outboxStorageWarning":"Der Speicher wächst; entfernen Sie Dateien aus den Warteschlangen, die Sie nicht mehr brauchen.","outboxUnassigned":"Nicht zugewiesene Dateien: {count} · {size}. Unten manuell prüfen und entfernen.","outboxWriteFailed":"G-Code-Datei konnte nicht aufbewahrt werden","outboxWrongStep":"Nicht der G-Code-Nachbearbeitungsschritt","pause":"Pause","plateLabel":"Platte","preparedUploadDiscardFailed":"Die temporäre Upload-Kopie konnte nicht gelöscht werden; bitte den Speicher prüfen.","print":"Drucken…","printShort":"Drucken","printerBusy":"Der Drucker ist beschäftigt","printerIpPlaceholder":"192.168.0.42 (Drucker-IP)","printerNotOnline":"Drucker ist nicht online","prusalinkApiKeyPlaceholder":"PrusaLink-API-Schlüssel","queueLess":"Weniger anzeigen","queueMore":"{count} weitere anzeigen","refresh":"Aktualisieren","remove":"Entfernen","removeRetainedTitle":"Aufbewahrte Kopie entfernen","repetierApiKeyPlaceholder":"Repetier-API-Schlüssel","repetierLoadFailed":"Repetier-Drucker konnte nicht geladen werden. Adresse, Schlüssel und Druckerliste prüfen.","repetierLoadPrinters":"Drucker laden","repetierModeUnsupported":"Schreibzugriff für diese Serverversion oder Verbindung ist nicht bestätigt. Nur Status.","repetierNotReady":"Der Server hat die Befehlsbereitschaft des Druckers nicht bestätigt.","repetierRequestAccepted":"Anfrage angenommen; der Auftrag kann in der Serverwarteschlange warten. Der nächste Status bestätigt den Druck.","repetierSelectPrinter":"Drucker wählen","resume":"Fortsetzen","select":"auswählen","selectAllTitle":"Alle verfügbaren Drucker auswählen oder abwählen","selfSigned":"selbstsigniert","selfSignedTitle":"Nur für einen Drucker aktivieren, der per HTTPS mit selbstsigniertem Zertifikat erreichbar ist. Drucker im LAN mit einfachem HTTP benötigen dies nicht.","send":"Senden","sendFailed":"{printer}: Senden fehlgeschlagen – {error}","sendSelected":"G-Code an Auswahl senden…","sendSelectedCount":"G-Code an {count} ausgewählte senden…","sendToPrinterTitle":"An diesen Drucker senden und den Druck starten","sendingFile":"{name} wird an {count} Drucker gesendet…","sentToPrint":"zum Drucken gesendet","serialAuto":"Seriennummer (automatisch)","serialTitle":"Die Seriennummer wird automatisch erkannt. Nur eingeben, um einen bestimmten Drucker festzulegen. Es wird MQTT-Port 8883 verwendet.","startApprovalExpired":"Die Startbestätigung ist abgelaufen oder die Einstellungen haben sich geändert; bitte erneut prüfen.","startBedClear":"Das Druckbett ist frei und bereit für einen neuen Druck.","startBlocked":"Start für {printer} blockiert: {reason}","startCompatibilityUnknown":"Es konnte nicht bestätigt werden, dass die geslicte Datei zu diesem Drucker passt. Sie kann ohne Druckstart hochgeladen werden.","startConfirmMissing":"Start abgebrochen: Bestätigen Sie, dass das Druckbett frei ist und – falls abgefragt – dass die Datei zum Drucker passt.","startFileCheck":"Geprüft: Diese Datei wurde genau für diesen Drucker geslict.","startImmediately":"Nach dem Hochladen sofort drucken","startPrint":"Druck starten","startReasonFileKind":"Dieser Dateityp kann auf diesem Drucker nicht gestartet werden.","startReasonNoStart":"Der Druckstart über Print Farm ist für diese Verbindung noch nicht verfügbar. Die Datei kann hochgeladen werden.","startReasonPlate":"Die gewählte Platte passt nicht zu dieser Datei.","startReasonProfileMatch":"Die Datei wurde für das OrcaSlicer-Profil dieses Druckers geslict.","startReasonProfileUnknown":"Print Farm kann der Datei nicht entnehmen, für welchen Drucker sie geslict wurde.","startReasonProject":"Dies ist eine Projektdatei, die noch nicht geslict ist. Bitte zuerst slicen.","startReasonSlicedOnly":"Dieser Drucker startet nur geslicte 3MF-Dateien, keinen reinen G-Code.","startReasonUnsupported":"Dieser Verbindungstyp wird noch nicht unterstützt.","startReviewTitle":"Jeden Druck bestätigen","startVerdictCompatible":"Kompatibel","startVerdictIncompatible":"Nicht kompatibel","startVerdictUnknown":"Manuell prüfen","startWillStart":"Zu startende Drucker: {count}","stateAborted":"abgebrochen","stateBusy":"beschäftigt","stateChecking":"wird geprüft","stateComplete":"abgeschlossen","stateError":"Fehler","stateFailed":"fehlgeschlagen","stateIdle":"inaktiv","stateOffline":"offline","stateOnline":"online","statePaused":"pausiert","statePrinting":"druckt","stateStandby":"Standby","stateUnavailable":"noch nicht verfügbar","stateUnknown":"unbekannt","stop":"Stopp","storageBar":"Speicher: {count} Dateien · {size}","storageGroupTitle":"{name} · {count} Dateien · {size}","storageMore":"{count} weitere…","supportPlanned":"{type}-Unterstützung ist geplant, aber noch nicht verfügbar.","sure":"Bestätigen?","tlsCertificateChanged":"Das Druckerzertifikat hat sich geändert. Verbindung blockiert.","tlsPermissionRequired":"Erlaube den Druckerzugriff in OrcaSlicer und wiederhole die Zertifikatsprüfung.","tlsProbeFailed":"Zertifikat konnte nicht gelesen werden. Überprüfe den Drucker und versuche es erneut.","tlsTrustBusy":"Der Drucker ist beschäftigt. Warte, bis der Vorgang abgeschlossen ist.","tlsTrustButton":"Zertifikate…","tlsTrustConfirm":"Diesem Zertifikat vertrauen","tlsTrustCurrent":"Gespeicherter SHA-256","tlsTrustDetails":"Details","tlsTrustFtps":"Dateien (FTPS 990)","tlsTrustIntro":"Bestätige Zertifikate nur in einem vertrauenswürdigen Netzwerk. Die erste Verbindung weist die Identität des Druckers nicht nach.","tlsTrustMqtt":"Status und Befehle (MQTT 8883)","tlsTrustNoPin":"Nicht bestätigt","tlsTrustObserved":"Empfangener SHA-256","tlsTrustProbe":"Lesen und vertrauen","tlsTrustReplacement":"Das Zertifikat weicht vom gespeicherten ab. Bestätige den Ersatz nur, wenn du diese Änderung erwartet hast, etwa nach einem Austausch oder Zurücksetzen des Druckers.","tlsTrustRequired":"Bestätige das Druckerzertifikat, bevor du eine Verbindung herstellst.","tlsTrustSaveFailed":"Zertifikatsbestätigung konnte nicht gespeichert werden.","tlsTrustSaved":"Zertifikat bestätigt.","tlsTrustStale":"Druckereinstellungen wurden geändert oder die Bestätigung ist abgelaufen. Lies das Zertifikat erneut.","tlsTrustTitle":"Bambu-Zertifikate","tlsTrustWorking":"Zertifikat wird gelesen…","toolActive":"aktives Werkzeug","toolDetails":"{tool} · Aktuell: {current} · Soll: {target} · {state}","toolInactive":"inaktives Werkzeug","toolViewOnly":"Nur Details anzeigen; das aktive Werkzeug bleibt unverändert","unassignedDelete":"Löschen","unassignedDeleteAll":"Alle löschen","unassignedDeleteAllConfirm":"Alle {count} Dateien ohne Druckerzuordnung ({size}) aus dem Print-Farm-Speicher löschen? Kopien auf den Druckern bleiben unberührt.","unassignedDeleteConfirm":"{name} ({size}) aus dem Print-Farm-Speicher löschen? Kopien auf Druckern bleiben unberührt.","unassignedHeading":"Dateien ohne Druckerzuordnung: {count} · {size}","unassignedNoPrinter":"Kein Drucker ist bereit. Er muss online und inaktiv sein und Uploads annehmen.","unassignedSend":"An Drucker senden…","unassignedUpload":"Nur hochladen","unassignedUploadStart":"Hochladen und starten","unassignedWhy":"Kein Drucker im Panel passt zum Druckerprofil dieser Datei. Sie lässt sich einmalig an einen gewählten Drucker senden; es wird nichts verknüpft.","unavailableSuffix":"noch nicht verfügbar","unmatchedQueued":"{count} Datei(en) in der Warteschlange passen zu keinem Drucker im Dashboard","uploadShort":"Hochladen","uploadToPrinterTitle":"Datei auf diesen Drucker hochladen, ohne den Druck zu starten","uploadToPrinters":"{name} auf {count} Drucker hochladen:","uploadUnverifiedHardware":"Upload nicht verfügbar: noch nicht auf Hardware verifiziert","uploadedNotStarted":"hochgeladen (nicht gestartet)","useAms":"AMS verwenden (Bambu)","webuiAddress":"Weboberfläche (optional)","webuiFallbackHelp":"Bei endlosem Laden die Adresse in einen Browser kopieren. Einen anderen Web-Port unter Verbindung einstellen.","webuiHelp":"Seite lädt nicht?"},"en":{"accessCode":"Access code","add":"Add","addConfiguredTitle":"Add a printer configured in OrcaSlicer","addPrinter":"Add a printer…","all":"all","bambuError":"Printer error {code}","bambuLayer":"layer {current}/{total}","bambuLeftHM":"{hours} h {minutes} min left","bambuLeftM":"{minutes} min left","bed":"Bed","busy":"{printer}: printer is busy ({state})","busyNotStarted":"{printer}: printer is busy ({state}) — not started.","cameraButton":"Live camera","cameraCapturedAt":"Captured {time}","cameraClose":"Close camera","cameraLoadFailed":"The picture did not load here. This window may block images from the local network.","cameraLoading":"Connecting to the camera…","cameraMode":"Camera","cameraModeAuto":"Configured webcam","cameraModeU1":"Stock Snapmaker U1 camera","cameraNativeSession":"Camera session open","cameraNone":"This printer has no camera configured.","cameraOpenWindow":"Open camera in window","cameraPermissionDenied":"Background work permission was denied. Allow it, then reopen the camera.","cameraReceivedAt":"Received {time}","cameraTitle":"Camera: {printer}","cameraUnavailable":"The camera could not be reached.","cancel":"Cancel","cfgAutoDelete":"Delete old copies automatically","cfgAutoDeleteAge":"Delete copies older than","cfgAutoDeleteHint":"Off by default. Checked at start and once a day; only copies saved by this plugin are removed, never files in use.","cfgClearConfirm":"Clear the print journal? This cannot be undone.","cfgClearDone":"Requested. The journal is cleared the next time the panel reads the settings.","cfgClearHistory":"Clear print journal","cfgDays":"{days} days","cfgJournalOrca":"Record sends and prints started from Orca in the journal","cfgJournalOrcaHint":"Only jobs that OrcaSlicer reports itself.","cfgKeepAll":"All","cfgKeepCopies":"Keep copies of sliced files","cfgKeepCopiesHint":"Lets you send a slice to a printer later. When off, nothing is copied.","cfgKeepHistory":"Keep print journal","cfgKeepHistoryHint":"When off, new entries are not recorded; existing ones stay.","cfgKeepLast":"Keep only the newest slices per printer","cfgKeepLastHint":"Older unsent copies of the same printer are deleted when a new slice is stored. Copies linked to the print journal stay.","cfgPauseHidden":"Do not poll while the panel is not visible","cfgPauseHiddenHint":"Saves network requests while the tab or window is hidden.","cfgPollInterval":"Printer polling interval","cfgProfileHint":"Hint when the plugin is not selected in the process profile","cfgProfileHintHint":"Shown on the panel when a slice did not reach this plugin.","cfgSeconds":"{seconds} s","close":"Close","comingLater":"coming later","commandFailed":"{printer}: {action} failed — {error}","commandSent":"{printer}: {action} sent.","confirmTitle":"Start print on multiple printers?","confirmUploadTitle":"Upload the file to the selected printers?","connectionOptions":"Connection","connectionOptionsFailed":"Could not save. Check the address and try again.","connectionOptionsHelp":"Use the printer host and enter the Web UI port explicitly.","connectionSave":"Save","connectionTypeTitle":"Connection type. Available functions depend on the printer protocol and current state.","controlsUnverified":"Pause and stop are not available for this connection (not verified on hardware)","crealityWsPortPlaceholder":"WS port (9999)","crealityWsPortTitle":"Optional. Port of the printer's status WebSocket. 9999 is an unconfirmed default; change it if your printer uses another port.","credentialLegacyWarning":"Old keys remain in plain text for {count} printers. Move them to the system credential store. Old backups are not removed.","credentialMigrate":"Move keys","credentialMigrationConfirm":"Move the saved keys to your system credential store? Existing backups are not removed.","credentialMigrationDone":"Keys moved to the system credential store.","credentialRetry":"Retry access","credentialSaveFailed":"Could not save the printer keys in the system credential store. The printer was not saved.","credentialUnavailable":"System credential access failed. No printer connection was made.","dashboardOpened":"Print Farm dashboard opened.","duetPasswordPlaceholder":"Duet machine password","errorNeedsAccessCode":"printer access code is required","errorNeedsBambuCredentials":"printer IP, access code and serial are required","errorNoAddress":"printer address is missing","errorOutcomeUnknown":"the printer may or may not have received the request; check the printer before trying again","errorPrintCommand":"print command failed: {error}","errorUnknownAction":"unknown printer action","errorUnknownSerial":"uploaded, but the printer serial is still unknown — start it from the printer","errorUnsupportedBackend":"printer backend is not supported","errorUpload":"upload failed: {error}","errorUploadUnverified":"the file was uploaded, but its size could not be verified on the printer, so the print was not started","errorUploadedNotStarted":"the file was uploaded, but the print was not started: {error}","feedbackButton":"Feedback","feedbackCopied":"Copied","feedbackCopy":"Copy","feedbackHelp":"Copy this address into a browser, then use the site's “Beta Feedback” button. Print Farm sends no printer data.","file3mfWarning":".3mf starts only on Bambu printers — the others expect G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Send failed: could not read the file.","fileTargetMismatch":"{printer}: queued file does not match this printer — not started.","flashforgeCheckCodePlaceholder":"Check code (on the printer screen)","flashforgeCheckCodeTitle":"Check code from the printer screen. LAN mode must be enabled on the printer.","flashforgeErrAuth":"Wrong serial number or check code.","flashforgeErrCredentials":"Enter the serial number and check code.","flashforgeErrIdentity":"The printer model could not be verified.","flashforgeErrLanMode":"Turn on LAN mode on the printer.","flashforgeErrUnsupportedModel":"This FlashForge model is not supported (only Adventurer 5M, 5M Pro and AD5X).","flashforgeSerialPlaceholder":"Serial number","flashforgeSerialTitle":"Printer serial number from the printer screen (Settings > About or Network). LAN mode must be on.","fleetAttention":"Need attention","fleetIdle":"Idle","fleetPrinting":"Printing","foundOnNetwork":"found on network","genericError":"error","history":"Print history","historyCoverage":"Local observed print history. It includes prints started by Print Farm and jobs seen while this dashboard was open; work performed while OrcaSlicer was offline may be missing.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"No observed prints for this printer yet.","historyFromOrca":"reported by OrcaSlicer","historyLoading":"Loading print history…","historyObserved":"observed by Print Farm","historyProgress":"{progress}%","historyStartedHere":"started by Print Farm","historyStateCancelled":"cancelled","historyStateCompleted":"completed","historyStateEnded":"ended","historyStateFailed":"failed","historyStatePaused":"paused","historyStatePrinting":"printing","historyStateSent":"sent","historyTitle":"Print history — {printer}","historyUnknownFile":"Unknown file","integrationUnavailable":"Printer integration is not available yet","journalActiveCount":"{count} active","journalAllCount":"{count} recorded","journalBlockedByHold":"an earlier operation for this printer is unresolved; open the print journal and release it after checking the printer","journalButton":"Print journal","journalCompletedCount":"{count} completed","journalEmptyAll":"No prints recorded yet.","journalFileDelete":"Delete file","journalFileUnsent":"Slice, not sent","journalHoldLocked":"This operation is still being dispatched and cannot be released yet.","journalHoldReleased":"Hold released. The old operation remains unverified.","journalHoldState":"State: {state}","journalHoldUnavailable":"Unresolved operation details are unavailable. Try reopening Print journal.","journalHoldsHeading":"Unresolved operations — check the physical printer, job, and build plate before releasing a hold.","journalNoResults":"No matching prints.","journalPrinter":"Printer","journalReleaseConfirm":"After checking the physical printer, job, and build plate for “{target}”, release this hold? This only unlocks a future attempt; it does not mark the old print as successful or retry it.","journalReleaseHold":"Release hold","journalResend":"Send again…","journalResultsCount":"{count} results","journalSearchLabel":"Search print journal","journalSearchPlaceholder":"Search file or printer…","journalSendConfirm":"Upload {name} to {printer} without starting a print?","journalStoreUnavailable":"Print journal is unavailable. Check local plugin storage.","journalTitle":"Print journal","legacyImportBlocked":"Your data remains in its previous storage folder. This set cannot be imported automatically.","legacyImportButton":"Import legacy data","legacyImportConfirm":"This copies data and local credentials into this OrcaSlicer plugin's local storage. The old copy will be kept. Continue?","legacyImportDetail":"Legacy data found: {printers} printers, {history} history records, {outbox} queue records, {files} files.","legacyImportDone":"Import completed.","legacyImportFailed":"Legacy data could not be imported.","loading":"Loading…","massFailed":", {count} failed","massResult":"Sent to {count} printer(s){failed}.","namePlaceholder":"Name","networkPermissionRequired":"Allow printer access in OrcaSlicer. If available, use Plugins → Print Farm → Permissions. Then click Refresh on this printer card.","noPrinters":"No printers found. Configure a printer host in OrcaSlicer, or add one above.","notReachable":"{printer}: printer is not reachable","notReachableNotStarted":"{printer}: printer is not reachable — not started.","nozzle":"Nozzle","octoprintApiKeyPlaceholder":"OctoPrint API key","open":"Open web UI","operatorStartCheck":"I checked that the sliced file and selected plate are right for this printer, the materials and tools are correct, and the bed is clear.","other":"Other","outboxCopiesOff":"Copies of slices are turned off in the plugin settings.","outboxFallbackName":"slice {stamp}","outboxHintText":"No Printers Outbox plugin is selected in the process profile — slice copies are not being saved.","outboxHintWhere":"Select it under Process → Others → Slicing pipeline plugin.","outboxNotReady":"G-code file not ready","outboxPrinterUsage":"Printer: {name} · folder: {folder} · {count} files · {size}. Review or remove files below.","outboxQueued":"Queued {name} for {target}","outboxRemoveFailed":"Could not remove the saved file. It remains listed so you can retry.","outboxStorageCleanBlocked":"Leftovers can be deleted only while no upload or print operation is running and the file index is healthy.","outboxStorageCleanButton":"Delete leftovers ({count} files, {size})","outboxStorageCleanConfirm":"Delete {count} leftover files ({size}) from Print Farm storage? Files queued for printers are not touched.","outboxStorageCleanDone":"Deleted {count} leftover files ({size}).","outboxStorageCleanFailed":"Could not delete {count} files: {paths}. Try again.","outboxStorageEmpty":"No outbox files or recovery copies found.","outboxStorageEntry":"{label}: {count} files · {size} · {path}","outboxStorageKindIncoming":"Prepared uploads","outboxStorageKindIndex":"Outbox index","outboxStorageKindIndexBackup":"Outbox index backup","outboxStorageKindLoose":"Loose or orphan files","outboxStorageKindRecovery":"Legacy recovery files","outboxStorageKindUnassigned":"Unassigned files","outboxStorageManualCleanup":"Leftover files (loose files, prepared uploads, recovery copies, index backups) can be deleted with the button below. Files queued for printers are removed one by one.","outboxStorageScanFailed":"Could not scan all storage paths: {paths}. Totals may be incomplete.","outboxStorageWarning":"Storage is growing; remove queued files you no longer need.","outboxUnassigned":"Unassigned files: {count} · {size}. Review and remove manually below.","outboxWriteFailed":"Could not retain the G-code file","outboxWrongStep":"Not the G-code post-process step","pause":"Pause","plateLabel":"Plate","preparedUploadDiscardFailed":"Could not remove the temporary upload copy; check storage.","print":"Print…","printShort":"Print","printerBusy":"Printer is busy","printerIpPlaceholder":"192.168.0.42 (printer IP)","printerNotOnline":"Printer is not online","prusalinkApiKeyPlaceholder":"PrusaLink API key","queueLess":"Show less","queueMore":"Show {count} more","refresh":"Refresh","remove":"Remove","removeRetainedTitle":"Remove retained copy","repetierApiKeyPlaceholder":"Repetier API key","repetierLoadFailed":"Could not load the selected Repetier printer. Check the address, key and printer list.","repetierLoadPrinters":"Load printers","repetierModeUnsupported":"This server version or connector has no verified write support. Status only.","repetierNotReady":"The server has not confirmed that this printer accepts commands.","repetierRequestAccepted":"Request accepted; the job may wait in the server queue. Printing is confirmed by the next status report.","repetierSelectPrinter":"Choose printer","resume":"Resume print","select":"select","selectAllTitle":"Select or deselect every available printer","selfSigned":"self-signed","selfSignedTitle":"Enable only for a printer served over HTTPS with a self-signed certificate. Plain HTTP LAN printers do not need this.","send":"Send","sendFailed":"{printer}: send failed — {error}","sendSelected":"Send G-code to selected…","sendSelectedCount":"Send G-code to {count} selected…","sendToPrinterTitle":"Send to this printer and start printing","sendingFile":"Sending {name} to {count}…","sentToPrint":"sent to print","serialAuto":"Serial number (auto)","serialTitle":"The serial is discovered automatically. Enter one only to pin a specific printer. MQTT port 8883 is used.","startApprovalExpired":"The start approval expired or the settings changed; please check again.","startBedClear":"The print bed is clear and ready for a new print.","startBlocked":"Start blocked for {printer}: {reason}","startCompatibilityUnknown":"Could not confirm that the sliced file is compatible with this printer. You can upload it without starting the print.","startConfirmMissing":"Start cancelled: confirm that the bed is clear and, where asked, that the file suits the printer.","startFileCheck":"I checked that this file is sliced for this exact printer.","startImmediately":"Start printing immediately after upload","startPrint":"Start print","startReasonFileKind":"This file type cannot be started on this printer.","startReasonNoStart":"Starting prints from Print Farm is not available for this connection yet. You can upload the file.","startReasonPlate":"The selected plate does not match this file.","startReasonProfileMatch":"The file was sliced for this printer's OrcaSlicer profile.","startReasonProfileUnknown":"Print Farm cannot tell from the file which printer it was sliced for.","startReasonProject":"This is an unsliced project file. Slice it first.","startReasonSlicedOnly":"This printer starts sliced 3MF files only, not plain G-code.","startReasonUnsupported":"This connection type is not supported yet.","startReviewTitle":"Confirm each print","startVerdictCompatible":"Compatible","startVerdictIncompatible":"Incompatible","startVerdictUnknown":"Check manually","startWillStart":"Printers that will start: {count}","stateAborted":"aborted","stateBusy":"busy","stateChecking":"checking","stateComplete":"complete","stateError":"error","stateFailed":"failed","stateIdle":"idle","stateOffline":"offline","stateOnline":"online","statePaused":"paused","statePrinting":"printing","stateStandby":"standby","stateUnavailable":"not available yet","stateUnknown":"unknown","stop":"Stop","storageBar":"Storage: {count} files · {size}","storageGroupTitle":"{name} · {count} files · {size}","storageMore":"{count} more…","supportPlanned":"{type} support is planned but not available yet.","sure":"Confirm?","tlsCertificateChanged":"The printer certificate changed. Connection blocked.","tlsPermissionRequired":"Allow printer access in OrcaSlicer, then retry the certificate check.","tlsProbeFailed":"Could not read the certificate. Check the printer and try again.","tlsTrustBusy":"The printer is in use. Wait for the operation to finish.","tlsTrustButton":"Certificates…","tlsTrustConfirm":"Trust this certificate","tlsTrustCurrent":"Saved SHA-256","tlsTrustDetails":"Details","tlsTrustFtps":"Files (FTPS 990)","tlsTrustIntro":"Confirm certificates only on a network you trust. The first connection does not prove the printer’s identity.","tlsTrustMqtt":"Status and commands (MQTT 8883)","tlsTrustNoPin":"Not confirmed","tlsTrustObserved":"Received SHA-256","tlsTrustProbe":"Read and trust","tlsTrustReplacement":"The certificate differs from the saved one. Confirm the replacement only if you expected this change, for example after replacing or resetting the printer.","tlsTrustRequired":"Confirm the printer certificate before connecting.","tlsTrustSaveFailed":"Could not save certificate confirmation.","tlsTrustSaved":"Certificate confirmed.","tlsTrustStale":"Printer settings changed or confirmation expired. Read the certificate again.","tlsTrustTitle":"Bambu certificates","tlsTrustWorking":"Reading certificate…","toolActive":"active tool","toolDetails":"{tool} · Current: {current} · Target: {target} · {state}","toolInactive":"inactive tool","toolViewOnly":"View details only; does not change the active tool","unassignedDelete":"Delete","unassignedDeleteAll":"Delete all","unassignedDeleteAllConfirm":"Delete all {count} files not linked to a printer ({size}) from Print Farm storage? Copies on printers are not affected.","unassignedDeleteConfirm":"Delete {name} ({size}) from Print Farm storage? Copies on printers are not affected.","unassignedHeading":"Files not linked to a printer: {count} · {size}","unassignedNoPrinter":"No printer is ready. It must be online, idle and accept uploads.","unassignedSend":"Send to printer…","unassignedUpload":"Upload only","unassignedUploadStart":"Upload and start","unassignedWhy":"No printer in the panel matches the printer profile in this file. You can send it once to a printer you choose; nothing gets linked.","unavailableSuffix":"not available yet","unmatchedQueued":"{count} queued file(s) match no printer on the dashboard","uploadShort":"Upload","uploadToPrinterTitle":"Upload a file to this printer without starting a print","uploadToPrinters":"Upload {name} to {count} printer(s):","uploadUnverifiedHardware":"Upload is unavailable: not verified on hardware yet","uploadedNotStarted":"uploaded (not started)","useAms":"Use AMS (Bambu)","webuiAddress":"Web UI address (optional)","webuiFallbackHelp":"If this page keeps loading, select and copy the address into a browser. A separate Web UI port can be set in Connection.","webuiHelp":"Page not loading?"},"es":{"accessCode":"Código de acceso","add":"Añadir","addConfiguredTitle":"Añadir una impresora configurada en OrcaSlicer","addPrinter":"Añadir impresora…","all":"todas","bambuError":"Error de la impresora {code}","bambuLayer":"capa {current}/{total}","bambuLeftHM":"Quedan {hours} h {minutes} min","bambuLeftM":"Quedan {minutes} min","bed":"Cama","busy":"{printer}: la impresora está ocupada ({state})","busyNotStarted":"{printer}: impresora ocupada ({state}); no se ha iniciado.","cameraButton":"Cámara en vivo","cameraCapturedAt":"Capturado {time}","cameraClose":"Cerrar la cámara","cameraLoadFailed":"La imagen no se cargó aquí. Esta ventana puede bloquear imágenes de la red local.","cameraLoading":"Conectando con la cámara…","cameraMode":"Cámara","cameraModeAuto":"Webcam configurada","cameraModeU1":"Cámara original Snapmaker U1","cameraNativeSession":"Sesión de cámara abierta","cameraNone":"Esta impresora no tiene ninguna cámara configurada.","cameraOpenWindow":"Abrir la cámara en una ventana","cameraPermissionDenied":"Trabajo en segundo plano denegado. Permítelo y vuelve a abrir la cámara.","cameraReceivedAt":"Recibido {time}","cameraTitle":"Cámara: {printer}","cameraUnavailable":"No se pudo acceder a la cámara.","cancel":"Cancelar","cfgAutoDelete":"Eliminar automáticamente las copias antiguas","cfgAutoDeleteAge":"Eliminar copias de más de","cfgAutoDeleteHint":"Desactivado por defecto. Se comprueba al iniciar y una vez al día; solo se eliminan copias de este plugin, nunca archivos en uso.","cfgClearConfirm":"¿Borrar el diario de impresión? Esta acción no se puede deshacer.","cfgClearDone":"Solicitado. El diario se borra la próxima vez que el panel lea los ajustes.","cfgClearHistory":"Borrar el diario de impresión","cfgDays":"{days} días","cfgJournalOrca":"Registrar en el diario los envíos e impresiones iniciados desde Orca","cfgJournalOrcaHint":"Solo los trabajos que notifica el propio OrcaSlicer.","cfgKeepAll":"Todos","cfgKeepCopies":"Guardar copias de los archivos laminados","cfgKeepCopiesHint":"Permite enviar un laminado a una impresora más tarde. Si está desactivado, no se copia nada.","cfgKeepHistory":"Guardar el diario de impresión","cfgKeepHistoryHint":"Si está desactivado, no se registran entradas nuevas; las existentes se conservan.","cfgKeepLast":"Conservar solo los últimos laminados por impresora","cfgKeepLastHint":"Al guardar un laminado nuevo se eliminan las copias antiguas sin enviar de la misma impresora. Las copias vinculadas al registro de impresión se conservan.","cfgPauseHidden":"No sondear mientras el panel no esté visible","cfgPauseHiddenHint":"Ahorra solicitudes de red mientras la pestaña o ventana está oculta.","cfgPollInterval":"Intervalo de sondeo de impresoras","cfgProfileHint":"Aviso si el plugin no está seleccionado en el perfil de proceso","cfgProfileHintHint":"Se muestra en el panel cuando un laminado no llegó a este plugin.","cfgSeconds":"{seconds} s","close":"Cerrar","comingLater":"próximamente","commandFailed":"{printer}: {action} falló — {error}","commandSent":"{printer}: {action} enviado.","confirmTitle":"¿Iniciar la impresión en varias impresoras?","confirmUploadTitle":"¿Cargar el archivo en las impresoras seleccionadas?","connectionOptions":"Conexión","connectionOptionsFailed":"No se pudo guardar. Comprueba la dirección.","connectionOptionsHelp":"Usa el mismo host e indica el puerto web.","connectionSave":"Guardar","connectionTypeTitle":"Tipo de conexión. Las funciones disponibles dependen del protocolo de la impresora y de su estado actual.","controlsUnverified":"Pausar y detener no están disponibles para esta conexión (no verificado en el hardware)","crealityWsPortPlaceholder":"Puerto WS (9999)","crealityWsPortTitle":"Opcional. Puerto del WebSocket de estado de la impresora. 9999 es un valor predeterminado no confirmado; cámbielo si su impresora usa otro puerto.","credentialLegacyWarning":"Las claves de {count} impresoras siguen en texto plano. Muévelas al almacén del sistema. Las copias antiguas permanecen.","credentialMigrate":"Mover claves","credentialMigrationConfirm":"¿Mover las claves al almacén del sistema? Las copias antiguas permanecen.","credentialMigrationDone":"Claves movidas al almacén del sistema.","credentialRetry":"Reintentar acceso","credentialSaveFailed":"No se pudieron guardar las claves de forma segura. Impresora no guardada.","credentialUnavailable":"Almacén de claves no disponible. Conexión bloqueada.","dashboardOpened":"Panel de Print Farm abierto.","duetPasswordPlaceholder":"Contraseña de la máquina Duet","errorNeedsAccessCode":"se requiere el código de acceso de la impresora","errorNeedsBambuCredentials":"se requieren la IP, el código de acceso y el número de serie de la impresora","errorNoAddress":"falta la dirección de la impresora","errorOutcomeUnknown":"puede que la impresora haya recibido la solicitud o no; compruebe la impresora antes de volver a intentarlo","errorPrintCommand":"error en el comando de impresión: {error}","errorUnknownAction":"acción de impresora desconocida","errorUnknownSerial":"cargado, pero aún se desconoce el número de serie de la impresora; inicie la impresión desde la propia impresora","errorUnsupportedBackend":"este tipo de conexión de impresora no es compatible","errorUpload":"error al cargar: {error}","errorUploadUnverified":"el archivo se cargó, pero no se pudo verificar su tamaño en la impresora, así que no se inició la impresión","errorUploadedNotStarted":"el archivo se cargó, pero no se inició la impresión: {error}","feedbackButton":"Comentarios","feedbackCopied":"Copiado","feedbackCopy":"Copiar","feedbackHelp":"Copia la dirección en un navegador y usa el botón de comentarios del sitio. No se envían datos de impresoras. “Beta Feedback”.","file3mfWarning":".3mf solo se puede iniciar en impresoras Bambu; las demás esperan G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Error de envío: no se pudo leer el archivo.","fileTargetMismatch":"{printer}: el archivo en cola no corresponde a esta impresora; la impresión no se ha iniciado.","flashforgeCheckCodePlaceholder":"Código de verificación (en la pantalla de la impresora)","flashforgeCheckCodeTitle":"Código de verificación de la pantalla de la impresora. El modo LAN debe estar activado en la impresora.","flashforgeErrAuth":"Número de serie o código de verificación incorrecto.","flashforgeErrCredentials":"Introduzca el número de serie y el código de verificación.","flashforgeErrIdentity":"No se pudo verificar el modelo de la impresora.","flashforgeErrLanMode":"Active el modo LAN en la impresora.","flashforgeErrUnsupportedModel":"Este modelo de FlashForge no es compatible (solo Adventurer 5M, 5M Pro y AD5X).","flashforgeSerialPlaceholder":"Número de serie","flashforgeSerialTitle":"Número de serie de la impresora que aparece en su pantalla (Ajustes > Acerca de o Red). El modo LAN debe estar activado.","fleetAttention":"Requieren atención","fleetIdle":"Libres","fleetPrinting":"Imprimiendo","foundOnNetwork":"encontrado en la red","genericError":"error","history":"Historial de impresión","historyCoverage":"Historial de impresión observado localmente. Incluye las impresiones iniciadas por Print Farm y los trabajos detectados con este panel abierto; puede faltar lo ocurrido mientras OrcaSlicer no estaba en ejecución.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Aún no se han observado impresiones para esta impresora.","historyFromOrca":"notificado por OrcaSlicer","historyLoading":"Cargando historial de impresión…","historyObserved":"observado por Print Farm","historyProgress":"{progress}%","historyStartedHere":"iniciado por Print Farm","historyStateCancelled":"cancelado","historyStateCompleted":"completado","historyStateEnded":"finalizado","historyStateFailed":"fallido","historyStatePaused":"pausado","historyStatePrinting":"imprimiendo","historyStateSent":"enviado","historyTitle":"Historial de impresión: {printer}","historyUnknownFile":"Archivo desconocido","integrationUnavailable":"La integración de la impresora aún no está disponible","journalActiveCount":"{count} activos","journalAllCount":"{count} registrados","journalBlockedByHold":"una operación anterior de esta impresora sigue sin resolverse; abra el diario de impresión y libere el bloqueo tras comprobar la impresora","journalButton":"Diario de impresión","journalCompletedCount":"{count} completados","journalEmptyAll":"Aún no hay impresiones registradas.","journalFileDelete":"Eliminar archivo","journalFileUnsent":"Laminado, no enviado","journalHoldLocked":"Esta operación aún se está enviando y todavía no se puede liberar.","journalHoldReleased":"Bloqueo liberado. La operación anterior sigue sin verificar.","journalHoldState":"Estado: {state}","journalHoldUnavailable":"No hay detalles de la operación sin resolver. Pruebe a volver a abrir el diario de impresión.","journalHoldsHeading":"Operaciones sin resolver: compruebe en persona la impresora, el trabajo y la cama antes de liberar un bloqueo.","journalNoResults":"No hay impresiones que coincidan.","journalPrinter":"Impresora","journalReleaseConfirm":"¿Liberar este bloqueo tras comprobar en persona la impresora, el trabajo y la cama de «{target}»? Solo desbloquea un intento futuro; no marca la impresión anterior como correcta ni la reintenta.","journalReleaseHold":"Liberar bloqueo","journalResend":"Enviar de nuevo…","journalResultsCount":"{count} resultados","journalSearchLabel":"Buscar en el diario de impresión","journalSearchPlaceholder":"Buscar archivo o impresora…","journalSendConfirm":"¿Cargar {name} en {printer} sin iniciar la impresión?","journalStoreUnavailable":"El diario de impresión no está disponible. Compruebe el almacenamiento local del plugin.","journalTitle":"Diario de impresión","legacyImportBlocked":"Tus datos siguen en la carpeta anterior. Este conjunto no se puede importar automáticamente.","legacyImportButton":"Importar datos anteriores","legacyImportConfirm":"Esto copia los datos y las credenciales locales al almacenamiento local de este plugin de OrcaSlicer. Se conservará la copia anterior. ¿Continuar?","legacyImportDetail":"Se encontraron datos anteriores: {printers} impresoras, {history} registros de historial, {outbox} elementos en cola y {files} archivos.","legacyImportDone":"Importación completada.","legacyImportFailed":"No se pudieron importar los datos anteriores.","loading":"Cargando…","massFailed":", {count} con error","massResult":"Enviado a {count} impresora(s){failed}.","namePlaceholder":"Nombre","networkPermissionRequired":"Permite el acceso a la impresora en OrcaSlicer. Si está disponible, ve a Complementos → Print Farm → Permisos. Después, haz clic en «Actualizar» en la tarjeta de esta impresora.","noPrinters":"No se encontraron impresoras. Configure un host de impresora en OrcaSlicer o agregue uno arriba.","notReachable":"{printer}: impresora no accesible","notReachableNotStarted":"{printer}: impresora no accesible; no se ha iniciado.","nozzle":"Boquilla","octoprintApiKeyPlaceholder":"Clave API de OctoPrint","open":"Interfaz web","operatorStartCheck":"He comprobado que el archivo laminado y la placa seleccionada son adecuados para esta impresora, que los materiales y las herramientas son correctos y que la cama está despejada.","other":"Otro","outboxCopiesOff":"Las copias de laminados están desactivadas en los ajustes del plugin.","outboxFallbackName":"laminado {stamp}","outboxHintText":"No hay ningún plugin Printers Outbox seleccionado en el perfil de proceso: no se guardan las copias de los laminados.","outboxHintWhere":"Selecciónelo en Proceso → Otros → Plugin de la canalización de laminado.","outboxNotReady":"Archivo G-code aún no listo","outboxPrinterUsage":"Impresora: {name} · carpeta: {folder} · {count} archivos · {size}. Revíselos o elimínelos abajo.","outboxQueued":"{name} puesto en cola para {target}","outboxRemoveFailed":"No se pudo eliminar el archivo guardado. Sigue en la lista para que pueda volver a intentarlo.","outboxStorageCleanBlocked":"Los restos solo se pueden eliminar mientras no haya una carga o impresión en curso y el índice de archivos esté en buen estado.","outboxStorageCleanButton":"Eliminar restos ({count} archivos, {size})","outboxStorageCleanConfirm":"¿Eliminar {count} archivos sobrantes ({size}) del almacenamiento de Print Farm? Los archivos en cola de las impresoras no se tocan.","outboxStorageCleanDone":"Se eliminaron {count} archivos sobrantes ({size}).","outboxStorageCleanFailed":"No se pudieron eliminar {count} archivos: {paths}. Inténtelo de nuevo.","outboxStorageEmpty":"No se encontraron archivos de cola ni copias de recuperación.","outboxStorageEntry":"{label}: {count} archivos · {size} · {path}","outboxStorageKindIncoming":"Cargas preparadas","outboxStorageKindIndex":"Índice de cola","outboxStorageKindIndexBackup":"Copia de seguridad del índice de la cola","outboxStorageKindLoose":"Archivos sueltos u huérfanos","outboxStorageKindRecovery":"Archivos de recuperación heredados","outboxStorageKindUnassigned":"Archivos sin asignar","outboxStorageManualCleanup":"Los archivos sobrantes (sueltos, subidas preparadas, copias de recuperación, copias del índice) se eliminan con el botón de abajo. Los archivos en cola de las impresoras se quitan uno a uno.","outboxStorageScanFailed":"No se pudieron revisar todas las rutas de almacenamiento: {paths}. Los totales pueden estar incompletos.","outboxStorageWarning":"El almacenamiento crece; elimine los archivos en cola que ya no necesite.","outboxUnassigned":"Archivos sin asignar: {count} · {size}. Revíselos y elimínelos manualmente abajo.","outboxWriteFailed":"No se pudo conservar el archivo G-code","outboxWrongStep":"No es el paso de post-procesado del G-code","pause":"Pausa","plateLabel":"Placa","preparedUploadDiscardFailed":"No se pudo eliminar la copia temporal de la carga; revise el almacenamiento.","print":"Imprimir…","printShort":"Imprimir","printerBusy":"La impresora está ocupada","printerIpPlaceholder":"192.168.0.42 (IP de la impresora)","printerNotOnline":"La impresora no está en línea","prusalinkApiKeyPlaceholder":"Clave API de PrusaLink","queueLess":"Mostrar menos","queueMore":"Mostrar {count} más","refresh":"Actualizar","remove":"Eliminar","removeRetainedTitle":"Eliminar la copia conservada","repetierApiKeyPlaceholder":"Clave API de Repetier","repetierLoadFailed":"No se pudo cargar la impresora Repetier. Comprueba dirección, clave y lista.","repetierLoadPrinters":"Cargar impresoras","repetierModeUnsupported":"Escritura no verificada para esta versión o conexión. Solo estado.","repetierNotReady":"El servidor no confirmó que la impresora acepte órdenes.","repetierRequestAccepted":"Solicitud aceptada; el trabajo puede esperar en la cola del servidor. El siguiente estado confirmará la impresión.","repetierSelectPrinter":"Elegir impresora","resume":"Reanudar","select":"seleccionar","selectAllTitle":"Seleccionar o anular la selección de todas las impresoras disponibles","selfSigned":"autofirmado","selfSignedTitle":"Activar solo para una impresora servida por HTTPS con un certificado autofirmado. Las impresoras HTTP sin cifrar en la red local no lo necesitan.","send":"Enviar","sendFailed":"{printer}: error de envío — {error}","sendSelected":"Enviar G-code a la selección…","sendSelectedCount":"Enviar G-code a {count} seleccionadas…","sendToPrinterTitle":"Enviar a esta impresora y comenzar a imprimir","sendingFile":"Enviando {name} a {count} impresora(s)…","sentToPrint":"enviado a imprimir","serialAuto":"Número de serie (automático)","serialTitle":"El número de serie se detecta automáticamente. Indíquelo solo para fijar una impresora concreta. Se usa el puerto MQTT 8883.","startApprovalExpired":"La confirmación de inicio ha caducado o han cambiado los parámetros; vuelva a comprobarlo.","startBedClear":"La cama está libre y lista para una nueva impresión.","startBlocked":"Inicio bloqueado para {printer}: {reason}","startCompatibilityUnknown":"No se pudo confirmar la compatibilidad del archivo laminado con esta impresora. Puede cargarlo sin iniciar la impresión.","startConfirmMissing":"Inicio cancelado: confirme que la cama está despejada y, cuando se pida, que el archivo es adecuado para la impresora.","startFileCheck":"He comprobado que este archivo está laminado para esta impresora exacta.","startImmediately":"Iniciar la impresión justo después de cargar","startPrint":"Iniciar impresión","startReasonFileKind":"Este tipo de archivo no se puede iniciar en esta impresora.","startReasonNoStart":"Iniciar impresiones desde Print Farm aún no está disponible para esta conexión. Puede cargar el archivo.","startReasonPlate":"La placa seleccionada no coincide con este archivo.","startReasonProfileMatch":"El archivo se laminó con el perfil de OrcaSlicer de esta impresora.","startReasonProfileUnknown":"Print Farm no puede saber por el archivo para qué impresora se laminó.","startReasonProject":"Es un archivo de proyecto sin laminar. Lamínelo primero.","startReasonSlicedOnly":"Esta impresora solo inicia archivos 3MF laminados, no G-code simple.","startReasonUnsupported":"Este tipo de conexión aún no es compatible.","startReviewTitle":"Confirmar cada impresión","startVerdictCompatible":"Compatible","startVerdictIncompatible":"Incompatible","startVerdictUnknown":"Revisar manualmente","startWillStart":"Impresoras que se iniciarán: {count}","stateAborted":"abortado","stateBusy":"ocupado","stateChecking":"comprobando","stateComplete":"completado","stateError":"error","stateFailed":"fallido","stateIdle":"inactivo","stateOffline":"fuera de línea","stateOnline":"en línea","statePaused":"pausado","statePrinting":"imprimiendo","stateStandby":"en espera","stateUnavailable":"aún no disponible","stateUnknown":"desconocido","stop":"Detener","storageBar":"Almacenamiento: {count} archivos · {size}","storageGroupTitle":"{name} · {count} archivos · {size}","storageMore":"{count} más…","supportPlanned":"La compatibilidad con {type} está planificada pero aún no está disponible.","sure":"¿Confirmar?","tlsCertificateChanged":"El certificado de la impresora ha cambiado. Conexión bloqueada.","tlsPermissionRequired":"Permite el acceso a la impresora en OrcaSlicer y repite la comprobación del certificado.","tlsProbeFailed":"No se pudo leer el certificado. Comprueba la impresora e inténtalo de nuevo.","tlsTrustBusy":"La impresora está en uso. Espera a que termine la operación.","tlsTrustButton":"Certificados…","tlsTrustConfirm":"Confiar en este certificado","tlsTrustCurrent":"SHA-256 guardado","tlsTrustDetails":"Detalles","tlsTrustFtps":"Archivos (FTPS 990)","tlsTrustIntro":"Confirma los certificados solo en una red de confianza. La primera conexión no demuestra la identidad de la impresora.","tlsTrustMqtt":"Estado y comandos (MQTT 8883)","tlsTrustNoPin":"Sin confirmar","tlsTrustObserved":"SHA-256 recibido","tlsTrustProbe":"Leer y confiar","tlsTrustReplacement":"El certificado no coincide con el guardado. Confirma el reemplazo solo si esperabas este cambio, por ejemplo, tras sustituir o restablecer la impresora.","tlsTrustRequired":"Confirma el certificado de la impresora antes de conectar.","tlsTrustSaveFailed":"No se pudo guardar la confirmación del certificado.","tlsTrustSaved":"Certificado confirmado.","tlsTrustStale":"La configuración de la impresora ha cambiado o la confirmación ha caducado. Vuelve a leer el certificado.","tlsTrustTitle":"Certificados de Bambu","tlsTrustWorking":"Leyendo certificado…","toolActive":"herramienta activa","toolDetails":"{tool} · Actual: {current} · Objetivo: {target} · {state}","toolInactive":"herramienta inactiva","toolViewOnly":"Solo muestra detalles; no cambia la herramienta activa","unassignedDelete":"Eliminar","unassignedDeleteAll":"Eliminar todo","unassignedDeleteAllConfirm":"¿Eliminar los {count} archivos sin impresora asociada ({size}) del almacenamiento de Print Farm? Las copias en las impresoras no se ven afectadas.","unassignedDeleteConfirm":"¿Eliminar {name} ({size}) del almacenamiento de Print Farm? Las copias en las impresoras no se ven afectadas.","unassignedHeading":"Archivos sin impresora asignada: {count} · {size}","unassignedNoPrinter":"Ninguna impresora está lista. Debe estar en línea, inactiva y aceptar cargas.","unassignedSend":"Enviar a una impresora…","unassignedUpload":"Solo cargar","unassignedUploadStart":"Cargar e iniciar","unassignedWhy":"Ninguna impresora del panel coincide con el perfil de impresora de este archivo. Puede enviarlo una sola vez a la impresora que elija; no se crea ningún vínculo.","unavailableSuffix":"aún no disponible","unmatchedQueued":"{count} archivo(s) en cola no coinciden con ninguna impresora del panel","uploadShort":"Cargar","uploadToPrinterTitle":"Cargar el archivo en esta impresora sin iniciar la impresión","uploadToPrinters":"Cargar {name} en {count} impresora(s):","uploadUnverifiedHardware":"La carga no está disponible: aún no verificada en el hardware","uploadedNotStarted":"cargado (sin iniciar)","useAms":"Usar AMS (Bambu)","webuiAddress":"Dirección web (opcional)","webuiFallbackHelp":"Si la página sigue cargando, copia la dirección en un navegador. Cambia el puerto web en Conexión.","webuiHelp":"¿No carga la página?"},"eu":{"accessCode":"Sarbide-kodea","add":"Gehitu","addConfiguredTitle":"Gehitu OrcaSlicer-en konfiguratutako inprimagailu bat","addPrinter":"Gehitu inprimagailu bat…","all":"guztiak","bambuError":"Inprimagailuaren errorea {code}","bambuLayer":"geruza {current}/{total}","bambuLeftHM":"{hours} h {minutes} min falta dira","bambuLeftM":"{minutes} min falta dira","bed":"Ohea","busy":"{printer}: inprimagailua lanpetuta dago ({state})","busyNotStarted":"{printer}: inprimagailua lanpetuta dago ({state}) — ez da hasi.","cameraButton":"Zuzeneko kamera","cameraCapturedAt":"Hartua {time}","cameraClose":"Itxi kamera","cameraLoadFailed":"Irudia ez da hemen kargatu. Leiho honek sare lokaleko irudiak blokeatu ditzake.","cameraLoading":"Kamerara konektatzen…","cameraMode":"Kamera","cameraModeAuto":"Konfiguratutako webcam-a","cameraModeU1":"Snapmaker U1 jatorrizko kamera","cameraNativeSession":"Kamera-saioa irekita","cameraNone":"Inprimagailu honek ez du konfiguratutako kamerarik.","cameraOpenWindow":"Ireki kamera leiho batean","cameraPermissionDenied":"Atzeko lana ukatu da. Baimendu eta ireki berriro kamera.","cameraReceivedAt":"Jasoa {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Ezin izan da kamerara konektatu.","cancel":"Utzi","cfgAutoDelete":"Ezabatu kopia zaharrak automatikoki","cfgAutoDeleteAge":"Ezabatu honek baino zaharragoak diren kopiak","cfgAutoDeleteHint":"Lehenespenez desaktibatuta. Abiaraztean eta egunean behin egiaztatzen da; plugin honen kopiak soilik ezabatzen dira, inoiz ez erabileran dauden fitxategiak.","cfgClearConfirm":"Inprimatze-egunkaria garbitu? Ekintza ezin da desegin.","cfgClearDone":"Eskatuta. Egunkaria garbituko da panelak hurrengoan ezarpenak irakurtzen dituenean.","cfgClearHistory":"Garbitu inprimatze-egunkaria","cfgDays":"{days} egun","cfgJournalOrca":"Erregistratu egunkarian Orcatik hasitako bidalketak eta inprimaketak","cfgJournalOrcaHint":"OrcaSlicer-ek berak jakinarazitako lanak soilik.","cfgKeepAll":"Guztiak","cfgKeepCopies":"Gorde xerratutako fitxategien kopiak","cfgKeepCopiesHint":"Xerra geroago inprimagailu batera bidaltzeko aukera ematen du. Desaktibatuta, ez da ezer kopiatzen.","cfgKeepHistory":"Gorde inprimatze-egunkaria","cfgKeepHistoryHint":"Desaktibatuta, sarrera berriak ez dira erregistratzen; daudenak mantentzen dira.","cfgKeepLast":"Gorde inprimagailuko azken xaflak soilik","cfgKeepLastHint":"Xafla berri bat gordetzean, inprimagailu bereko bidali gabeko kopia zaharrak ezabatzen dira. Inprimatze-egunkariari lotutako kopiak mantentzen dira.","cfgPauseHidden":"Ez galdetu panela ikusgai ez dagoen bitartean","cfgPauseHiddenHint":"Sare-eskaerak aurrezten ditu fitxa edo leihoa ezkutuan dagoen bitartean.","cfgPollInterval":"Inprimagailuen galdeketa-tartea","cfgProfileHint":"Oharra plugina prozesu-profilean hautatuta ez dagoenean","cfgProfileHintHint":"Panelean agertzen da xerra plugin honetara iritsi ez denean.","cfgSeconds":"{seconds} s","close":"Itxi","comingLater":"laster","commandFailed":"{printer}: {action} huts egin du — {error}","commandSent":"{printer}: {action} bidali da.","confirmTitle":"Hainbat inprimagailutan inprimatzen hasi nahi duzu?","confirmUploadTitle":"Fitxategia hautatutako inprimagailuetara kargatu nahi duzu?","connectionOptions":"Konexioa","connectionOptionsFailed":"Ezin izan da gorde. Egiaztatu helbidea.","connectionOptionsHelp":"Erabili inprimagailuaren ostalaria eta zehaztu web ataka.","connectionSave":"Gorde","connectionTypeTitle":"Konexio mota. Eskuragarri dauden funtzioak inprimagailuaren protokoloaren eta uneko egoeraren araberakoak dira.","controlsUnverified":"Pausa eta gelditzea ez daude erabilgarri konexio honetarako (hardwarean egiaztatu gabe)","crealityWsPortPlaceholder":"WS ataka (9999)","crealityWsPortTitle":"Aukerakoa. Inprimagailuaren egoera-WebSocketaren ataka. 9999 baieztatu gabeko balio lehenetsia da; aldatu zure inprimagailuak beste ataka bat erabiltzen badu.","credentialLegacyWarning":"{count} inprimagailuren gakoak testu arruntean daude oraindik. Eraman sistemaren biltegira. Babeskopia zaharrak mantenduko dira.","credentialMigrate":"Eraman gakoak","credentialMigrationConfirm":"Gakoak sistemaren biltegira eraman? Babeskopia zaharrak mantenduko dira.","credentialMigrationDone":"Gakoak sistemaren biltegira eraman dira.","credentialRetry":"Saiatu berriro sartzen","credentialSaveFailed":"Ezin izan dira gakoak seguru gorde. Inprimagailua ez da gorde.","credentialUnavailable":"Sistemaren biltegia ez dago erabilgarri. Konexioa blokeatuta.","dashboardOpened":"Print Farm-en panela ireki da.","duetPasswordPlaceholder":"Duet makinaren pasahitza","errorNeedsAccessCode":"inprimagailuaren sarbide-kodea behar da","errorNeedsBambuCredentials":"inprimagailuaren IPa, sarbide-kodea eta serie-zenbakia behar dira","errorNoAddress":"inprimagailuaren helbidea falta da","errorOutcomeUnknown":"inprimagailuak eskaera jaso zuen edo ez; egiaztatu inprimagailua berriro saiatu aurretik","errorPrintCommand":"inprimatzeko komandoak huts egin du: {error}","errorUnknownAction":"inprimagailuaren ekintza ezezaguna","errorUnknownSerial":"kargatuta, baina inprimagailuaren serie-zenbakia oraindik ezezaguna da — hasi inprimaketa inprimagailutik","errorUnsupportedBackend":"inprimagailu-konexio mota hau ez da onartzen","errorUpload":"kargak huts egin du: {error}","errorUploadUnverified":"fitxategia kargatu da, baina ezin izan da haren tamaina egiaztatu inprimagailuan, beraz ez da inprimaketa hasi","errorUploadedNotStarted":"fitxategia kargatu da, baina inprimaketa ez da hasi: {error}","feedbackButton":"Iritzia","feedbackCopied":"Kopiatuta","feedbackCopy":"Kopiatu","feedbackHelp":"Kopiatu helbidea nabigatzailean eta erabili webguneko iritzi-botoia. Ez da inprimagailu-daturik bidaltzen. “Beta Feedback”.","file3mfWarning":".3mf Bambu inprimagailuetan soilik abiarazten da; besteek G-code espero dute.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Bidalketak huts egin du: ezin izan da fitxategia irakurri.","fileTargetMismatch":"{printer}: ilarako fitxategia ez dator bat inprimagailu honekin; inprimaketa ez da hasi.","flashforgeCheckCodePlaceholder":"Egiaztatze-kodea (inprimagailuaren pantailan)","flashforgeCheckCodeTitle":"Inprimagailuaren pantailako egiaztatze-kodea. Inprimagailuan LAN modua gaituta egon behar da.","flashforgeErrAuth":"Serie-zenbakia edo egiaztatze-kodea okerra da.","flashforgeErrCredentials":"Sartu serie-zenbakia eta egiaztatze-kodea.","flashforgeErrIdentity":"Ezin izan da inprimagailuaren eredua egiaztatu.","flashforgeErrLanMode":"Aktibatu LAN modua inprimagailuan.","flashforgeErrUnsupportedModel":"FlashForge eredu hau ez da onartzen (Adventurer 5M, 5M Pro eta AD5X soilik).","flashforgeSerialPlaceholder":"Serie-zenbakia","flashforgeSerialTitle":"Inprimagailuaren serie-zenbakia, bere pantailan agertzen dena (Ezarpenak > Honi buruz edo Sarea). LAN modua aktibatuta egon behar da.","fleetAttention":"Arreta behar dute","fleetIdle":"Libre","fleetPrinting":"Inprimatzen","foundOnNetwork":"sarean aurkituta","genericError":"akatsa","history":"Inprimatze-historia","historyCoverage":"Lokalean behatutako inprimatze-historia. Print Farm-ek hasitako inprimaketak eta panel hau irekita zegoen bitartean detektatutako lanak biltzen ditu; OrcaSlicer martxan ez zegoenean egindakoak faltan izan daitezke.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Oraindik ez da inprimaketarik behatu inprimagailu honetan.","historyFromOrca":"OrcaSlicer-ek jakinarazita","historyLoading":"Inprimatze-historia kargatzen…","historyObserved":"Print Farm-ek behatua","historyProgress":"{progress}%","historyStartedHere":"Print Farm-ek hasita","historyStateCancelled":"bertan behera utzita","historyStateCompleted":"amaituta","historyStateEnded":"bukatuta","historyStateFailed":"huts egin zuen","historyStatePaused":"pausatuta","historyStatePrinting":"inprimatzen","historyStateSent":"bidalita","historyTitle":"Inprimatu historia — {printer}","historyUnknownFile":"Fitxategi ezezaguna","integrationUnavailable":"Inprimagailuen integrazioa ez dago eskuragarri oraindik","journalActiveCount":"{count} aktibo","journalAllCount":"{count} erregistratuta","journalBlockedByHold":"inprimagailu honen aurreko eragiketa bat ebatzi gabe dago; ireki inprimatze-egunkaria eta askatu blokeoa inprimagailua egiaztatu ondoren","journalButton":"Inprimatze-egunkaria","journalCompletedCount":"{count} amaituta","journalEmptyAll":"Oraindik ez dago inprimatzerik erregistratuta.","journalFileDelete":"Ezabatu fitxategia","journalFileUnsent":"Xerra, bidali gabe","journalHoldLocked":"Eragiketa hau oraindik bidaltzen ari da eta oraindik ezin da askatu.","journalHoldReleased":"Blokeoa askatu da. Eragiketa zaharra egiaztatu gabe dago.","journalHoldState":"Egoera: {state}","journalHoldUnavailable":"Ebatzi gabeko eragiketaren xehetasunak ez daude erabilgarri. Saiatu inprimatze-egunkaria berriro irekitzen.","journalHoldsHeading":"Ebatzi gabeko eragiketak — egiaztatu inprimagailua, lana eta ohea bertan, blokeoa askatu aurretik.","journalNoResults":"Ez dago bat datorren inprimaketarik.","journalPrinter":"Inprimagailua","journalReleaseConfirm":"Blokeo hau askatu, inprimagailua, lana eta ohea bertan egiaztatu ondoren (“{target}”)? Honek etorkizuneko saiakera bat desblokeatzen du soilik; ez du inprimaketa zaharra arrakastatsu gisa markatzen, ezta berriro saiatzen ere.","journalReleaseHold":"Askatu blokeoa","journalResend":"Bidali berriro…","journalResultsCount":"{count} emaitza","journalSearchLabel":"Bilatu inprimatze-egunkarian","journalSearchPlaceholder":"Bilatu fitxategia edo inprimagailua…","journalSendConfirm":"{name} kargatu nahi duzu hona: {printer}, inprimaketa hasi gabe?","journalStoreUnavailable":"Inprimatze-egunkaria ez dago erabilgarri. Egiaztatu pluginaren biltegiratze lokala.","journalTitle":"Inprimatze-egunkaria","legacyImportBlocked":"Datuak aurreko biltegian daude. Multzo hau ezin da automatikoki inportatu.","legacyImportButton":"Inportatu aurreko datuak","legacyImportConfirm":"Honek datuak eta kredentzial lokalak OrcaSlicer plugin honen biltegiratze lokalera kopiatzen ditu. Aurreko kopia gorde egingo da. Jarraitu?","legacyImportDetail":"Aurreko datuak aurkitu dira: {printers} inprimagailu, {history} historia-sarrera, {outbox} ilara-sarrera eta {files} fitxategi.","legacyImportDone":"Inportazioa osatu da.","legacyImportFailed":"Ezin izan dira aurreko datuak inportatu.","loading":"Kargatzen…","massFailed":", {count} huts egin du","massResult":"{count} inprimagailutara bidali da{failed}.","namePlaceholder":"Izena","networkPermissionRequired":"Baimendu inprimagailurako sarbidea OrcaSlicer-en. Aukera erabilgarri badago, joan Pluginak → Print Farm → Baimenak atalera. Ondoren, egin klik «Freskatu» inprimagailu honen txartelean.","noPrinters":"Ez da inprimagailurik aurkitu. Konfiguratu inprimagailu-ostalari bat OrcaSlicer-en edo gehitu bat goian.","notReachable":"{printer}: inprimagailua ez dago eskuragarri","notReachableNotStarted":"{printer}: inprimagailua ez dago eskuragarri — ez da hasi.","nozzle":"Pita","octoprintApiKeyPlaceholder":"OctoPrint API gakoa","open":"Web interfazea","operatorStartCheck":"Egiaztatu dut xerratutako fitxategia eta hautatutako plaka inprimagailu honetarako egokiak direla, materialak eta tresnak zuzenak direla eta ohea libre dagoela.","other":"Besteak","outboxCopiesOff":"Xerren kopiak desaktibatuta daude pluginaren ezarpenetan.","outboxFallbackName":"xerra {stamp}","outboxHintText":"Prozesu-profilean ez dago Printers Outbox plugina hautatuta; xerren kopiak ez dira gordetzen.","outboxHintWhere":"Hautatu Prozesua → Besteak → Xerratze-kanalizazioaren plugina atalean.","outboxNotReady":"G-code fitxategia ez dago oraindik prest","outboxPrinterUsage":"Inprimagailua: {name} · karpeta: {folder} · {count} fitxategi · {size}. Berrikusi edo kendu behean.","outboxQueued":"{name} ilaran jarri da ({target})","outboxRemoveFailed":"Ezin izan da gordetako fitxategia kendu. Zerrendan geratzen da berriro saia zaitezen.","outboxStorageCleanBlocked":"Hondarrak ezabatzeko, ez da kargarik edo inprimaketarik martxan egon behar, eta fitxategi-indizeak osasuntsu egon behar du.","outboxStorageCleanButton":"Ezabatu hondarrak ({count} fitxategi, {size})","outboxStorageCleanConfirm":"{count} hondar-fitxategi ({size}) ezabatu Print Farm-en biltegitik? Inprimagailuen ilaretako fitxategiak ez dira ukitzen.","outboxStorageCleanDone":"{count} hondar-fitxategi ezabatu dira ({size}).","outboxStorageCleanFailed":"Ezin izan dira {count} fitxategi ezabatu: {paths}. Saiatu berriro.","outboxStorageEmpty":"Ez da ilarako fitxategirik edo berreskuratze-kopiarik aurkitu.","outboxStorageEntry":"{label}: {count} fitxategi · {size} · {path}","outboxStorageKindIncoming":"Prestatutako kargak","outboxStorageKindIndex":"Ilararen indizea","outboxStorageKindIndexBackup":"Indizearen babeskopia","outboxStorageKindLoose":"Fitxategi solte edo umezurtzak","outboxStorageKindRecovery":"Berreskuratze-fitxategi zaharrak","outboxStorageKindUnassigned":"Esleitu gabeko fitxategiak","outboxStorageManualCleanup":"Hondar-fitxategiak (fitxategi solteak, prestatutako igoerak, berreskuratze-kopiak, indize-babeskopiak) beheko botoiarekin ezaba daitezke. Inprimagailuen ilaretako fitxategiak banan-banan kentzen dira.","outboxStorageScanFailed":"Ezin izan dira biltegiratze-bide guztiak aztertu: {paths}. Guztizkoak osatugabeak izan daitezke.","outboxStorageWarning":"Biltegiratzea hazten ari da; ezabatu jada behar ez dituzun ilarako fitxategiak.","outboxUnassigned":"Esleitu gabeko fitxategiak: {count} · {size}. Berrikusi eta kendu eskuz behean.","outboxWriteFailed":"Ezin izan da G-code fitxategia gorde","outboxWrongStep":"Hau ez da G-codearen postprozesatze-urratsa","pause":"Pausa","plateLabel":"Plaka","preparedUploadDiscardFailed":"Ezin izan da kargatutako fitxategiaren aldi baterako kopia ezabatu; egiaztatu biltegiratzea.","print":"Inprimatu…","printShort":"Inprimatu","printerBusy":"Inprimagailua lanpetuta dago","printerIpPlaceholder":"192.168.0.42 (inprimagailuaren IPa)","printerNotOnline":"Inprimagailua ez dago konektatuta","prusalinkApiKeyPlaceholder":"PrusaLink API gakoa","queueLess":"Erakutsi gutxiago","queueMore":"Erakutsi beste {count}","refresh":"Freskatu","remove":"Kendu","removeRetainedTitle":"Kendu gordetako kopia","repetierApiKeyPlaceholder":"Repetier API gakoa","repetierLoadFailed":"Ezin izan da Repetier inprimagailua kargatu. Egiaztatu helbidea, gakoa eta zerrenda.","repetierLoadPrinters":"Kargatu inprimagailuak","repetierModeUnsupported":"Bertsio edo konexio honen idazketa ez dago egiaztatuta. Egoera soilik.","repetierNotReady":"Zerbitzariak ez du baieztatu inprimagailuak aginduak onartzen dituenik.","repetierRequestAccepted":"Eskaera onartu da; lana zerbitzariaren ilaran egon daiteke. Hurrengo egoerak inprimatzea baieztatuko du.","repetierSelectPrinter":"Aukeratu inprimagailua","resume":"Berrekin","select":"hautatu","selectAllTitle":"Hautatu edo desautatu eskuragarri dauden inprimagailu guztiak","selfSigned":"autosinatua","selfSignedTitle":"Gaitu HTTPS bidez autosinatutako ziurtagiri batekin zerbitzatzen den inprimagailuetarako soilik. HTTP hutsa darabilten sare lokaleko inprimagailuek ez dute hau behar.","send":"Bidali","sendFailed":"{printer}: bidalketak huts egin du — {error}","sendSelected":"Bidali G-code hautatutakoei…","sendSelectedCount":"Bidali G-code hautatutako {count} inprimagailuei…","sendToPrinterTitle":"Bidali inprimagailu honetara eta hasi inprimatzen","sendingFile":"{name} {count} inprimagailutara bidaltzen…","sentToPrint":"inprimatzera bidali","serialAuto":"Serie-zenbakia (automatikoa)","serialTitle":"Serie-zenbakia automatikoki detektatzen da. Sartu bat inprimagailu zehatz bat finkatzeko soilik. MQTT 8883 ataka erabiltzen da.","startApprovalExpired":"Hasteko berrespena iraungi da edo parametroak aldatu dira; egiaztatu berriro.","startBedClear":"Ohea libre dago eta inprimaketa berrirako prest dago.","startBlocked":"{printer}: hasiera blokeatuta — {reason}","startCompatibilityUnknown":"Ezin izan da egiaztatu xerratutako fitxategia inprimagailu honekin bateragarria denik. Inprimaketa hasi gabe kargatu dezakezu.","startConfirmMissing":"Hasiera bertan behera utzi da: berretsi ohea libre dagoela eta, galdetzen denean, fitxategia inprimagailuarentzat egokia dela.","startFileCheck":"Egiaztatu dut fitxategi hau zehazki inprimagailu honetarako xerratu dela.","startImmediately":"Kargatu ondoren, berehala hasi inprimatzen","startPrint":"Hasi inprimatzen","startReasonFileKind":"Fitxategi mota hau ezin da inprimagailu honetan abiarazi.","startReasonNoStart":"Print Farm-etik inprimaketak hastea ez dago oraindik eskuragarri konexio honetan. Fitxategia kargatu dezakezu.","startReasonPlate":"Hautatutako plaka ez dator bat fitxategi honekin.","startReasonProfileMatch":"Fitxategia inprimagailu honen OrcaSlicer profilarekin xerratu da.","startReasonProfileUnknown":"Print Farm-ek ezin du fitxategitik jakin zein inprimagailutarako xerratu den.","startReasonProject":"Proiektu-fitxategi xerratu gabea da. Xerratu lehenik.","startReasonSlicedOnly":"Inprimagailu honek xerratutako 3MF fitxategiak soilik abiarazten ditu, ez G-code hutsa.","startReasonUnsupported":"Konexio mota hori ez da oraindik onartzen.","startReviewTitle":"Berretsi inprimaketa bakoitza","startVerdictCompatible":"Bateragarria","startVerdictIncompatible":"Bateraezina","startVerdictUnknown":"Egiaztatu eskuz","startWillStart":"Abiaraziko diren inprimagailuak: {count}","stateAborted":"geldiarazita","stateBusy":"lanpetuta","stateChecking":"egiaztatzen","stateComplete":"amaituta","stateError":"akatsa","stateFailed":"huts egin du","stateIdle":"zereginik gabe","stateOffline":"lineaz kanpo","stateOnline":"sarean","statePaused":"pausatuta","statePrinting":"inprimatzen","stateStandby":"egonean","stateUnavailable":"oraindik ez dago eskuragarri","stateUnknown":"ezezaguna","stop":"Gelditu","storageBar":"Biltegiratzea: {count} fitxategi · {size}","storageGroupTitle":"{name} · {count} fitxategi · {size}","storageMore":"{count} gehiago…","supportPlanned":"{type} euskarria aurreikusita dago, baina oraindik ez dago eskuragarri.","sure":"Berretsi?","tlsCertificateChanged":"Inprimagailuaren ziurtagiria aldatu da. Konexioa blokeatuta.","tlsPermissionRequired":"Baimendu inprimagailurako sarbidea OrcaSlicer-en eta saiatu berriro ziurtagiria egiaztatzen.","tlsProbeFailed":"Ezin izan da ziurtagiria irakurri. Egiaztatu inprimagailua eta saiatu berriro.","tlsTrustBusy":"Inprimagailua erabiltzen ari dira. Itxaron eragiketa amaitu arte.","tlsTrustButton":"Ziurtagiriak…","tlsTrustConfirm":"Fidatu ziurtagiri honetaz","tlsTrustCurrent":"Gordetako SHA-256","tlsTrustDetails":"Xehetasunak","tlsTrustFtps":"Fitxategiak (FTPS 990)","tlsTrustIntro":"Ziurtagiriak fidatzen zaren sare batean soilik berretsi. Lehen konexioak ez du inprimagailuaren identitatea egiaztatzen.","tlsTrustMqtt":"Egoera eta komandoak (MQTT 8883)","tlsTrustNoPin":"Berretsi gabe","tlsTrustObserved":"Jasotako SHA-256","tlsTrustProbe":"Irakurri eta fidatu","tlsTrustReplacement":"Ziurtagiria ez dator bat gordetakoarekin. Ordezkoa espero bazenu bakarrik berretsi, adibidez inprimagailua ordezkatu edo berrezarri ondoren.","tlsTrustRequired":"Berretsi inprimagailuaren ziurtagiria konektatu aurretik.","tlsTrustSaveFailed":"Ezin izan da ziurtagiriaren berrespena gorde.","tlsTrustSaved":"Ziurtagiria berretsita.","tlsTrustStale":"Inprimagailuaren ezarpenak aldatu dira edo berrespena iraungi da. Irakurri ziurtagiria berriro.","tlsTrustTitle":"Bambu ziurtagiriak","tlsTrustWorking":"Ziurtagiria irakurtzen…","toolActive":"tresna aktiboa","toolDetails":"{tool} · Unekoa: {current} · Helburua: {target} · {state}","toolInactive":"tresna ez-aktiboa","toolViewOnly":"Xehetasunak soilik; ez du tresna aktiboa aldatzen","unassignedDelete":"Ezabatu","unassignedDeleteAll":"Ezabatu guztiak","unassignedDeleteAllConfirm":"Print Farm-en biltegitik inprimagailurik gabeko {count} fitxategiak ({size}) ezabatu nahi dituzu? Inprimagailuetako kopiei ez zaie eragingo.","unassignedDeleteConfirm":"{name} ({size}) Print Farm-en biltegitik ezabatu? Inprimagailuetako kopiei ez die eragiten.","unassignedHeading":"Inprimagailurik gabeko fitxategiak: {count} · {size}","unassignedNoPrinter":"Ez dago inprimagailu prestik. Linean eta zereginik gabe egon behar du, eta kargak onartu.","unassignedSend":"Bidali inprimagailura…","unassignedUpload":"Kargatu soilik","unassignedUploadStart":"Kargatu eta hasi","unassignedWhy":"Panelko ezein inprimagailuk ez dator bat fitxategi honen inprimagailu-profilarekin. Behin bidali dezakezu aukeratzen duzun inprimagailura; ez da loturarik sortzen.","unavailableSuffix":"oraindik ez dago eskuragarri","unmatchedQueued":"Panelean inprimagailurik ez duten ilarako fitxategiak: {count}","uploadShort":"Kargatu","uploadToPrinterTitle":"Kargatu fitxategia inprimagailu honetara inprimaketa hasi gabe","uploadToPrinters":"Kargatu {name} {count} inprimagailutara:","uploadUnverifiedHardware":"Karga ez dago erabilgarri: oraindik ez dago hardwarean egiaztatuta","uploadedNotStarted":"kargatuta (hasi gabe)","useAms":"Erabili AMS (Bambu)","webuiAddress":"Web helbidea (aukerakoa)","webuiFallbackHelp":"Kargak jarraitzen badu, kopiatu helbidea nabigatzailean. Web ataka Konexioan ezar daiteke.","webuiHelp":"Orria ez da kargatzen?"},"fr":{"accessCode":"Code d'accès","add":"Ajouter","addConfiguredTitle":"Ajouter une imprimante configurée dans OrcaSlicer","addPrinter":"Ajouter une imprimante…","all":"tous","bambuError":"Erreur imprimante {code}","bambuLayer":"couche {current}/{total}","bambuLeftHM":"{hours} h {minutes} min restantes","bambuLeftM":"{minutes} min restantes","bed":"Plateau","busy":"{printer} : l'imprimante est occupée ({state})","busyNotStarted":"{printer} : imprimante occupée ({state}) — impression non lancée.","cameraButton":"Caméra en direct","cameraCapturedAt":"Capture {time}","cameraClose":"Fermer la caméra","cameraLoadFailed":"L'image ne s'est pas chargée ici. Cette fenêtre peut bloquer les images du réseau local.","cameraLoading":"Connexion à la caméra…","cameraMode":"Caméra","cameraModeAuto":"Webcam configurée","cameraModeU1":"Caméra d’origine Snapmaker U1","cameraNativeSession":"Session caméra ouverte","cameraNone":"Aucune caméra n'est configurée sur cette imprimante.","cameraOpenWindow":"Ouvrir la caméra dans une fenêtre","cameraPermissionDenied":"Travail en arrière-plan refusé. Autorisez-le puis rouvrez la caméra.","cameraReceivedAt":"Réception {time}","cameraTitle":"Caméra : {printer}","cameraUnavailable":"La caméra est inaccessible.","cancel":"Annuler","cfgAutoDelete":"Supprimer automatiquement les anciennes copies","cfgAutoDeleteAge":"Supprimer les copies de plus de","cfgAutoDeleteHint":"Désactivé par défaut. Vérifié au démarrage et une fois par jour ; seules les copies de ce plugin sont supprimées, jamais les fichiers en cours d'utilisation.","cfgClearConfirm":"Effacer le journal d'impression ? Cette action est irréversible.","cfgClearDone":"Demande enregistrée. Le journal sera effacé à la prochaine lecture des paramètres par le panneau.","cfgClearHistory":"Effacer le journal d'impression","cfgDays":"{days} jours","cfgJournalOrca":"Enregistrer dans le journal les envois et impressions lancés depuis Orca","cfgJournalOrcaHint":"Uniquement les tâches signalées par OrcaSlicer lui-même.","cfgKeepAll":"Toutes","cfgKeepCopies":"Conserver des copies des fichiers découpés","cfgKeepCopiesHint":"Permet d'envoyer une découpe à une imprimante plus tard. Désactivé, rien n'est copié.","cfgKeepHistory":"Conserver le journal d'impression","cfgKeepHistoryHint":"Désactivé, les nouvelles entrées ne sont pas enregistrées ; les existantes restent.","cfgKeepLast":"Ne conserver que les dernières tranches par imprimante","cfgKeepLastHint":"Quand une nouvelle tranche est enregistrée, les anciennes copies non envoyées de la même imprimante sont supprimées. Les copies liées au journal d’impression restent.","cfgPauseHidden":"Ne pas interroger tant que le panneau n'est pas visible","cfgPauseHiddenHint":"Économise des requêtes réseau quand l'onglet ou la fenêtre est masqué.","cfgPollInterval":"Intervalle d'interrogation des imprimantes","cfgProfileHint":"Indice si le plugin n'est pas sélectionné dans le profil de traitement","cfgProfileHintHint":"Affiché dans le panneau quand une découpe n'a pas atteint ce plugin.","cfgSeconds":"{seconds} s","close":"Fermer","comingLater":"à venir","commandFailed":"{printer} : {action} a échoué — {error}","commandSent":"{printer} : {action} envoyée.","confirmTitle":"Lancer l'impression sur plusieurs imprimantes ?","confirmUploadTitle":"Téléverser le fichier sur les imprimantes sélectionnées ?","connectionOptions":"Connexion","connectionOptionsFailed":"Enregistrement impossible. Vérifiez l’adresse.","connectionOptionsHelp":"Conservez l’hôte de l’imprimante et précisez le port web.","connectionSave":"Enregistrer","connectionTypeTitle":"Type de connexion. Les fonctions disponibles dépendent du protocole de l'imprimante et de son état actuel.","controlsUnverified":"Pause et arrêt ne sont pas disponibles pour cette connexion (non vérifié sur le matériel)","crealityWsPortPlaceholder":"Port WS (9999)","crealityWsPortTitle":"Facultatif. Port du WebSocket d'état de l'imprimante. 9999 est une valeur par défaut non confirmée ; modifiez-la si votre imprimante utilise un autre port.","credentialLegacyWarning":"Les clés de {count} imprimantes restent en clair. Déplacez-les dans le coffre système. Les anciennes sauvegardes restent.","credentialMigrate":"Déplacer les clés","credentialMigrationConfirm":"Déplacer les clés dans le coffre système ? Les anciennes sauvegardes restent.","credentialMigrationDone":"Clés déplacées dans le coffre système.","credentialRetry":"Réessayer l’accès","credentialSaveFailed":"Échec du stockage sécurisé des clés. Imprimante non enregistrée.","credentialUnavailable":"Coffre système inaccessible. Connexion à l’imprimante bloquée.","dashboardOpened":"Tableau de bord Print Farm ouvert.","duetPasswordPlaceholder":"Mot de passe de la machine Duet","errorNeedsAccessCode":"un code d'accès à l'imprimante est requis","errorNeedsBambuCredentials":"l'adresse IP, le code d'accès et le numéro de série de l'imprimante sont requis","errorNoAddress":"l'adresse de l'imprimante est manquante","errorOutcomeUnknown":"l'imprimante a peut-être reçu la requête, peut-être pas ; vérifiez l'imprimante avant de réessayer","errorPrintCommand":"échec de la commande d'impression : {error}","errorUnknownAction":"action d'imprimante inconnue","errorUnknownSerial":"téléversé, mais le numéro de série de l'imprimante est encore inconnu — lancez l'impression depuis l'imprimante","errorUnsupportedBackend":"ce type de connexion d'imprimante n'est pas pris en charge","errorUpload":"échec du téléversement : {error}","errorUploadUnverified":"le fichier a été téléversé, mais sa taille n'a pas pu être vérifiée sur l'imprimante ; l'impression n'a donc pas été lancée","errorUploadedNotStarted":"le fichier a été téléversé, mais l'impression n'a pas été lancée : {error}","feedbackButton":"Commentaires","feedbackCopied":"Copié","feedbackCopy":"Copier","feedbackHelp":"Copiez l’adresse dans un navigateur puis utilisez le bouton de retour du site. Aucune donnée d’imprimante n’est envoyée. “Beta Feedback”.","file3mfWarning":".3mf ne démarre que sur les imprimantes Bambu — les autres attendent du G-code.","fileOperationDone":"{printer} : {name} {result}.","fileReadFailed":"Échec de l'envoi : impossible de lire le fichier.","fileTargetMismatch":"{printer} : le fichier en file d'attente ne correspond pas à cette imprimante — impression non lancée.","flashforgeCheckCodePlaceholder":"Code de vérification (sur l'écran de l'imprimante)","flashforgeCheckCodeTitle":"Code de vérification affiché sur l'écran de l'imprimante. Le mode LAN doit être activé sur l'imprimante.","flashforgeErrAuth":"Numéro de série ou code de vérification incorrect.","flashforgeErrCredentials":"Saisissez le numéro de série et le code de vérification.","flashforgeErrIdentity":"Le modèle de l'imprimante n'a pas pu être vérifié.","flashforgeErrLanMode":"Activez le mode LAN sur l'imprimante.","flashforgeErrUnsupportedModel":"Ce modèle FlashForge n'est pas pris en charge (uniquement Adventurer 5M, 5M Pro et AD5X).","flashforgeSerialPlaceholder":"Numéro de série","flashforgeSerialTitle":"Numéro de série de l'imprimante affiché sur son écran (Paramètres > À propos ou Réseau). Le mode LAN doit être activé.","fleetAttention":"À surveiller","fleetIdle":"Disponibles","fleetPrinting":"En impression","foundOnNetwork":"trouvé sur le réseau","genericError":"erreur","history":"Historique d'impression","historyCoverage":"Historique d'impression observé localement. Il comprend les impressions lancées par Print Farm et les tâches vues pendant que ce tableau de bord était ouvert ; ce qui s'est passé quand OrcaSlicer n'était pas ouvert peut manquer.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Aucune impression observée pour cette imprimante pour l'instant.","historyFromOrca":"signalé par OrcaSlicer","historyLoading":"Chargement de l'historique d'impression…","historyObserved":"observé par Print Farm","historyProgress":"{progress}%","historyStartedHere":"lancé par Print Farm","historyStateCancelled":"annulé","historyStateCompleted":"terminé","historyStateEnded":"fini","historyStateFailed":"échec","historyStatePaused":"en pause","historyStatePrinting":"en impression","historyStateSent":"envoyé","historyTitle":"Historique d'impression — {printer}","historyUnknownFile":"Fichier inconnu","integrationUnavailable":"L'intégration de l'imprimante n'est pas encore disponible","journalActiveCount":"{count} actives","journalAllCount":"{count} enregistrées","journalBlockedByHold":"une opération précédente de cette imprimante n'est pas résolue ; ouvrez le journal d'impression et levez le blocage après avoir vérifié l'imprimante","journalButton":"Journal d'impression","journalCompletedCount":"{count} terminées","journalEmptyAll":"Aucune impression enregistrée pour le moment.","journalFileDelete":"Supprimer le fichier","journalFileUnsent":"Découpe, non envoyée","journalHoldLocked":"Cette opération est encore en cours d'envoi et ne peut pas encore être levée.","journalHoldReleased":"Blocage levé. L'ancienne opération reste non vérifiée.","journalHoldState":"État : {state}","journalHoldUnavailable":"Les détails de l'opération non résolue sont indisponibles. Essayez de rouvrir le journal d'impression.","journalHoldsHeading":"Opérations non résolues — vérifiez sur place l'imprimante, la tâche et la plaque avant de lever un blocage.","journalNoResults":"Aucune impression correspondante.","journalPrinter":"Imprimante","journalReleaseConfirm":"Lever ce blocage après avoir vérifié sur place l'imprimante, la tâche et la plaque pour « {target} » ? Cela ne déverrouille qu'une tentative future ; l'ancienne impression n'est ni marquée comme réussie ni relancée.","journalReleaseHold":"Lever le blocage","journalResend":"Renvoyer…","journalResultsCount":"{count} résultats","journalSearchLabel":"Rechercher dans le journal d'impression","journalSearchPlaceholder":"Rechercher un fichier ou une imprimante…","journalSendConfirm":"Téléverser {name} sur {printer} sans lancer l'impression ?","journalStoreUnavailable":"Le journal d'impression est indisponible. Vérifiez le stockage local du plugin.","journalTitle":"Journal d'impression","legacyImportBlocked":"Les données restent dans leur ancien dossier. Cet ensemble ne peut pas être importé automatiquement.","legacyImportButton":"Importer les anciennes données","legacyImportConfirm":"Les données et identifiants locaux seront copiés dans le stockage local du plug-in OrcaSlicer. L’ancienne copie sera conservée. Continuer ?","legacyImportDetail":"Anciennes données trouvées : {printers} imprimantes, {history} entrées d'historique, {outbox} entrées de file d'attente, {files} fichiers.","legacyImportDone":"Importation terminée.","legacyImportFailed":"Impossible d’importer les anciennes données.","loading":"Chargement…","massFailed":", {count} en échec","massResult":"Envoyé à {count} imprimante(s){failed}.","namePlaceholder":"Nom","networkPermissionRequired":"Autorisez l’accès à l’imprimante dans OrcaSlicer. Si cette option est disponible, ouvrez Extensions → Print Farm → Autorisations. Cliquez ensuite sur « Actualiser » sur la carte de cette imprimante.","noPrinters":"Aucune imprimante trouvée. Configurez un hôte d'impression dans OrcaSlicer ou ajoutez-en un ci-dessus.","notReachable":"{printer} : l'imprimante n'est pas accessible","notReachableNotStarted":"{printer} : imprimante inaccessible — impression non lancée.","nozzle":"Buse","octoprintApiKeyPlaceholder":"Clé API OctoPrint","open":"Interface web","operatorStartCheck":"J'ai vérifié que le fichier découpé et la plaque sélectionnée conviennent à cette imprimante, que les matériaux et les outils sont corrects et que le plateau est libre.","other":"Autre","outboxCopiesOff":"Les copies des découpes sont désactivées dans les paramètres du plugin.","outboxFallbackName":"découpe {stamp}","outboxHintText":"Aucun plugin Printers Outbox n'est sélectionné dans le profil de traitement : les copies des découpes ne sont pas enregistrées.","outboxHintWhere":"Sélectionnez-le dans Traitement → Autres → Plugin de pipeline de découpe.","outboxNotReady":"Fichier G-code pas encore prêt","outboxPrinterUsage":"Imprimante : {name} · dossier : {folder} · {count} fichiers · {size}. Consultez-les ou supprimez-les ci-dessous.","outboxQueued":"{name} mis en file d'attente pour {target}","outboxRemoveFailed":"Impossible de supprimer le fichier enregistré. Il reste listé pour permettre une nouvelle tentative.","outboxStorageCleanBlocked":"Les restes ne peuvent être supprimés que si aucun téléversement ni aucune impression n'est en cours et que l'index des fichiers est sain.","outboxStorageCleanButton":"Supprimer les restes ({count} fichiers, {size})","outboxStorageCleanConfirm":"Supprimer {count} fichiers résiduels ({size}) du stockage de Print Farm ? Les fichiers en file d'attente des imprimantes ne sont pas touchés.","outboxStorageCleanDone":"{count} fichiers résiduels supprimés ({size}).","outboxStorageCleanFailed":"Impossible de supprimer {count} fichiers : {paths}. Réessayez.","outboxStorageEmpty":"Aucun fichier de file d’attente ni copie de récupération trouvé.","outboxStorageEntry":"{label} : {count} fichiers · {size} · {path}","outboxStorageKindIncoming":"Envois préparés","outboxStorageKindIndex":"Index de la file d'attente","outboxStorageKindIndexBackup":"Sauvegarde de l'index de la file","outboxStorageKindLoose":"Fichiers isolés ou orphelins","outboxStorageKindRecovery":"Anciens fichiers de récupération","outboxStorageKindUnassigned":"Fichiers non attribués","outboxStorageManualCleanup":"Les fichiers résiduels (fichiers isolés, envois préparés, copies de récupération, sauvegardes d'index) se suppriment avec le bouton ci-dessous. Les fichiers en file d'attente des imprimantes se retirent un par un.","outboxStorageScanFailed":"Impossible de vérifier tous les chemins de stockage : {paths}. Les totaux peuvent être incomplets.","outboxStorageWarning":"Le stockage grossit ; supprimez les fichiers en file d'attente dont vous n'avez plus besoin.","outboxUnassigned":"Fichiers non attribués : {count} · {size}. Consultez-les et supprimez-les manuellement ci-dessous.","outboxWriteFailed":"Impossible de conserver le fichier G-code","outboxWrongStep":"Ce n'est pas l'étape de post-traitement du G-code","pause":"Pause","plateLabel":"Plaque","preparedUploadDiscardFailed":"Impossible de supprimer la copie temporaire du fichier téléversé ; vérifiez le stockage.","print":"Imprimer…","printShort":"Imprimer","printerBusy":"L'imprimante est occupée","printerIpPlaceholder":"192.168.0.42 (IP de l'imprimante)","printerNotOnline":"L'imprimante n'est pas en ligne","prusalinkApiKeyPlaceholder":"Clé API PrusaLink","queueLess":"Afficher moins","queueMore":"Afficher {count} de plus","refresh":"Actualiser","remove":"Retirer","removeRetainedTitle":"Retirer la copie conservée","repetierApiKeyPlaceholder":"Clé API Repetier","repetierLoadFailed":"Impossible de charger l’imprimante Repetier. Vérifiez adresse, clé et liste.","repetierLoadPrinters":"Charger les imprimantes","repetierModeUnsupported":"Écriture non vérifiée pour cette version du serveur ou connexion. État uniquement.","repetierNotReady":"Le serveur n’a pas confirmé que l’imprimante accepte les commandes.","repetierRequestAccepted":"Demande acceptée ; le travail peut attendre dans la file du serveur. Le prochain état confirmera l’impression.","repetierSelectPrinter":"Choisir une imprimante","resume":"Reprendre","select":"sélectionner","selectAllTitle":"Sélectionner ou désélectionner toutes les imprimantes disponibles","selfSigned":"auto-signé","selfSignedTitle":"À activer uniquement pour une imprimante servie en HTTPS avec un certificat auto-signé. Inutile pour les imprimantes en HTTP simple sur le réseau local.","send":"Envoyer","sendFailed":"{printer} : échec de l'envoi — {error}","sendSelected":"Envoyer le G-code à la sélection…","sendSelectedCount":"Envoyer le G-code à {count} sélectionnée(s)…","sendToPrinterTitle":"Envoyer à cette imprimante et lancer l'impression","sendingFile":"Envoi de {name} vers {count} imprimante(s)…","sentToPrint":"envoyé pour impression","serialAuto":"Numéro de série (auto)","serialTitle":"Le numéro de série est détecté automatiquement. Saisissez-en un seulement pour cibler une imprimante précise. Le port MQTT 8883 est utilisé.","startApprovalExpired":"La confirmation de démarrage a expiré ou les paramètres ont changé ; veuillez vérifier à nouveau.","startBedClear":"Le plateau est dégagé et prêt pour une nouvelle impression.","startBlocked":"Démarrage bloqué pour {printer} : {reason}","startCompatibilityUnknown":"Impossible de confirmer la compatibilité du fichier découpé avec cette imprimante. Vous pouvez le téléverser sans lancer l'impression.","startConfirmMissing":"Démarrage annulé : confirmez que le plateau est dégagé et, si demandé, que le fichier convient à l'imprimante.","startFileCheck":"J'ai vérifié que ce fichier est découpé pour cette imprimante précise.","startImmediately":"Imprimer dès la fin du téléversement","startPrint":"Lancer l'impression","startReasonFileKind":"Ce type de fichier ne peut pas être démarré sur cette imprimante.","startReasonNoStart":"Le démarrage d'impressions depuis Print Farm n'est pas encore disponible pour cette connexion. Vous pouvez téléverser le fichier.","startReasonPlate":"La plaque sélectionnée ne correspond pas à ce fichier.","startReasonProfileMatch":"Le fichier a été découpé avec le profil OrcaSlicer de cette imprimante.","startReasonProfileUnknown":"Print Farm ne peut pas déterminer d'après le fichier pour quelle imprimante il a été découpé.","startReasonProject":"Ceci est un fichier de projet non découpé. Découpez-le d'abord.","startReasonSlicedOnly":"Cette imprimante ne démarre que des fichiers 3MF découpés, pas du G-code brut.","startReasonUnsupported":"Ce type de connexion n'est pas encore pris en charge.","startReviewTitle":"Confirmez chaque impression","startVerdictCompatible":"Compatible","startVerdictIncompatible":"Incompatible","startVerdictUnknown":"À vérifier manuellement","startWillStart":"Imprimantes qui vont démarrer : {count}","stateAborted":"interrompu","stateBusy":"occupé","stateChecking":"vérification","stateComplete":"terminé","stateError":"erreur","stateFailed":"échec","stateIdle":"inactif","stateOffline":"hors ligne","stateOnline":"en ligne","statePaused":"en pause","statePrinting":"en impression","stateStandby":"veille","stateUnavailable":"pas encore disponible","stateUnknown":"inconnu","stop":"Arrêt","storageBar":"Stockage : {count} fichiers · {size}","storageGroupTitle":"{name} · {count} fichiers · {size}","storageMore":"{count} de plus…","supportPlanned":"La prise en charge de {type} est prévue, mais pas encore disponible.","sure":"Confirmer ?","tlsCertificateChanged":"Le certificat de l’imprimante a changé. Connexion bloquée.","tlsPermissionRequired":"Autorisez l’accès à l’imprimante dans OrcaSlicer, puis relancez la vérification du certificat.","tlsProbeFailed":"Impossible de lire le certificat. Vérifie l’imprimante et réessaie.","tlsTrustBusy":"L’imprimante est occupée. Attends la fin de l’opération.","tlsTrustButton":"Certificats…","tlsTrustConfirm":"Faire confiance à ce certificat","tlsTrustCurrent":"SHA-256 enregistré","tlsTrustDetails":"Détails","tlsTrustFtps":"Fichiers (FTPS 990)","tlsTrustIntro":"Ne confirme les certificats que sur un réseau de confiance. La première connexion ne prouve pas l’identité de l’imprimante.","tlsTrustMqtt":"État et commandes (MQTT 8883)","tlsTrustNoPin":"Non confirmé","tlsTrustObserved":"SHA-256 reçu","tlsTrustProbe":"Lire et approuver","tlsTrustReplacement":"Le certificat diffère de celui enregistré. Ne confirme le remplacement que si tu t’attendais à ce changement, par exemple après le remplacement ou la réinitialisation de l’imprimante.","tlsTrustRequired":"Confirme le certificat de l’imprimante avant de te connecter.","tlsTrustSaveFailed":"Impossible d’enregistrer la confirmation du certificat.","tlsTrustSaved":"Certificat confirmé.","tlsTrustStale":"Les paramètres de l’imprimante ont changé ou la confirmation a expiré. Relis le certificat.","tlsTrustTitle":"Certificats Bambu","tlsTrustWorking":"Lecture du certificat…","toolActive":"outil actif","toolDetails":"{tool} · Actuelle : {current} · Cible : {target} · {state}","toolInactive":"outil inactif","toolViewOnly":"Affichage uniquement ; ne change pas l’outil actif","unassignedDelete":"Supprimer","unassignedDeleteAll":"Tout supprimer","unassignedDeleteAllConfirm":"Supprimer les {count} fichiers sans imprimante associée ({size}) du stockage Print Farm ? Les copies sur les imprimantes ne sont pas touchées.","unassignedDeleteConfirm":"Supprimer {name} ({size}) du stockage Print Farm ? Les copies sur les imprimantes ne sont pas touchées.","unassignedHeading":"Fichiers non liés à une imprimante : {count} · {size}","unassignedNoPrinter":"Aucune imprimante n'est prête. Elle doit être en ligne, inactive et accepter les téléversements.","unassignedSend":"Envoyer à une imprimante…","unassignedUpload":"Téléverser seulement","unassignedUploadStart":"Téléverser et lancer","unassignedWhy":"Aucune imprimante du panneau ne correspond au profil d’imprimante de ce fichier. Vous pouvez l’envoyer une fois à l’imprimante de votre choix ; aucun lien n’est créé.","unavailableSuffix":"pas encore disponible","unmatchedQueued":"{count} fichier(s) en file d'attente ne correspondent à aucune imprimante sur le tableau de bord","uploadShort":"Téléverser","uploadToPrinterTitle":"Téléverser le fichier sur cette imprimante sans lancer l'impression","uploadToPrinters":"Téléverser {name} sur {count} imprimante(s) :","uploadUnverifiedHardware":"Téléversement indisponible : pas encore vérifié sur du matériel réel","uploadedNotStarted":"téléversé (non lancé)","useAms":"Utiliser l'AMS (Bambu)","webuiAddress":"Adresse de l’interface web (facultatif)","webuiFallbackHelp":"Si le chargement continue, copiez l’adresse dans un navigateur. Le port web se règle dans Connexion.","webuiHelp":"La page ne charge pas ?"},"hu":{"accessCode":"Hozzáférési kód","add":"Hozzáadás","addConfiguredTitle":"Az OrcaSlicerben beállított nyomtató hozzáadása","addPrinter":"Nyomtató hozzáadása…","all":"mind","bambuError":"Nyomtatóhiba {code}","bambuLayer":"réteg {current}/{total}","bambuLeftHM":"{hours} h {minutes} min van hátra","bambuLeftM":"{minutes} min van hátra","bed":"Asztal","busy":"{printer}: a nyomtató elfoglalt ({state})","busyNotStarted":"{printer}: a nyomtató elfoglalt ({state}) – nem indult el.","cameraButton":"Élő kamerakép","cameraCapturedAt":"Felvétel {time}","cameraClose":"Kamera bezárása","cameraLoadFailed":"A kép itt nem töltődött be. Ez az ablak blokkolhatja a helyi hálózati képeket.","cameraLoading":"Csatlakozás a kamerához…","cameraMode":"Kamera","cameraModeAuto":"Beállított webkamera","cameraModeU1":"Eredeti Snapmaker U1 kamera","cameraNativeSession":"Kameramunkamenet megnyitva","cameraNone":"Ehhez a nyomtatóhoz nincs kamera beállítva.","cameraOpenWindow":"Kamera megnyitása ablakban","cameraPermissionDenied":"Háttérmunka megtagadva. Engedélyezd, majd nyisd újra a kamerát.","cameraReceivedAt":"Fogadva {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"A kamera nem érhető el.","cancel":"Mégse","cfgAutoDelete":"Régi másolatok automatikus törlése","cfgAutoDeleteAge":"Ennél régebbi másolatok törlése:","cfgAutoDeleteHint":"Alapból kikapcsolva. Indításkor és naponta egyszer ellenőrzi; csak ennek a bővítménynek a másolatait törli, használatban lévő fájlokat soha.","cfgClearConfirm":"Törlöd a nyomtatási naplót? A művelet nem vonható vissza.","cfgClearDone":"Kérés rögzítve. A napló törlődik, amikor a panel legközelebb beolvassa a beállításokat.","cfgClearHistory":"Nyomtatási napló törlése","cfgDays":"{days} nap","cfgJournalOrca":"Az Orcából indított küldések és nyomtatások naplózása","cfgJournalOrcaHint":"Csak azok a feladatok, amelyeket maga az OrcaSlicer jelez.","cfgKeepAll":"Mind","cfgKeepCopies":"A szeletelt fájlok másolatainak megőrzése","cfgKeepCopiesHint":"Lehetővé teszi, hogy később nyomtatóra küldd a szeletelt fájlt. Kikapcsolva nem készül másolat.","cfgKeepHistory":"Nyomtatási napló megőrzése","cfgKeepHistoryHint":"Kikapcsolva nem rögzít új bejegyzést; a meglévők megmaradnak.","cfgKeepLast":"Nyomtatónként csak a legutóbbi szeletek megtartása","cfgKeepLastHint":"Új szelet mentésekor ugyanannak a nyomtatónak a régebbi, el nem küldött másolatai törlődnek. A nyomtatási naplóhoz kapcsolt másolatok megmaradnak.","cfgPauseHidden":"Ne kérdezzen le, amíg a panel nem látható","cfgPauseHiddenHint":"Hálózati kéréseket takarít meg, amíg a lap vagy az ablak rejtve van.","cfgPollInterval":"Nyomtatók lekérdezési időköze","cfgProfileHint":"Jelzés, ha a bővítmény nincs kiválasztva a folyamatprofilban","cfgProfileHintHint":"A panelen jelenik meg, ha egy szelet nem jutott el ehhez a bővítményhez.","cfgSeconds":"{seconds} mp","close":"Bezárás","comingLater":"hamarosan","commandFailed":"{printer}: {action} sikertelen – {error}","commandSent":"{printer}: {action} elküldve.","confirmTitle":"Nyomtatás indítása több nyomtatón?","confirmUploadTitle":"Feltöltöd a fájlt a kiválasztott nyomtatókra?","connectionOptions":"Kapcsolat","connectionOptionsFailed":"Nem sikerült menteni. Ellenőrizd a címet.","connectionOptionsHelp":"Azonos gazdagépet és kifejezett webportot használj.","connectionSave":"Mentés","connectionTypeTitle":"Csatlakozás típusa. Az elérhető funkciók a nyomtató protokolljától és az aktuális állapottól függnek.","controlsUnverified":"A szüneteltetés és a leállítás ennél a kapcsolatnál nem érhető el (hardveren nincs ellenőrizve)","crealityWsPortPlaceholder":"WS-port (9999)","crealityWsPortTitle":"Választható. A nyomtató állapot-WebSocketjének portja. A 9999 nem megerősített alapértelmezés; módosítsd, ha a nyomtató másik portot használ.","credentialLegacyWarning":"{count} nyomtató kulcsai még egyszerű szövegként tárolódnak. Helyezd át a rendszer tárolójába. A régi mentések megmaradnak.","credentialMigrate":"Kulcsok áthelyezése","credentialMigrationConfirm":"Áthelyezed a kulcsokat a rendszer tárolójába? A régi mentések megmaradnak.","credentialMigrationDone":"A kulcsok átkerültek a rendszer tárolójába.","credentialRetry":"Hozzáférés újra","credentialSaveFailed":"A kulcsok biztonságos mentése sikertelen. A nyomtató nem lett mentve.","credentialUnavailable":"A rendszer tárolója nem érhető el. A kapcsolat blokkolva.","dashboardOpened":"A Print Farm irányítópultja megnyílt.","duetPasswordPlaceholder":"Duet gép jelszava","errorNeedsAccessCode":"nyomtató hozzáférési kód szükséges","errorNeedsBambuCredentials":"a nyomtató IP-címe, a hozzáférési kód és a sorozatszám kötelező","errorNoAddress":"hiányzik a nyomtató címe","errorOutcomeUnknown":"a nyomtató megkaphatta a kérést, de lehet, hogy nem; újrapróbálkozás előtt ellenőrizd a nyomtatót","errorPrintCommand":"nyomtatási parancs sikertelen: {error}","errorUnknownAction":"ismeretlen nyomtatóművelet","errorUnknownSerial":"feltöltve, de a nyomtató sorozatszáma még ismeretlen – indítsd el a nyomtatást a nyomtatóról","errorUnsupportedBackend":"a nyomtató csatlakozási típusa nem támogatott","errorUpload":"feltöltés sikertelen: {error}","errorUploadUnverified":"a fájl feltöltődött, de a méretét nem sikerült ellenőrizni a nyomtatón, ezért a nyomtatás nem indult el","errorUploadedNotStarted":"a fájl feltöltődött, de a nyomtatás nem indult el: {error}","feedbackButton":"Visszajelzés","feedbackCopied":"Másolva","feedbackCopy":"Másolás","feedbackHelp":"Másold a címet egy böngészőbe, és használd a webhely visszajelző gombját. Nyomtatóadat nem kerül elküldésre. “Beta Feedback”.","file3mfWarning":".3mf csak Bambu nyomtatókon indítható – a többi G-code-ot vár.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"A küldés sikertelen: nem sikerült beolvasni a fájlt.","fileTargetMismatch":"{printer}: a sorban álló fájl nem ehhez a nyomtatóhoz tartozik; a nyomtatás nem indult el.","flashforgeCheckCodePlaceholder":"Ellenőrző kód (a nyomtató képernyőjén)","flashforgeCheckCodeTitle":"Ellenőrző kód a nyomtató képernyőjéről. A nyomtatón be kell kapcsolni a LAN-módot.","flashforgeErrAuth":"Hibás sorozatszám vagy ellenőrző kód.","flashforgeErrCredentials":"Add meg a sorozatszámot és az ellenőrző kódot.","flashforgeErrIdentity":"A nyomtató modelljét nem sikerült ellenőrizni.","flashforgeErrLanMode":"Kapcsold be a LAN-módot a nyomtatón.","flashforgeErrUnsupportedModel":"Ez a FlashForge modell nem támogatott (csak Adventurer 5M, 5M Pro és AD5X).","flashforgeSerialPlaceholder":"Sorozatszám","flashforgeSerialTitle":"A nyomtató sorozatszáma a nyomtató képernyőjéről (Beállítások > Névjegy vagy Hálózat). A LAN-módnak bekapcsolva kell lennie.","fleetAttention":"Figyelmet igényelnek","fleetIdle":"Szabadok","fleetPrinting":"Nyomtatnak","foundOnNetwork":"megtalálva a hálózaton","genericError":"hiba","history":"Nyomtatási előzmények","historyCoverage":"Helyben megfigyelt nyomtatási előzmények. Tartalmazza a Print Farm által indított nyomtatásokat és azokat a feladatokat, amelyeket az irányítópult nyitva tartása alatt észlelt; ami akkor történt, amikor az OrcaSlicer nem futott, hiányozhat.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Ennél a nyomtatónál még nincs megfigyelt nyomtatás.","historyFromOrca":"az OrcaSlicer jelentette","historyLoading":"Nyomtatási előzmények betöltése…","historyObserved":"megfigyelte: Print Farm","historyProgress":"{progress}%","historyStartedHere":"indította: Print Farm","historyStateCancelled":"törölve","historyStateCompleted":"befejezve","historyStateEnded":"befejeződött","historyStateFailed":"sikertelen","historyStatePaused":"szünetel","historyStatePrinting":"nyomtat","historyStateSent":"elküldve","historyTitle":"Nyomtatási előzmények – {printer}","historyUnknownFile":"Ismeretlen fájl","integrationUnavailable":"A nyomtatóintegráció még nem érhető el","journalActiveCount":"{count} aktív","journalAllCount":"{count} rögzítve","journalBlockedByHold":"a nyomtató egy korábbi művelete tisztázatlan; nyisd meg a nyomtatási naplót, és a nyomtató ellenőrzése után old fel a zárolást","journalButton":"Nyomtatási napló","journalCompletedCount":"{count} befejezve","journalEmptyAll":"Még nincs rögzített nyomtatás.","journalFileDelete":"Fájl törlése","journalFileUnsent":"Szeletelt fájl, nincs elküldve","journalHoldLocked":"Ez a művelet még küldés alatt áll, ezért még nem oldható fel.","journalHoldReleased":"Zárolás feloldva. A régi művelet továbbra is ellenőrizetlen.","journalHoldState":"Állapot: {state}","journalHoldUnavailable":"A megoldatlan művelet részletei nem érhetők el. Próbáld újra megnyitni a nyomtatási naplót.","journalHoldsHeading":"Megoldatlan műveletek – a zárolás feloldása előtt ellenőrizd a nyomtatót, a feladatot és az asztalt a helyszínen.","journalNoResults":"Nincs egyező nyomtatás.","journalPrinter":"Nyomtató","journalReleaseConfirm":"Feloldod ezt a zárolást, miután a helyszínen ellenőrizted a nyomtatót, a feladatot és az asztalt („{target}”)? Ez csak egy későbbi próbálkozást old fel; a régi nyomtatást nem jelöli sikeresnek, és nem ismétli meg.","journalReleaseHold":"Zárolás feloldása","journalResend":"Küldés újra…","journalResultsCount":"{count} találat","journalSearchLabel":"Keresés a nyomtatási naplóban","journalSearchPlaceholder":"Keresés fájl vagy nyomtató alapján…","journalSendConfirm":"Feltöltöd a(z) {name} fájlt a(z) {printer} nyomtatóra nyomtatás indítása nélkül?","journalStoreUnavailable":"A nyomtatási napló nem érhető el. Ellenőrizd a bővítmény helyi tárhelyét.","journalTitle":"Nyomtatási napló","legacyImportBlocked":"Az adatok a korábbi mappában maradnak. Ez az adatkészlet nem importálható automatikusan.","legacyImportButton":"Régi adatok importálása","legacyImportConfirm":"Az adatok és a helyi hitelesítő adatok az OrcaSlicer bővítmény helyi tárhelyére másolódnak. A régi példány megmarad. Folytatja?","legacyImportDetail":"Régi adatok: {printers} nyomtató, {history} előzménybejegyzés, {outbox} várólistaelem és {files} fájl.","legacyImportDone":"Az importálás befejeződött.","legacyImportFailed":"A régi adatok importálása nem sikerült.","loading":"Betöltés…","massFailed":", {count} sikertelen","massResult":"Elküldve {count} nyomtatóra{failed}.","namePlaceholder":"Név","networkPermissionRequired":"Engedélyezd a nyomtató elérését az OrcaSlicerben. Ha elérhető, válaszd a Bővítmények → Print Farm → Engedélyek lehetőséget. Ezután kattints a nyomtató kártyáján lévő „Frissítés” gombra.","noPrinters":"Nem található nyomtató. Állíts be nyomtatási gazdagépet az OrcaSlicerben, vagy adj hozzá egyet fent.","notReachable":"{printer}: a nyomtató nem érhető el","notReachableNotStarted":"{printer}: a nyomtató nem érhető el – nem indult el.","nozzle":"Fúvóka","octoprintApiKeyPlaceholder":"OctoPrint API-kulcs","open":"Webes felület","operatorStartCheck":"Ellenőriztem, hogy a szeletelt fájl és a kiválasztott tálca ehhez a nyomtatóhoz való, az anyagok és az eszközök megfelelőek, az asztal pedig szabad.","other":"Egyéb","outboxCopiesOff":"A szeletek másolatai ki vannak kapcsolva a bővítmény beállításaiban.","outboxFallbackName":"szeletelés {stamp}","outboxHintText":"A folyamatprofilban nincs kiválasztva a Printers Outbox bővítmény – a szeletek másolatai nem kerülnek mentésre.","outboxHintWhere":"Itt választhatod ki: Folyamat → Egyéb → Szeletelési folyamat bővítmény.","outboxNotReady":"A G-code fájl még nincs készen","outboxPrinterUsage":"Nyomtató: {name} · mappa: {folder} · {count} fájl · {size}. Alább megtekintheted vagy törölheted őket.","outboxQueued":"{name} sorba állítva ({target})","outboxRemoveFailed":"A mentett fájl eltávolítása nem sikerült. A listában marad, így újra próbálhatod.","outboxStorageCleanBlocked":"A maradékok csak akkor törölhetők, ha nincs folyamatban feltöltés vagy nyomtatás, és a fájlindex rendben van.","outboxStorageCleanButton":"Maradékok törlése ({count} fájl, {size})","outboxStorageCleanConfirm":"Törli a Print Farm tárhelyéről a(z) {count} maradék fájlt ({size})? A nyomtatók várólistáján lévő fájlokhoz nem nyúlunk.","outboxStorageCleanDone":"{count} maradék fájl törölve ({size}).","outboxStorageCleanFailed":"{count} fájl nem törölhető: {paths}. Próbáld újra.","outboxStorageEmpty":"Nem találhatók sorban álló fájlok vagy helyreállítási másolatok.","outboxStorageEntry":"{label}: {count} fájl · {size} · {path}","outboxStorageKindIncoming":"Előkészített feltöltések","outboxStorageKindIndex":"Sorindex","outboxStorageKindIndexBackup":"Sorindex biztonsági másolata","outboxStorageKindLoose":"Különálló vagy árva fájlok","outboxStorageKindRecovery":"Régi helyreállítási fájlok","outboxStorageKindUnassigned":"Nem hozzárendelt fájlok","outboxStorageManualCleanup":"A maradék fájlok (különálló fájlok, előkészített feltöltések, helyreállítási másolatok, indexmentések) az alábbi gombbal törölhetők. A nyomtatók várólistáján lévő fájlok egyenként távolíthatók el.","outboxStorageScanFailed":"Nem sikerült minden tárhelyútvonalat ellenőrizni: {paths}. Az összesítés hiányos lehet.","outboxStorageWarning":"A tárhely növekszik; töröld a sorokból a már nem szükséges fájlokat.","outboxUnassigned":"Nem hozzárendelt fájlok: {count} · {size}. Alább kézzel áttekintheted és törölheted őket.","outboxWriteFailed":"A G-code fájlt nem sikerült megőrizni","outboxWrongStep":"Ez nem a G-code utófeldolgozási lépése","pause":"Szünet","plateLabel":"Tálca","preparedUploadDiscardFailed":"Nem sikerült törölni a feltöltés ideiglenes másolatát; ellenőrizd a tárhelyet.","print":"Nyomtatás…","printShort":"Nyomtatás","printerBusy":"A nyomtató elfoglalt","printerIpPlaceholder":"192.168.0.42 (nyomtató IP)","printerNotOnline":"A nyomtató nincs online állapotban","prusalinkApiKeyPlaceholder":"PrusaLink API-kulcs","queueLess":"Kevesebb megjelenítése","queueMore":"Még {count} megjelenítése","refresh":"Frissítés","remove":"Eltávolítás","removeRetainedTitle":"A megőrzött másolat eltávolítása","repetierApiKeyPlaceholder":"Repetier API-kulcs","repetierLoadFailed":"A Repetier nyomtató nem tölthető be. Ellenőrizd a címet, kulcsot és listát.","repetierLoadPrinters":"Nyomtatók betöltése","repetierModeUnsupported":"Az írás ennél a verziónál vagy kapcsolatnál nincs ellenőrizve. Csak állapot.","repetierNotReady":"A szerver nem igazolta, hogy a nyomtató fogad parancsokat.","repetierRequestAccepted":"Kérés elfogadva; a feladat a szerver sorában várhat. A következő állapot igazolja a nyomtatást.","repetierSelectPrinter":"Nyomtató kiválasztása","resume":"Folytatás","select":"választ","selectAllTitle":"Az összes elérhető nyomtató kijelölése vagy a kijelölés megszüntetése","selfSigned":"önaláírt","selfSignedTitle":"Csak olyan nyomtatónál kapcsold be, amely HTTPS-en keresztül önaláírt tanúsítvánnyal érhető el. A sima HTTP-t használó LAN-os nyomtatóknak erre nincs szükségük.","send":"Küldés","sendFailed":"{printer}: a küldés sikertelen – {error}","sendSelected":"G-code küldése a kijelöltekre…","sendSelectedCount":"G-code küldése {count} kijelölt nyomtatóra…","sendToPrinterTitle":"Küldés erre a nyomtatóra és a nyomtatás indítása","sendingFile":"{name} küldése {count} nyomtatóra…","sentToPrint":"nyomtatásra küldve","serialAuto":"Sorozatszám (automatikus)","serialTitle":"A sorozatszám automatikusan felismerhető. Csak egy adott nyomtató rögzítéséhez add meg. A rendszer a 8883-as MQTT-portot használja.","startApprovalExpired":"A nyomtatás indításának jóváhagyása lejárt, vagy a beállítások megváltoztak; ellenőrizd újra.","startBedClear":"Az asztal szabad, és készen áll az új nyomtatásra.","startBlocked":"Az indítás le van tiltva ({printer}): {reason}","startCompatibilityUnknown":"Nem sikerült megerősíteni, hogy a szeletelt fájl kompatibilis-e ezzel a nyomtatóval. A fájl nyomtatás indítása nélkül is feltölthető.","startConfirmMissing":"Az indítás megszakadt: erősítsd meg, hogy az asztal szabad, és ahol kérdezzük, hogy a fájl megfelel a nyomtatónak.","startFileCheck":"Ellenőrizve: a fájl pontosan ehhez a nyomtatóhoz van szeletelve.","startImmediately":"Feltöltés után azonnal nyomtatás indítása","startPrint":"Nyomtatás indítása","startReasonFileKind":"Ez a fájltípus nem indítható ezen a nyomtatón.","startReasonNoStart":"A nyomtatás indítása a Print Farmból ennél a kapcsolatnál még nem érhető el. A fájlt feltöltheted.","startReasonPlate":"A kiválasztott tálca nem egyezik ezzel a fájllal.","startReasonProfileMatch":"A fájl ennek a nyomtatónak az OrcaSlicer-profiljához készült.","startReasonProfileUnknown":"A Print Farm nem tudja megállapítani a fájlból, melyik nyomtatóhoz készült.","startReasonProject":"Ez egy még nem szeletelt projektfájl. Először szeleteld fel.","startReasonSlicedOnly":"Ez a nyomtató csak szeletelt 3MF fájlokat indít, sima G-code-ot nem.","startReasonUnsupported":"Ez a kapcsolattípus még nem támogatott.","startReviewTitle":"Erősíts meg minden nyomtatást","startVerdictCompatible":"Kompatibilis","startVerdictIncompatible":"Nem kompatibilis","startVerdictUnknown":"Kézzel ellenőrizendő","startWillStart":"Elinduló nyomtatók: {count}","stateAborted":"megszakítva","stateBusy":"elfoglalt","stateChecking":"ellenőrzés","stateComplete":"kész","stateError":"hiba","stateFailed":"sikertelen","stateIdle":"tétlen","stateOffline":"offline","stateOnline":"online","statePaused":"szünetel","statePrinting":"nyomtat","stateStandby":"készenlét","stateUnavailable":"még nem elérhető","stateUnknown":"ismeretlen","stop":"Leállítás","storageBar":"Tárhely: {count} fájl · {size}","storageGroupTitle":"{name} · {count} fájl · {size}","storageMore":"Még {count}…","supportPlanned":"A(z) {type} támogatása tervezett, de még nem érhető el.","sure":"Megerősíted?","tlsCertificateChanged":"A nyomtató tanúsítványa megváltozott. A kapcsolat blokkolva.","tlsPermissionRequired":"Engedélyezd a nyomtató elérését az OrcaSlicerben, majd ismételd meg a tanúsítvány ellenőrzését.","tlsProbeFailed":"Nem sikerült beolvasni a tanúsítványt. Ellenőrizd a nyomtatót, majd próbáld újra.","tlsTrustBusy":"A nyomtató használatban van. Várd meg a művelet végét.","tlsTrustButton":"Tanúsítványok…","tlsTrustConfirm":"Tanúsítvány megbízhatónak jelölése","tlsTrustCurrent":"Mentett SHA-256","tlsTrustDetails":"Részletek","tlsTrustFtps":"Fájlok (FTPS 990)","tlsTrustIntro":"Tanúsítványt csak megbízható hálózaton erősíts meg. Az első kapcsolat nem igazolja a nyomtató személyazonosságát.","tlsTrustMqtt":"Állapot és parancsok (MQTT 8883)","tlsTrustNoPin":"Nincs megerősítve","tlsTrustObserved":"Kapott SHA-256","tlsTrustProbe":"Beolvasás és megbízhatónak jelölés","tlsTrustReplacement":"A tanúsítvány eltér a mentettől. Csak akkor erősítsd meg a cserét, ha számítottál erre a változásra, például a nyomtató cseréje vagy visszaállítása után.","tlsTrustRequired":"Csatlakozás előtt erősítsd meg a nyomtató tanúsítványát.","tlsTrustSaveFailed":"Nem sikerült menteni a tanúsítvány megerősítését.","tlsTrustSaved":"Tanúsítvány megerősítve.","tlsTrustStale":"A nyomtató beállításai megváltoztak, vagy a megerősítés lejárt. Olvasd be újra a tanúsítványt.","tlsTrustTitle":"Bambu-tanúsítványok","tlsTrustWorking":"Tanúsítvány beolvasása…","toolActive":"aktív szerszám","toolDetails":"{tool} · Jelenlegi: {current} · Cél: {target} · {state}","toolInactive":"inaktív eszköz","toolViewOnly":"Csak megjelenítés; nem vált aktív eszközt","unassignedDelete":"Törlés","unassignedDeleteAll":"Összes törlése","unassignedDeleteAllConfirm":"Törli mind a {count} nyomtatóhoz nem rendelt fájlt ({size}) a Print Farm tárhelyéről? A nyomtatókon lévő másolatok nem változnak.","unassignedDeleteConfirm":"Törli a(z) {name} ({size}) fájlt a Print Farm tárhelyéről? A nyomtatókon lévő másolatokat ez nem érinti.","unassignedHeading":"Nyomtatóhoz nem rendelt fájlok: {count} · {size}","unassignedNoPrinter":"Nincs kész nyomtató. Online, tétlen állapotban kell lennie, és fogadnia kell a feltöltést.","unassignedSend":"Küldés nyomtatóra…","unassignedUpload":"Csak feltöltés","unassignedUploadStart":"Feltöltés és indítás","unassignedWhy":"A panel egyik nyomtatója sem egyezik a fájl nyomtatóprofiljával. Egyszer elküldheted egy általad választott nyomtatóra; semmilyen kapcsolat nem jön létre.","unavailableSuffix":"még nem elérhető","unmatchedQueued":"{count} sorban álló fájl nem egyezik az irányítópulton lévő egyik nyomtatóval sem","uploadShort":"Feltöltés","uploadToPrinterTitle":"Fájl feltöltése erre a nyomtatóra a nyomtatás elindítása nélkül","uploadToPrinters":"{name} feltöltése {count} nyomtatóra:","uploadUnverifiedHardware":"A feltöltés nem érhető el: hardveren még nincs ellenőrizve","uploadedNotStarted":"feltöltve (nem indult el)","useAms":"AMS használata (Bambu)","webuiAddress":"Webcím (opcionális)","webuiFallbackHelp":"Ha a betöltés nem áll le, másold a címet böngészőbe. A webport a Kapcsolat alatt állítható.","webuiHelp":"Nem töltődik be az oldal?"},"it":{"accessCode":"Codice di accesso","add":"Aggiungi","addConfiguredTitle":"Aggiungi una stampante configurata in OrcaSlicer","addPrinter":"Aggiungi una stampante…","all":"tutte","bambuError":"Errore stampante {code}","bambuLayer":"strato {current}/{total}","bambuLeftHM":"Restano {hours} h {minutes} min","bambuLeftM":"Restano {minutes} min","bed":"Piatto","busy":"{printer}: la stampante è occupata ({state})","busyNotStarted":"{printer}: stampante occupata ({state}) — avvio non eseguito.","cameraButton":"Telecamera dal vivo","cameraCapturedAt":"Acquisito {time}","cameraClose":"Chiudi la telecamera","cameraLoadFailed":"L'immagine non si è caricata qui. Questa finestra potrebbe bloccare le immagini della rete locale.","cameraLoading":"Connessione alla telecamera…","cameraMode":"Fotocamera","cameraModeAuto":"Webcam configurata","cameraModeU1":"Fotocamera originale Snapmaker U1","cameraNativeSession":"Sessione fotocamera aperta","cameraNone":"Su questa stampante non è configurata alcuna telecamera.","cameraOpenWindow":"Apri la telecamera in una finestra","cameraPermissionDenied":"Lavoro in background negato. Consentilo e riapri la fotocamera.","cameraReceivedAt":"Ricevuto {time}","cameraTitle":"Telecamera: {printer}","cameraUnavailable":"Impossibile raggiungere la telecamera.","cancel":"Annulla","cfgAutoDelete":"Elimina automaticamente le copie vecchie","cfgAutoDeleteAge":"Elimina copie più vecchie di","cfgAutoDeleteHint":"Disattivato di default. Controllo all'avvio e una volta al giorno; vengono rimosse solo le copie di questo plugin, mai i file in uso.","cfgClearConfirm":"Cancellare il registro di stampa? L'azione è irreversibile.","cfgClearDone":"Richiesta salvata. Il registro verrà cancellato alla prossima lettura delle impostazioni da parte del pannello.","cfgClearHistory":"Cancella il registro di stampa","cfgDays":"{days} gg","cfgJournalOrca":"Registra nel registro di stampa gli invii e le stampe avviati da Orca","cfgJournalOrcaHint":"Solo i lavori segnalati da OrcaSlicer stesso.","cfgKeepAll":"Tutti","cfgKeepCopies":"Conserva copie dei file elaborati","cfgKeepCopiesHint":"Permette di inviare un'elaborazione a una stampante più tardi. Se disattivato, non viene copiato nulla.","cfgKeepHistory":"Conserva il registro di stampa","cfgKeepHistoryHint":"Se disattivato, le nuove voci non vengono registrate; quelle esistenti restano.","cfgKeepLast":"Conserva solo gli ultimi slice per stampante","cfgKeepLastHint":"Quando viene salvato un nuovo slice, le copie meno recenti non inviate della stessa stampante vengono eliminate. Le copie collegate al registro di stampa restano.","cfgPauseHidden":"Non interrogare mentre il pannello non è visibile","cfgPauseHiddenHint":"Risparmia richieste di rete mentre la scheda o la finestra è nascosta.","cfgPollInterval":"Intervallo di interrogazione delle stampanti","cfgProfileHint":"Suggerimento se il plugin non è selezionato nel profilo di processo","cfgProfileHintHint":"Mostrato nel pannello quando un'elaborazione non ha raggiunto questo plugin.","cfgSeconds":"{seconds} s","close":"Chiudi","comingLater":"in arrivo","commandFailed":"{printer}: comando “{action}” non riuscito — {error}","commandSent":"{printer}: comando “{action}” inviato.","confirmTitle":"Avviare la stampa su più stampanti?","confirmUploadTitle":"Caricare il file sulle stampanti selezionate?","connectionOptions":"Connessione","connectionOptionsFailed":"Salvataggio non riuscito. Controlla l’indirizzo.","connectionOptionsHelp":"Usa lo stesso host e indica la porta web.","connectionSave":"Salva","connectionTypeTitle":"Tipo di connessione. Le funzioni disponibili dipendono dal protocollo della stampante e dal suo stato attuale.","controlsUnverified":"Pausa e stop non sono disponibili per questa connessione (non verificato sull'hardware)","crealityWsPortPlaceholder":"Porta WS (9999)","crealityWsPortTitle":"Facoltativo. Porta del WebSocket di stato della stampante. 9999 è un valore predefinito non confermato; modificalo se la tua stampante usa un'altra porta.","credentialLegacyWarning":"Le chiavi di {count} stampanti sono ancora in chiaro. Spostale nell’archivio di sistema. I vecchi backup restano.","credentialMigrate":"Sposta chiavi","credentialMigrationConfirm":"Spostare le chiavi nell’archivio di sistema? I vecchi backup restano.","credentialMigrationDone":"Chiavi spostate nell’archivio di sistema.","credentialRetry":"Riprova accesso","credentialSaveFailed":"Impossibile salvare le chiavi in modo sicuro. Stampante non salvata.","credentialUnavailable":"Archivio di sistema non disponibile. Connessione bloccata.","dashboardOpened":"Pannello Print Farm aperto.","duetPasswordPlaceholder":"Password della macchina Duet","errorNeedsAccessCode":"è richiesto il codice di accesso alla stampante","errorNeedsBambuCredentials":"sono richiesti IP, codice di accesso e numero di serie della stampante","errorNoAddress":"indirizzo della stampante mancante","errorOutcomeUnknown":"la stampante potrebbe aver ricevuto la richiesta oppure no; controlla la stampante prima di riprovare","errorPrintCommand":"comando di stampa non riuscito: {error}","errorUnknownAction":"azione stampante sconosciuta","errorUnknownSerial":"caricato, ma il numero di serie della stampante è ancora sconosciuto: avvialo dalla stampante","errorUnsupportedBackend":"questo tipo di connessione non è supportato","errorUpload":"caricamento non riuscito: {error}","errorUploadUnverified":"il file è stato caricato, ma non è stato possibile verificarne la dimensione sulla stampante, quindi la stampa non è stata avviata","errorUploadedNotStarted":"il file è stato caricato, ma la stampa non è stata avviata: {error}","feedbackButton":"Feedback","feedbackCopied":"Copiato","feedbackCopy":"Copia","feedbackHelp":"Copia l’indirizzo in un browser e usa il pulsante feedback del sito. Nessun dato delle stampanti viene inviato. “Beta Feedback”.","file3mfWarning":"Il .3mf si avvia solo sulle stampanti Bambu: le altre richiedono G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Invio fallito: impossibile leggere il file.","fileTargetMismatch":"{printer}: il file in coda non corrisponde a questa stampante — avvio non eseguito.","flashforgeCheckCodePlaceholder":"Codice di verifica (sullo schermo della stampante)","flashforgeCheckCodeTitle":"Codice di verifica mostrato sullo schermo della stampante. Sulla stampante deve essere attiva la modalità LAN.","flashforgeErrAuth":"Numero di serie o codice di verifica errato.","flashforgeErrCredentials":"Inserisci il numero di serie e il codice di verifica.","flashforgeErrIdentity":"Non è stato possibile verificare il modello della stampante.","flashforgeErrLanMode":"Attiva la modalità LAN sulla stampante.","flashforgeErrUnsupportedModel":"Questo modello FlashForge non è supportato (solo Adventurer 5M, 5M Pro e AD5X).","flashforgeSerialPlaceholder":"Numero di serie","flashforgeSerialTitle":"Numero di serie della stampante mostrato sul suo schermo (Impostazioni > Info o Rete). La modalità LAN deve essere attiva.","fleetAttention":"Richiedono attenzione","fleetIdle":"Disponibili","fleetPrinting":"In stampa","foundOnNetwork":"trovata sulla rete","genericError":"errore","history":"Cronologia di stampa","historyCoverage":"Cronologia locale delle stampe osservate. Include le stampe avviate da Print Farm e i lavori rilevati mentre questo pannello era aperto; il lavoro svolto mentre OrcaSlicer non era in linea potrebbe mancare.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Nessuna stampa osservata per questa stampante.","historyFromOrca":"segnalato da OrcaSlicer","historyLoading":"Caricamento cronologia di stampa…","historyObserved":"rilevato da Print Farm","historyProgress":"{progress}%","historyStartedHere":"avviato da Print Farm","historyStateCancelled":"annullato","historyStateCompleted":"completato","historyStateEnded":"terminato","historyStateFailed":"fallito","historyStatePaused":"in pausa","historyStatePrinting":"in stampa","historyStateSent":"inviato","historyTitle":"Cronologia di stampa — {printer}","historyUnknownFile":"File sconosciuto","integrationUnavailable":"L'integrazione della stampante non è ancora disponibile","journalActiveCount":"Attivi: {count}","journalAllCount":"Registrati: {count}","journalBlockedByHold":"un'operazione precedente di questa stampante non è risolta; apri il registro di stampa e sbloccala dopo aver controllato la stampante","journalButton":"Registro di stampa","journalCompletedCount":"Completati: {count}","journalEmptyAll":"Nessuna stampa registrata per ora.","journalFileDelete":"Elimina file","journalFileUnsent":"Elaborazione, non inviata","journalHoldLocked":"Questa operazione è ancora in corso di invio e non può ancora essere sbloccata.","journalHoldReleased":"Blocco rimosso. La vecchia operazione resta non verificata.","journalHoldState":"Stato: {state}","journalHoldUnavailable":"I dettagli dell'operazione irrisolta non sono disponibili. Prova a riaprire il registro di stampa.","journalHoldsHeading":"Operazioni irrisolte — controlla la stampante fisica, il lavoro e il piatto prima di rimuovere un blocco.","journalNoResults":"Nessuna stampa corrispondente.","journalPrinter":"Stampante","journalReleaseConfirm":"Dopo aver controllato la stampante fisica, il lavoro e il piatto per “{target}”, rimuovere questo blocco? Si sblocca solo un tentativo futuro: la vecchia stampa non viene segnata come riuscita né ripetuta.","journalReleaseHold":"Rimuovi blocco","journalResend":"Invia di nuovo…","journalResultsCount":"Risultati: {count}","journalSearchLabel":"Cerca nel registro di stampa","journalSearchPlaceholder":"Cerca file o stampante…","journalSendConfirm":"Caricare {name} su {printer} senza avviare la stampa?","journalStoreUnavailable":"Il registro di stampa non è disponibile. Controlla l'archivio locale del plugin.","journalTitle":"Registro di stampa","legacyImportBlocked":"I dati rimangono nella cartella precedente. Questo insieme non può essere importato automaticamente.","legacyImportButton":"Importa dati precedenti","legacyImportConfirm":"I dati e le credenziali locali verranno copiati nell'archivio locale di questo plugin di OrcaSlicer. La copia precedente verrà conservata. Continuare?","legacyImportDetail":"Dati precedenti trovati: {printers} stampanti, {history} voci di cronologia, {outbox} elementi in coda, {files} file.","legacyImportDone":"Importazione completata.","legacyImportFailed":"Impossibile importare i dati precedenti.","loading":"Caricamento…","massFailed":", non riusciti: {count}","massResult":"Invii riusciti: {count}{failed}.","namePlaceholder":"Nome","networkPermissionRequired":"Consenti l’accesso alla stampante in OrcaSlicer. Se disponibile, apri Plugin → Print Farm → Permessi. Poi fai clic su «Aggiorna» nella scheda di questa stampante.","noPrinters":"Nessuna stampante trovata. Configura un host stampante in OrcaSlicer o aggiungine uno sopra.","notReachable":"{printer}: la stampante non è raggiungibile","notReachableNotStarted":"{printer}: stampante non raggiungibile — avvio non eseguito.","nozzle":"Ugello","octoprintApiKeyPlaceholder":"Chiave API di OctoPrint","open":"Interfaccia web","operatorStartCheck":"Ho verificato che il file elaborato e la piastra selezionata siano adatti a questa stampante, che materiali e strumenti siano corretti e che il piatto sia libero.","other":"Altro","outboxCopiesOff":"Le copie delle elaborazioni sono disattivate nelle impostazioni del plugin.","outboxFallbackName":"elaborazione {stamp}","outboxHintText":"Nel profilo di processo non è selezionato alcun plugin Printers Outbox: le copie delle elaborazioni non vengono salvate.","outboxHintWhere":"Selezionalo in Processo → Altro → Plugin della pipeline di slicing.","outboxNotReady":"File G-code non pronto","outboxPrinterUsage":"Stampante: {name} · cartella: {folder} · {count} file · {size}. Esaminali o rimuovili qui sotto.","outboxQueued":"{name} messo in coda per {target}","outboxRemoveFailed":"Impossibile rimuovere il file salvato. Resta nell'elenco per consentire un nuovo tentativo.","outboxStorageCleanBlocked":"I residui si possono eliminare solo quando non è in corso alcun caricamento o stampa e l'indice dei file è integro.","outboxStorageCleanButton":"Elimina residui ({count} file, {size})","outboxStorageCleanConfirm":"Eliminare {count} file residui ({size}) dall'archivio di Print Farm? I file in coda per le stampanti non vengono toccati.","outboxStorageCleanDone":"Eliminati {count} file residui ({size}).","outboxStorageCleanFailed":"Impossibile eliminare {count} file: {paths}. Riprova.","outboxStorageEmpty":"Nessun file in coda né copia di ripristino trovati.","outboxStorageEntry":"{label}: {count} file · {size} · {path}","outboxStorageKindIncoming":"Caricamenti preparati","outboxStorageKindIndex":"Indice della coda","outboxStorageKindIndexBackup":"Backup dell'indice della coda","outboxStorageKindLoose":"File sparsi o orfani","outboxStorageKindRecovery":"File di ripristino precedenti","outboxStorageKindUnassigned":"File non assegnati","outboxStorageManualCleanup":"I file residui (file isolati, caricamenti preparati, copie di ripristino, backup dell'indice) si eliminano con il pulsante qui sotto. I file in coda per le stampanti si rimuovono uno alla volta.","outboxStorageScanFailed":"Impossibile esaminare tutti i percorsi dell'archivio: {paths}. I totali potrebbero essere incompleti.","outboxStorageWarning":"L'archivio cresce: rimuovi dalla coda i file che non ti servono più.","outboxUnassigned":"File non assegnati: {count} · {size}. Esaminali e rimuovili manualmente qui sotto.","outboxWriteFailed":"Impossibile conservare il file G-code","outboxWrongStep":"Non è il passaggio di post-elaborazione G-code","pause":"Pausa","plateLabel":"Piastra","preparedUploadDiscardFailed":"Impossibile rimuovere la copia temporanea del caricamento; controlla l'archivio.","print":"Stampa…","printShort":"Stampa","printerBusy":"La stampante è occupata","printerIpPlaceholder":"192.168.0.42 (IP stampante)","printerNotOnline":"La stampante non è in linea","prusalinkApiKeyPlaceholder":"Chiave API di PrusaLink","queueLess":"Mostra meno","queueMore":"Altri {count}","refresh":"Aggiorna","remove":"Rimuovi","removeRetainedTitle":"Rimuovi la copia conservata","repetierApiKeyPlaceholder":"Chiave API di Repetier","repetierLoadFailed":"Impossibile caricare la stampante Repetier. Controlla indirizzo, chiave ed elenco.","repetierLoadPrinters":"Carica stampanti","repetierModeUnsupported":"Scrittura non verificata per questa versione o connessione. Solo stato.","repetierNotReady":"Il server non ha confermato che la stampante accetti comandi.","repetierRequestAccepted":"Richiesta accettata; il lavoro può attendere nella coda del server. Il prossimo stato confermerà la stampa.","repetierSelectPrinter":"Scegli stampante","resume":"Continua","select":"seleziona","selectAllTitle":"Seleziona o deseleziona tutte le stampanti disponibili","selfSigned":"autofirmato","selfSignedTitle":"Abilita solo per una stampante servita via HTTPS con un certificato autofirmato. Le stampanti in LAN con semplice HTTP non ne hanno bisogno.","send":"Invia","sendFailed":"{printer}: invio non riuscito — {error}","sendSelected":"Invia G-code alle selezionate…","sendSelectedCount":"Invia G-code (selezionate: {count})…","sendToPrinterTitle":"Invia a questa stampante e avvia la stampa","sendingFile":"Invio di {name} (stampanti: {count})…","sentToPrint":"inviato in stampa","serialAuto":"Numero di serie (automatico)","serialTitle":"Il numero di serie viene rilevato automaticamente. Inseriscilo solo per vincolare una stampante specifica. Viene usata la porta MQTT 8883.","startApprovalExpired":"La conferma di avvio è scaduta o le impostazioni sono cambiate; verifica di nuovo.","startBedClear":"Il piatto è libero e pronto per una nuova stampa.","startBlocked":"Avvio bloccato per {printer}: {reason}","startCompatibilityUnknown":"Impossibile confermare la compatibilità del file elaborato con questa stampante. Puoi caricarlo senza avviare la stampa.","startConfirmMissing":"Avvio annullato: conferma che il piatto è libero e, dove richiesto, che il file è adatto alla stampante.","startFileCheck":"Ho verificato che questo file sia elaborato proprio per questa stampante.","startImmediately":"Avvia la stampa subito dopo il caricamento","startPrint":"Avvia stampa","startReasonFileKind":"Questo tipo di file non può essere avviato su questa stampante.","startReasonNoStart":"L'avvio delle stampe da Print Farm non è ancora disponibile per questa connessione. Puoi caricare il file.","startReasonPlate":"La piastra selezionata non corrisponde a questo file.","startReasonProfileMatch":"Il file è stato elaborato con il profilo OrcaSlicer di questa stampante.","startReasonProfileUnknown":"Print Farm non riesce a capire dal file per quale stampante sia stato elaborato.","startReasonProject":"È un file di progetto non elaborato. Elaboralo prima.","startReasonSlicedOnly":"Questa stampante avvia solo file 3MF elaborati, non G-code semplice.","startReasonUnsupported":"Questo tipo di connessione non è ancora supportato.","startReviewTitle":"Conferma ogni stampa","startVerdictCompatible":"Compatibile","startVerdictIncompatible":"Incompatibile","startVerdictUnknown":"Verifica manuale","startWillStart":"Stampanti che verranno avviate: {count}","stateAborted":"interrotto","stateBusy":"occupata","stateChecking":"verifica","stateComplete":"completata","stateError":"errore","stateFailed":"fallito","stateIdle":"inattiva","stateOffline":"non in linea","stateOnline":"in linea","statePaused":"in pausa","statePrinting":"in stampa","stateStandby":"in attesa","stateUnavailable":"non ancora disponibile","stateUnknown":"sconosciuto","stop":"Ferma","storageBar":"Archivio: {count} file · {size}","storageGroupTitle":"{name} · {count} file · {size}","storageMore":"Altri {count}…","supportPlanned":"Il supporto per {type} è pianificato ma non è ancora disponibile.","sure":"Confermi?","tlsCertificateChanged":"Il certificato della stampante è cambiato. Connessione bloccata.","tlsPermissionRequired":"Consenti l’accesso alla stampante in OrcaSlicer, poi ripeti la verifica del certificato.","tlsProbeFailed":"Impossibile leggere il certificato. Controlla la stampante e riprova.","tlsTrustBusy":"La stampante è in uso. Attendi il completamento dell’operazione.","tlsTrustButton":"Certificati…","tlsTrustConfirm":"Considera attendibile questo certificato","tlsTrustCurrent":"SHA-256 salvato","tlsTrustDetails":"Dettagli","tlsTrustFtps":"File (FTPS 990)","tlsTrustIntro":"Conferma i certificati solo su una rete fidata. La prima connessione non dimostra l’identità della stampante.","tlsTrustMqtt":"Stato e comandi (MQTT 8883)","tlsTrustNoPin":"Non confermato","tlsTrustObserved":"SHA-256 ricevuto","tlsTrustProbe":"Leggi e considera attendibile","tlsTrustReplacement":"Il certificato è diverso da quello salvato. Conferma la sostituzione solo se ti aspettavi questo cambiamento, ad esempio dopo aver sostituito o ripristinato la stampante.","tlsTrustRequired":"Conferma il certificato della stampante prima di connetterti.","tlsTrustSaveFailed":"Impossibile salvare la conferma del certificato.","tlsTrustSaved":"Certificato confermato.","tlsTrustStale":"Le impostazioni della stampante sono cambiate o la conferma è scaduta. Leggi di nuovo il certificato.","tlsTrustTitle":"Certificati Bambu","tlsTrustWorking":"Lettura del certificato…","toolActive":"strumento attivo","toolDetails":"{tool} · Attuale: {current} · Obiettivo: {target} · {state}","toolInactive":"strumento inattivo","toolViewOnly":"Solo visualizzazione; non cambia lo strumento attivo","unassignedDelete":"Elimina","unassignedDeleteAll":"Elimina tutti","unassignedDeleteAllConfirm":"Eliminare tutti i {count} file non collegati a una stampante ({size}) dall'archivio di Print Farm? Le copie sulle stampanti non vengono toccate.","unassignedDeleteConfirm":"Eliminare {name} ({size}) dall'archivio di Print Farm? Le copie sulle stampanti non vengono toccate.","unassignedHeading":"File non collegati a una stampante: {count} · {size}","unassignedNoPrinter":"Nessuna stampante è pronta. Deve essere in linea, inattiva e accettare caricamenti.","unassignedSend":"Invia a una stampante…","unassignedUpload":"Solo caricamento","unassignedUploadStart":"Carica e avvia","unassignedWhy":"Nessuna stampante nel pannello corrisponde al profilo stampante di questo file. Puoi inviarlo una volta a una stampante a tua scelta; non viene creato alcun collegamento.","unavailableSuffix":"non ancora disponibile","unmatchedQueued":"File in coda senza stampante corrispondente nel pannello: {count}","uploadShort":"Carica","uploadToPrinterTitle":"Carica il file su questa stampante senza avviare la stampa","uploadToPrinters":"Carica {name} sulle stampanti selezionate ({count}):","uploadUnverifiedHardware":"Caricamento non disponibile: non ancora verificato sull'hardware","uploadedNotStarted":"caricato (non avviato)","useAms":"Usa AMS (Bambu)","webuiAddress":"Indirizzo web (facoltativo)","webuiFallbackHelp":"Se il caricamento continua, copia l’indirizzo in un browser. La porta web si imposta in Connessione.","webuiHelp":"La pagina non si carica?"},"ja":{"accessCode":"アクセスコード","add":"追加","addConfiguredTitle":"OrcaSlicerで設定済みのプリンターを追加します","addPrinter":"プリンターを追加…","all":"すべて","bambuError":"プリンターエラー {code}","bambuLayer":"レイヤー {current}/{total}","bambuLeftHM":"残り {hours} 時間 {minutes} 分","bambuLeftM":"残り {minutes} 分","bed":"ベッド","busy":"{printer}: プリンターはビジー状態です（{state}）","busyNotStarted":"{printer}: プリンターはビジー状態です（{state}）— 開始しませんでした。","cameraButton":"ライブカメラ","cameraCapturedAt":"撮影 {time}","cameraClose":"カメラを閉じる","cameraLoadFailed":"ここでは映像を読み込めませんでした。このウィンドウはローカルネットワークの画像をブロックすることがあります。","cameraLoading":"カメラに接続しています…","cameraMode":"カメラ","cameraModeAuto":"設定されたウェブカメラ","cameraModeU1":"Snapmaker U1 純正カメラ","cameraNativeSession":"カメラセッション開始","cameraNone":"このプリンターにはカメラが設定されていません。","cameraOpenWindow":"ウィンドウでカメラを開く","cameraPermissionDenied":"バックグラウンド処理が拒否されました。許可してカメラを開き直してください。","cameraReceivedAt":"受信 {time}","cameraTitle":"カメラ: {printer}","cameraUnavailable":"カメラに接続できませんでした。","cancel":"取消し","cfgAutoDelete":"古いコピーを自動的に削除する","cfgAutoDeleteAge":"次の期間より古いコピーを削除","cfgAutoDeleteHint":"既定ではオフです。起動時と1日1回確認し、このプラグインのコピーのみ削除します。使用中のファイルは削除しません。","cfgClearConfirm":"印刷ジャーナルを消去しますか？この操作は元に戻せません。","cfgClearDone":"リクエストを保存しました。パネルが次に設定を読み込むときにジャーナルが消去されます。","cfgClearHistory":"印刷ジャーナルを消去","cfgDays":"{days} 日","cfgJournalOrca":"Orca から開始した送信と印刷を印刷ジャーナルに記録する","cfgJournalOrcaHint":"OrcaSlicer 自身が報告したジョブのみです。","cfgKeepAll":"すべて","cfgKeepCopies":"スライス済みファイルのコピーを保存する","cfgKeepCopiesHint":"後でスライスをプリンターに送信できます。オフの場合、コピーは作成されません。","cfgKeepHistory":"印刷ジャーナルを保存する","cfgKeepHistoryHint":"オフの場合、新しい記録は保存されません。既存の記録は残ります。","cfgKeepLast":"プリンターごとに最新のスライスだけを保持","cfgKeepLastHint":"新しいスライスを保存すると、同じプリンターの古い未送信コピーが削除されます。印刷ジャーナルに関連付けられたコピーは残ります。","cfgPauseHidden":"パネルが見えていない間は問い合わせない","cfgPauseHiddenHint":"タブまたはウィンドウが非表示の間、ネットワーク要求を節約します。","cfgPollInterval":"プリンターの問い合わせ間隔","cfgProfileHint":"プロセスプリセットでプラグインが未選択のときにヒントを表示","cfgProfileHintHint":"スライスがこのプラグインに届かなかった場合、パネルに表示されます。","cfgSeconds":"{seconds} 秒","close":"閉じる","comingLater":"近日対応","commandFailed":"{printer}: 「{action}」コマンドに失敗しました — {error}","commandSent":"{printer}: 「{action}」コマンドを送信しました。","confirmTitle":"複数のプリンターで印刷を開始しますか？","confirmUploadTitle":"選択したプリンターにファイルをアップロードしますか？","connectionOptions":"接続","connectionOptionsFailed":"保存できません。アドレスを確認してください。","connectionOptionsHelp":"同じホストを使用し、Web ポートを指定してください。","connectionSave":"保存","connectionTypeTitle":"接続タイプ。利用できる機能は、プリンターのプロトコルと現在の状態によって異なります。","controlsUnverified":"この接続では一時停止と中止は利用できません（実機で未検証）","crealityWsPortPlaceholder":"WSポート (9999)","crealityWsPortTitle":"任意。プリンターのステータス用WebSocketのポート。9999は未確認の既定値です。プリンターが別のポートを使う場合は変更してください。","credentialLegacyWarning":"{count} 台のプリンターのキーが平文で残っています。システム保管庫に移してください。古いバックアップは残ります。","credentialMigrate":"キーを移動","credentialMigrationConfirm":"キーをシステム保管庫に移しますか？古いバックアップは残ります。","credentialMigrationDone":"キーをシステム保管庫に移しました。","credentialRetry":"アクセスを再試行","credentialSaveFailed":"キーを安全に保存できませんでした。プリンターは保存されていません。","credentialUnavailable":"システム保管庫を利用できません。接続を停止しました。","dashboardOpened":"Print Farmパネルを開きました。","duetPasswordPlaceholder":"Duet マシンのパスワード","errorNeedsAccessCode":"プリンターのアクセスコードが必要です","errorNeedsBambuCredentials":"プリンターのIP、アクセスコード、シリアル番号が必要です","errorNoAddress":"プリンターのアドレスがありません","errorOutcomeUnknown":"プリンターが要求を受信したかどうか不明です。再試行する前にプリンターを確認してください","errorPrintCommand":"印刷コマンドが失敗しました: {error}","errorUnknownAction":"不明なプリンター操作","errorUnknownSerial":"アップロードしましたが、プリンターのシリアル番号が不明です — プリンター本体から開始してください","errorUnsupportedBackend":"このプリンターの接続タイプには対応していません","errorUpload":"アップロードに失敗しました: {error}","errorUploadUnverified":"ファイルはアップロードされましたが、プリンター上でサイズを検証できなかったため、印刷は開始されませんでした","errorUploadedNotStarted":"ファイルはアップロードされましたが、印刷は開始されませんでした: {error}","feedbackButton":"フィードバック","feedbackCopied":"コピーしました","feedbackCopy":"コピー","feedbackHelp":"アドレスをブラウザーにコピーし、サイトのフィードバックボタンを使ってください。プリンター情報は送信されません。 “Beta Feedback”.","file3mfWarning":".3mfはBambuプリンターでのみ開始できます。他のプリンターではG-codeが必要です。","fileOperationDone":"{printer}: {name} {result}。","fileReadFailed":"送信失敗: ファイルを読み取れませんでした。","fileTargetMismatch":"{printer}: キュー内のファイルはこのプリンターに対応していません — 開始しませんでした。","flashforgeCheckCodePlaceholder":"チェックコード（プリンター画面に表示）","flashforgeCheckCodeTitle":"プリンター画面に表示されるチェックコード。プリンターで LAN モードを有効にしてください。","flashforgeErrAuth":"シリアル番号またはチェックコードが正しくありません。","flashforgeErrCredentials":"シリアル番号とチェックコードを入力してください。","flashforgeErrIdentity":"プリンターのモデルを確認できませんでした。","flashforgeErrLanMode":"プリンターで LAN モードをオンにしてください。","flashforgeErrUnsupportedModel":"この FlashForge のモデルはサポートされていません（Adventurer 5M、5M Pro、AD5X のみ）。","flashforgeSerialPlaceholder":"シリアル番号","flashforgeSerialTitle":"プリンター画面に表示されるシリアル番号（設定 > 本機情報 またはネットワーク）。LAN モードをオンにしてください。","fleetAttention":"要確認","fleetIdle":"待機中","fleetPrinting":"印刷中","foundOnNetwork":"ネットワーク上で検出","genericError":"エラー","history":"印刷履歴","historyCoverage":"ローカルで確認できた印刷履歴です。Print Farmで開始した印刷と、このパネルを開いている間に確認できたジョブが含まれます。OrcaSlicerが動作していない間の作業は記録されない場合があります。","historyDurationHoursMinutes":"{hours} 時間 {minutes} 分","historyDurationMinutes":"{minutes} 分","historyEmpty":"このプリンターではまだ印刷が確認されていません。","historyFromOrca":"OrcaSlicer から報告","historyLoading":"印刷履歴を読み込み中…","historyObserved":"Print Farmが検知","historyProgress":"{progress}%","historyStartedHere":"Print Farmで開始","historyStateCancelled":"取消済み","historyStateCompleted":"完了","historyStateEnded":"終了","historyStateFailed":"失敗","historyStatePaused":"一時停止中","historyStatePrinting":"印刷中","historyStateSent":"送信済み","historyTitle":"印刷履歴 — {printer}","historyUnknownFile":"不明なファイル","integrationUnavailable":"プリンターの連携にはまだ対応していません","journalActiveCount":"進行中: {count}件","journalAllCount":"記録: {count}件","journalBlockedByHold":"このプリンターの以前の操作が未解決です。プリンターを確認してから、印刷ジャーナルを開いて保留を解除してください","journalButton":"印刷ジャーナル","journalCompletedCount":"完了: {count}件","journalEmptyAll":"記録された印刷はまだありません。","journalFileDelete":"ファイルを削除","journalFileUnsent":"スライス済み・未送信","journalHoldLocked":"この操作はまだ送信処理中のため、解除できません。","journalHoldReleased":"保留を解除しました。以前の操作は未確認のままです。","journalHoldState":"状態: {state}","journalHoldUnavailable":"未解決の操作の詳細を取得できません。印刷ジャーナルを開き直してください。","journalHoldsHeading":"未解決の操作 — 保留を解除する前に、実機のプリンター、ジョブ、ベッド上のプレートを確認してください。","journalNoResults":"一致する印刷はありません。","journalPrinter":"プリンター","journalReleaseConfirm":"「{target}」について実機のプリンター、ジョブ、ベッド上のプレートを確認したうえで、この保留を解除しますか？ 解除しても今後の試行が可能になるだけで、以前の印刷が成功したと記録されたり、再実行されたりすることはありません。","journalReleaseHold":"保留を解除","journalResend":"もう一度送信…","journalResultsCount":"検索結果: {count}件","journalSearchLabel":"印刷ジャーナルを検索","journalSearchPlaceholder":"ファイルまたはプリンターを検索…","journalSendConfirm":"印刷を開始せずに {name} を {printer} にアップロードしますか？","journalStoreUnavailable":"印刷ジャーナルを利用できません。プラグインのローカルストレージを確認してください。","journalTitle":"印刷ジャーナル","legacyImportBlocked":"データは以前の保存フォルダーに残っています。このデータは自動的にインポートできません。","legacyImportButton":"旧データをインポート","legacyImportConfirm":"データとローカル認証情報をOrcaSlicerプラグインのローカルストレージにコピーします。旧データは保持されます。続行しますか？","legacyImportDetail":"旧データ: プリンター {printers} 台、履歴 {history} 件、キュー項目 {outbox} 件、ファイル {files} 個。","legacyImportDone":"インポートが完了しました。","legacyImportFailed":"旧データをインポートできませんでした。","loading":"読み込み中…","massFailed":"（失敗: {count}）","massResult":"{count}台のプリンターに送信しました{failed}。","namePlaceholder":"名称","networkPermissionRequired":"OrcaSlicer でプリンターへのアクセスを許可してください。利用できる場合は、プラグイン → Print Farm → 権限を開きます。その後、このプリンターのカードにある「再読込」をクリックしてください。","noPrinters":"プリンターが見つかりません。OrcaSlicerでプリンターホストを設定するか、上から追加してください。","notReachable":"{printer}: プリンターに接続できません","notReachableNotStarted":"{printer}: プリンターに接続できません — 開始しませんでした。","nozzle":"ノズル","octoprintApiKeyPlaceholder":"OctoPrint APIキー","open":"Web UIを開く","operatorStartCheck":"スライス済みファイルと選択したプレートがこのプリンターに適合し、材料とツールが正しく、ベッドが空いていることを確認しました。","other":"その他","outboxCopiesOff":"スライスのコピーはプラグイン設定で無効になっています。","outboxFallbackName":"スライス {stamp}","outboxHintText":"プロセスプリセットで Printers Outbox プラグインが選択されていません。スライス結果のコピーは保存されません。","outboxHintWhere":"「プロセス → その他 → スライスパイプラインプラグイン」で選択してください。","outboxNotReady":"G-code ファイルの準備ができていません","outboxPrinterUsage":"プリンター: {name} · フォルダー: {folder} · {count} 件 · {size}。下で確認または削除できます。","outboxQueued":"{name} を {target} のキューに入れました","outboxRemoveFailed":"保存ファイルを削除できませんでした。再試行できるよう一覧に残しています。","outboxStorageCleanBlocked":"残りファイルは、アップロードや印刷が実行中でなく、ファイルインデックスが正常な場合のみ削除できます。","outboxStorageCleanButton":"残りファイルを削除（{count} 件、{size}）","outboxStorageCleanConfirm":"Print Farm のストレージから残りファイル {count} 件（{size}）を削除しますか？ プリンターのキュー内のファイルには触れません。","outboxStorageCleanDone":"残りファイル {count} 件（{size}）を削除しました。","outboxStorageCleanFailed":"{count} 件のファイルを削除できませんでした: {paths}。もう一度お試しください。","outboxStorageEmpty":"キューのファイルや復旧コピーはありません。","outboxStorageEntry":"{label}: {count} 件 · {size} · {path}","outboxStorageKindIncoming":"準備済みアップロード","outboxStorageKindIndex":"キューのインデックス","outboxStorageKindIndexBackup":"キューのインデックスのバックアップ","outboxStorageKindLoose":"単独ファイルまたは孤立ファイル","outboxStorageKindRecovery":"旧データ復旧ファイル","outboxStorageKindUnassigned":"未割り当てファイル","outboxStorageManualCleanup":"残りファイル（単独ファイル、準備済みアップロード、復旧コピー、インデックスのバックアップ）は下のボタンで削除できます。プリンターのキュー内のファイルは 1 件ずつ削除します。","outboxStorageScanFailed":"一部の保存先を確認できませんでした: {paths}。合計が不完全な可能性があります。","outboxStorageWarning":"ストレージが増えています。不要になったキューのファイルを削除してください。","outboxUnassigned":"未割り当てファイル: {count} 件 · {size}。下で確認して手動で削除できます。","outboxWriteFailed":"G-code ファイルを保持できませんでした","outboxWrongStep":"G-code の後処理ステップではありません","pause":"一時停止","plateLabel":"プレート","preparedUploadDiscardFailed":"アップロードの一時コピーを削除できませんでした。ストレージを確認してください。","print":"印刷…","printShort":"印刷","printerBusy":"プリンターはビジー状態です","printerIpPlaceholder":"192.168.0.42 (プリンター IP)","printerNotOnline":"プリンターがオンラインではありません","prusalinkApiKeyPlaceholder":"PrusaLink APIキー","queueLess":"折りたたむ","queueMore":"さらに{count}件表示","refresh":"再読込","remove":"削除","removeRetainedTitle":"保持しているコピーを削除","repetierApiKeyPlaceholder":"Repetier APIキー","repetierLoadFailed":"Repetier プリンターを読み込めません。アドレス、キー、一覧を確認してください。","repetierLoadPrinters":"プリンターを読み込む","repetierModeUnsupported":"このサーバーバージョンまたは接続の書き込み対応は未確認です。状態のみ表示します。","repetierNotReady":"サーバーはこのプリンターのコマンド受付を確認していません。","repetierRequestAccepted":"要求を受け付けました。ジョブはサーバーのキューで待機する場合があります。次の状態報告で印刷を確認します。","repetierSelectPrinter":"プリンターを選択","resume":"再開","select":"選択","selectAllTitle":"利用可能なすべてのプリンターを選択または選択解除します","selfSigned":"自己署名","selfSignedTitle":"自己署名証明書を使うHTTPSのプリンターでのみ有効にしてください。通常のHTTP接続のLANプリンターでは不要です。","send":"送信","sendFailed":"{printer}: 送信失敗 — {error}","sendSelected":"選択したプリンターにG-codeを送信…","sendSelectedCount":"選択した{count}台にG-codeを送信…","sendToPrinterTitle":"このプリンターに送信して印刷を開始します","sendingFile":"{name}を{count}台に送信中…","sentToPrint":"印刷に送信済み","serialAuto":"シリアル番号 (自動)","serialTitle":"シリアル番号は自動的に検出されます。特定のプリンターに固定する場合のみ入力してください。MQTTポート8883を使用します。","startApprovalExpired":"開始の承認が期限切れになったか、設定が変更されました。もう一度確認してください。","startBedClear":"ベッドは空で、新しい印刷の準備ができています。","startBlocked":"{printer} の開始をブロックしました: {reason}","startCompatibilityUnknown":"スライス済みファイルがこのプリンターに対応していることを確認できませんでした。印刷を開始せずにファイルをアップロードできます。","startConfirmMissing":"開始を中止しました。ベッドが空であること、および求められた場合はファイルがプリンターに適していることを確認してください。","startFileCheck":"このファイルがまさにこのプリンター向けにスライスされていることを確認しました。","startImmediately":"アップロード後すぐに印刷を開始","startPrint":"印刷を開始","startReasonFileKind":"この種類のファイルはこのプリンターで開始できません。","startReasonNoStart":"この接続では Print Farm からの印刷開始はまだ利用できません。ファイルのアップロードは可能です。","startReasonPlate":"選択したプレートはこのファイルと一致しません。","startReasonProfileMatch":"このファイルはこのプリンターの OrcaSlicer プリセットでスライスされています。","startReasonProfileUnknown":"Print Farm はファイルからどのプリンター向けにスライスされたか判断できません。","startReasonProject":"スライスされていないプロジェクトファイルです。先にスライスしてください。","startReasonSlicedOnly":"このプリンターはスライス済みの 3MF のみ開始でき、単なる G-code は開始できません。","startReasonUnsupported":"この接続タイプにはまだ対応していません。","startReviewTitle":"各印刷を確認","startVerdictCompatible":"互換あり","startVerdictIncompatible":"互換なし","startVerdictUnknown":"手動で確認","startWillStart":"開始するプリンター: {count}","stateAborted":"中断","stateBusy":"ビジー","stateChecking":"確認中","stateComplete":"完了","stateError":"エラー","stateFailed":"失敗","stateIdle":"待機中","stateOffline":"オフライン","stateOnline":"オンライン","statePaused":"一時停止中","statePrinting":"印刷中","stateStandby":"スタンバイ","stateUnavailable":"まだ利用できません","stateUnknown":"不明","stop":"中止","storageBar":"ストレージ: {count} 件 · {size}","storageGroupTitle":"{name} · {count} 件 · {size}","storageMore":"さらに {count} 件…","supportPlanned":"{type}のサポートは計画中ですが、まだ利用できません。","sure":"確認？","tlsCertificateChanged":"プリンターの証明書が変更されました。接続をブロックしました。","tlsPermissionRequired":"OrcaSlicerでプリンターへのアクセスを許可してから、証明書の確認を再試行してください。","tlsProbeFailed":"証明書を読み取れませんでした。プリンターを確認して、もう一度お試しください。","tlsTrustBusy":"プリンターは使用中です。操作が終わるまでお待ちください。","tlsTrustButton":"証明書…","tlsTrustConfirm":"この証明書を信頼する","tlsTrustCurrent":"保存済みSHA-256","tlsTrustDetails":"詳細","tlsTrustFtps":"ファイル（FTPS 990）","tlsTrustIntro":"信頼できるネットワーク上でのみ証明書を確認してください。初回接続ではプリンターの身元を証明できません。","tlsTrustMqtt":"状態とコマンド（MQTT 8883）","tlsTrustNoPin":"未確認","tlsTrustObserved":"受信したSHA-256","tlsTrustProbe":"読み取って信頼する","tlsTrustReplacement":"証明書が保存済みのものと異なります。プリンターの交換やリセット後など、変更を予期していた場合にのみ新しい証明書を確認してください。","tlsTrustRequired":"接続する前にプリンターの証明書を確認してください。","tlsTrustSaveFailed":"証明書の確認を保存できませんでした。","tlsTrustSaved":"証明書を確認しました。","tlsTrustStale":"プリンター設定が変更されたか、確認の有効期限が切れました。証明書を再度読み取ってください。","tlsTrustTitle":"Bambuの証明書","tlsTrustWorking":"証明書を読み取り中…","toolActive":"アクティブなツール","toolDetails":"{tool} · 現在: {current} · 目標: {target} · {state}","toolInactive":"非使用ツール","toolViewOnly":"詳細の表示のみ。使用中のツールは変更しません","unassignedDelete":"削除","unassignedDeleteAll":"すべて削除","unassignedDeleteAllConfirm":"プリンターに紐づいていないファイル {count} 件 ({size}) をすべて Print Farm のストレージから削除しますか？プリンター上のコピーには影響しません。","unassignedDeleteConfirm":"{name} ({size}) をPrint Farmのストレージから削除しますか？プリンター上のコピーには影響しません。","unassignedHeading":"プリンターに紐づいていないファイル: {count} · {size}","unassignedNoPrinter":"準備できているプリンターがありません。オンラインで待機中、かつアップロードを受け付ける必要があります。","unassignedSend":"プリンターに送信…","unassignedUpload":"アップロードのみ","unassignedUploadStart":"アップロードして開始","unassignedWhy":"パネル内のどのプリンターも、このファイルのプリンタープリセットと一致しません。選んだプリンターに一度だけ送信できます。紐づけは作成されません。","unavailableSuffix":"まだ利用できません","unmatchedQueued":"キュー内の{count}件のファイルが、パネル上のどのプリンターとも一致しません","uploadShort":"アップロード","uploadToPrinterTitle":"印刷を開始せずにこのプリンターへファイルをアップロード","uploadToPrinters":"{name}を{count}台のプリンターにアップロード:","uploadUnverifiedHardware":"アップロードは利用できません: まだ実機で検証されていません","uploadedNotStarted":"アップロード済み（未開始）","useAms":"AMS（Bambu）を使用","webuiAddress":"Web UI アドレス（任意）","webuiFallbackHelp":"読み込みが続く場合はアドレスをブラウザーにコピーしてください。Web ポートは接続で設定できます。","webuiHelp":"ページが読み込まれない場合"},"ko":{"accessCode":"액세스 코드","add":"추가","addConfiguredTitle":"OrcaSlicer에 설정된 프린터 추가","addPrinter":"프린터 추가…","all":"모두","bambuError":"프린터 오류 {code}","bambuLayer":"레이어 {current}/{total}","bambuLeftHM":"{hours}시간 {minutes}분 남음","bambuLeftM":"{minutes}분 남음","bed":"베드","busy":"{printer}: 프린터 사용 중 ({state})","busyNotStarted":"{printer}: 프린터 사용 중({state}) — 시작하지 않았습니다.","cameraButton":"실시간 카메라","cameraCapturedAt":"촬영 {time}","cameraClose":"카메라 닫기","cameraLoadFailed":"여기서는 영상을 불러오지 못했습니다. 이 창은 로컬 네트워크의 이미지를 차단할 수 있습니다.","cameraLoading":"카메라에 연결하는 중…","cameraMode":"카메라","cameraModeAuto":"설정된 웹캠","cameraModeU1":"Snapmaker U1 기본 카메라","cameraNativeSession":"카메라 세션 열림","cameraNone":"이 프린터에는 카메라가 설정되어 있지 않습니다.","cameraOpenWindow":"창에서 카메라 열기","cameraPermissionDenied":"백그라운드 작업 권한이 거부되었습니다. 허용한 뒤 카메라를 다시 여세요.","cameraReceivedAt":"수신 {time}","cameraTitle":"카메라: {printer}","cameraUnavailable":"카메라에 연결할 수 없습니다.","cancel":"취소","cfgAutoDelete":"오래된 사본 자동 삭제","cfgAutoDeleteAge":"다음보다 오래된 사본 삭제","cfgAutoDeleteHint":"기본값은 꺼짐입니다. 시작 시와 하루에 한 번 확인하며, 이 플러그인의 사본만 삭제하고 사용 중인 파일은 삭제하지 않습니다.","cfgClearConfirm":"출력 일지를 지울까요? 되돌릴 수 없습니다.","cfgClearDone":"요청이 저장되었습니다. 패널이 다음에 설정을 읽을 때 일지가 지워집니다.","cfgClearHistory":"출력 일지 지우기","cfgDays":"{days}일","cfgJournalOrca":"Orca에서 시작한 전송과 출력을 출력 일지에 기록","cfgJournalOrcaHint":"OrcaSlicer가 직접 보고한 작업만 해당합니다.","cfgKeepAll":"모두","cfgKeepCopies":"슬라이스 파일 사본 보관","cfgKeepCopiesHint":"나중에 슬라이스를 프린터로 보낼 수 있습니다. 끄면 아무것도 복사하지 않습니다.","cfgKeepHistory":"출력 일지 보관","cfgKeepHistoryHint":"끄면 새 항목을 기록하지 않으며 기존 항목은 유지됩니다.","cfgKeepLast":"프린터별로 최신 슬라이스만 보관","cfgKeepLastHint":"새 슬라이스를 저장하면 같은 프린터의 오래된 미전송 사본이 삭제됩니다. 인쇄 저널에 연결된 사본은 유지됩니다.","cfgPauseHidden":"패널이 보이지 않는 동안 조회하지 않음","cfgPauseHiddenHint":"탭이나 창이 숨겨진 동안 네트워크 요청을 줄입니다.","cfgPollInterval":"프린터 조회 간격","cfgProfileHint":"프로세스 사전 설정에서 플러그인이 선택되지 않은 경우 안내 표시","cfgProfileHintHint":"슬라이스가 이 플러그인에 도달하지 않았을 때 패널에 표시됩니다.","cfgSeconds":"{seconds}초","close":"닫기","comingLater":"나중에 제공","commandFailed":"{printer}: {action} 명령 실패 — {error}","commandSent":"{printer}: {action} 명령을 보냈습니다.","confirmTitle":"여러 프린터에서 출력을 시작할까요?","confirmUploadTitle":"선택한 프린터에 파일을 업로드할까요?","connectionOptions":"연결","connectionOptionsFailed":"저장할 수 없습니다. 주소를 확인하세요.","connectionOptionsHelp":"같은 호스트를 사용하고 웹 포트를 지정하세요.","connectionSave":"저장","connectionTypeTitle":"연결 유형. 사용 가능한 기능은 프린터 프로토콜과 현재 상태에 따라 다릅니다.","controlsUnverified":"이 연결에서는 일시 정지와 정지를 사용할 수 없습니다(실제 장비에서 미검증)","crealityWsPortPlaceholder":"WS 포트 (9999)","crealityWsPortTitle":"선택 사항. 프린터 상태 WebSocket의 포트입니다. 9999는 확인되지 않은 기본값이므로 프린터가 다른 포트를 사용하면 변경하세요.","credentialLegacyWarning":"{count}대 프린터의 키가 아직 일반 텍스트로 저장되어 있습니다. 시스템 저장소로 이동하세요. 이전 백업은 유지됩니다.","credentialMigrate":"키 이동","credentialMigrationConfirm":"키를 시스템 저장소로 이동할까요? 이전 백업은 유지됩니다.","credentialMigrationDone":"키를 시스템 저장소로 이동했습니다.","credentialRetry":"접근 다시 시도","credentialSaveFailed":"키를 안전하게 저장하지 못했습니다. 프린터가 저장되지 않았습니다.","credentialUnavailable":"시스템 저장소를 사용할 수 없어 연결을 차단했습니다.","dashboardOpened":"Print Farm 패널을 열었습니다.","duetPasswordPlaceholder":"Duet 장치 비밀번호","errorNeedsAccessCode":"프린터 액세스 코드가 필요합니다","errorNeedsBambuCredentials":"프린터 IP, 액세스 코드, 시리얼 번호가 필요합니다","errorNoAddress":"프린터 주소가 없습니다","errorOutcomeUnknown":"프린터가 요청을 받았는지 알 수 없습니다. 다시 시도하기 전에 프린터를 확인하세요","errorPrintCommand":"출력 명령 실패: {error}","errorUnknownAction":"알 수 없는 프린터 작업","errorUnknownSerial":"업로드했지만 프린터 시리얼 번호를 아직 알 수 없습니다 — 프린터에서 직접 시작하세요","errorUnsupportedBackend":"이 프린터의 연결 유형은 지원되지 않습니다","errorUpload":"업로드 실패: {error}","errorUploadUnverified":"파일은 업로드되었지만 프린터에서 크기를 확인할 수 없어 출력을 시작하지 않았습니다","errorUploadedNotStarted":"파일은 업로드되었지만 출력이 시작되지 않았습니다: {error}","feedbackButton":"의견 보내기","feedbackCopied":"복사됨","feedbackCopy":"복사","feedbackHelp":"주소를 브라우저에 복사한 뒤 사이트의 의견 버튼을 사용하세요. 프린터 데이터는 전송되지 않습니다. “Beta Feedback”.","file3mfWarning":".3mf는 Bambu 프린터에서만 시작됩니다. 다른 프린터는 G-code가 필요합니다.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"보내기 실패: 파일을 읽을 수 없습니다.","fileTargetMismatch":"{printer}: 대기 중인 파일이 이 프린터와 일치하지 않아 출력을 시작하지 않았습니다.","flashforgeCheckCodePlaceholder":"확인 코드(프린터 화면에 표시)","flashforgeCheckCodeTitle":"프린터 화면에 표시되는 확인 코드. 프린터에서 LAN 모드를 켜야 합니다.","flashforgeErrAuth":"시리얼 번호 또는 확인 코드가 올바르지 않습니다.","flashforgeErrCredentials":"시리얼 번호와 확인 코드를 입력하세요.","flashforgeErrIdentity":"프린터 모델을 확인할 수 없습니다.","flashforgeErrLanMode":"프린터에서 LAN 모드를 켜세요.","flashforgeErrUnsupportedModel":"이 FlashForge 모델은 지원되지 않습니다(Adventurer 5M, 5M Pro, AD5X만 지원).","flashforgeSerialPlaceholder":"시리얼 번호","flashforgeSerialTitle":"프린터 화면에 표시되는 시리얼 번호(설정 > 정보 또는 네트워크). LAN 모드가 켜져 있어야 합니다.","fleetAttention":"확인 필요","fleetIdle":"대기 중","fleetPrinting":"인쇄 중","foundOnNetwork":"네트워크에서 발견됨","genericError":"오류","history":"출력 기록","historyCoverage":"로컬에서 확인된 출력 기록입니다. Print Farm에서 시작한 출력과 이 패널이 열려 있는 동안 확인된 작업이 포함되며, OrcaSlicer가 실행되지 않은 동안의 작업은 누락될 수 있습니다.","historyDurationHoursMinutes":"{hours}시간 {minutes}분","historyDurationMinutes":"{minutes}분","historyEmpty":"이 프린터에 대해 확인된 출력이 아직 없습니다.","historyFromOrca":"OrcaSlicer에서 보고됨","historyLoading":"출력 기록을 불러오는 중…","historyObserved":"Print Farm에서 확인","historyProgress":"{progress}%","historyStartedHere":"Print Farm에서 시작","historyStateCancelled":"취소됨","historyStateCompleted":"완료","historyStateEnded":"종료됨","historyStateFailed":"실패","historyStatePaused":"일시 정지됨","historyStatePrinting":"출력 중","historyStateSent":"전송됨","historyTitle":"출력 기록 — {printer}","historyUnknownFile":"알 수 없는 파일","integrationUnavailable":"프린터 연동은 아직 지원되지 않습니다","journalActiveCount":"진행 중 {count}개","journalAllCount":"기록 {count}개","journalBlockedByHold":"이 프린터의 이전 작업이 해결되지 않았습니다. 프린터를 확인한 뒤 출력 일지를 열어 보류를 해제하세요","journalButton":"출력 일지","journalCompletedCount":"완료 {count}개","journalEmptyAll":"기록된 출력이 아직 없습니다.","journalFileDelete":"파일 삭제","journalFileUnsent":"슬라이스됨, 미전송","journalHoldLocked":"이 작업은 아직 전송 중이므로 지금은 해제할 수 없습니다.","journalHoldReleased":"보류를 해제했습니다. 이전 작업은 확인되지 않은 상태로 남아 있습니다.","journalHoldState":"상태: {state}","journalHoldUnavailable":"해결되지 않은 작업의 세부 정보를 확인할 수 없습니다. 출력 일지를 다시 열어 보세요.","journalHoldsHeading":"해결되지 않은 작업 — 보류를 해제하기 전에 실제 프린터, 작업, 빌드 플레이트를 확인하세요.","journalNoResults":"일치하는 출력이 없습니다.","journalPrinter":"프린터","journalReleaseConfirm":"“{target}”의 실제 프린터, 작업, 빌드 플레이트를 확인한 후 이 보류를 해제할까요? 이후 시도만 가능해질 뿐, 이전 출력이 성공한 것으로 표시되거나 다시 시도되지는 않습니다.","journalReleaseHold":"보류 해제","journalResend":"다시 보내기…","journalResultsCount":"결과 {count}개","journalSearchLabel":"출력 일지 검색","journalSearchPlaceholder":"파일 또는 프린터 검색…","journalSendConfirm":"출력을 시작하지 않고 {name}을(를) {printer}에 업로드할까요?","journalStoreUnavailable":"출력 일지를 사용할 수 없습니다. 플러그인의 로컬 저장소를 확인하세요.","journalTitle":"출력 일지","legacyImportBlocked":"데이터는 이전 저장 폴더에 남아 있습니다. 이 데이터는 자동으로 가져올 수 없습니다.","legacyImportButton":"이전 데이터 가져오기","legacyImportConfirm":"데이터와 로컬 자격 증명을 이 OrcaSlicer 플러그인의 로컬 저장소로 복사합니다. 기존 데이터는 그대로 유지됩니다. 계속할까요?","legacyImportDetail":"이전 데이터 발견: 프린터 {printers}대, 기록 {history}개, 대기열 항목 {outbox}개, 파일 {files}개.","legacyImportDone":"가져오기가 완료되었습니다.","legacyImportFailed":"이전 데이터를 가져오지 못했습니다.","loading":"불러오는 중…","massFailed":" (실패 {count}대)","massResult":"프린터 {count}대로 전송했습니다{failed}.","namePlaceholder":"이름","networkPermissionRequired":"OrcaSlicer에서 프린터 접근을 허용하세요. 해당 메뉴가 있으면 플러그인 → Print Farm → 권한을 사용하세요. 그런 다음 이 프린터 카드의 ‘새로 고침’을(를) 클릭하세요.","noPrinters":"프린터를 찾을 수 없습니다. OrcaSlicer에서 프린터 호스트를 설정하거나 위에서 하나를 추가하세요.","notReachable":"{printer}: 프린터에 연결할 수 없습니다","notReachableNotStarted":"{printer}: 프린터에 연결할 수 없어 시작하지 않았습니다.","nozzle":"노즐","octoprintApiKeyPlaceholder":"OctoPrint API 키","open":"웹 UI 열기","operatorStartCheck":"슬라이스 파일과 선택한 플레이트가 이 프린터에 적합하고, 재료와 도구가 올바르며, 베드가 비어 있는지 확인했습니다.","other":"기타","outboxCopiesOff":"슬라이스 사본이 플러그인 설정에서 꺼져 있습니다.","outboxFallbackName":"슬라이스 {stamp}","outboxHintText":"프로세스 사전 설정에 Printers Outbox 플러그인이 선택되어 있지 않아 슬라이스 사본이 저장되지 않습니다.","outboxHintWhere":"프로세스 → 기타 → 슬라이싱 파이프라인 플러그인에서 선택하세요.","outboxNotReady":"G-code 파일이 준비되지 않음","outboxPrinterUsage":"프린터: {name} · 폴더: {folder} · 파일 {count}개 · {size}. 아래에서 확인하거나 제거하세요.","outboxQueued":"{name}을(를) {target} 대기열에 추가했습니다","outboxRemoveFailed":"저장된 파일을 제거하지 못했습니다. 다시 시도할 수 있도록 목록에 남겨 둡니다.","outboxStorageCleanBlocked":"남은 파일은 업로드나 출력이 진행 중이 아니고 파일 인덱스가 정상일 때만 삭제할 수 있습니다.","outboxStorageCleanButton":"남은 파일 삭제 ({count}개, {size})","outboxStorageCleanConfirm":"Print Farm 저장소에서 남은 파일 {count}개({size})를 삭제할까요? 프린터 대기열의 파일은 건드리지 않습니다.","outboxStorageCleanDone":"남은 파일 {count}개({size})를 삭제했습니다.","outboxStorageCleanFailed":"파일 {count}개를 삭제하지 못했습니다: {paths}. 다시 시도하세요.","outboxStorageEmpty":"대기열 파일이나 복구 사본이 없습니다.","outboxStorageEntry":"{label}: 파일 {count}개 · {size} · {path}","outboxStorageKindIncoming":"준비된 업로드","outboxStorageKindIndex":"대기열 인덱스","outboxStorageKindIndexBackup":"대기열 인덱스 백업","outboxStorageKindLoose":"개별 파일 또는 고아 파일","outboxStorageKindRecovery":"이전 복구 파일","outboxStorageKindUnassigned":"미할당 파일","outboxStorageManualCleanup":"남은 파일(개별 파일, 준비된 업로드, 복구 사본, 인덱스 백업)은 아래 버튼으로 삭제할 수 있습니다. 프린터 대기열의 파일은 하나씩 제거합니다.","outboxStorageScanFailed":"모든 저장 경로를 확인할 수 없습니다: {paths}. 합계가 불완전할 수 있습니다.","outboxStorageWarning":"저장소가 늘고 있습니다. 더 이상 필요 없는 대기열 파일을 삭제하세요.","outboxUnassigned":"미할당 파일: {count}개 · {size}. 아래에서 확인하고 직접 제거하세요.","outboxWriteFailed":"G-code 파일을 보관할 수 없습니다","outboxWrongStep":"G-code 후처리 단계가 아님","pause":"일시 정지","plateLabel":"플레이트","preparedUploadDiscardFailed":"업로드 임시 사본을 삭제하지 못했습니다. 저장소를 확인하세요.","print":"출력…","printShort":"출력","printerBusy":"프린터가 사용 중입니다","printerIpPlaceholder":"192.168.0.42 (프린터 IP)","printerNotOnline":"프린터가 온라인이 아닙니다","prusalinkApiKeyPlaceholder":"PrusaLink API 키","queueLess":"접기","queueMore":"{count}개 더 보기","refresh":"새로 고침","remove":"제거","removeRetainedTitle":"보관된 사본 제거","repetierApiKeyPlaceholder":"Repetier API 키","repetierLoadFailed":"Repetier 프린터를 불러올 수 없습니다. 주소, 키와 목록을 확인하세요.","repetierLoadPrinters":"프린터 불러오기","repetierModeUnsupported":"이 서버 버전 또는 연결의 쓰기 지원은 확인되지 않았습니다. 상태만 표시합니다.","repetierNotReady":"서버가 이 프린터의 명령 수신 가능 상태를 확인하지 않았습니다.","repetierRequestAccepted":"요청이 접수되었습니다. 작업은 서버 대기열에서 기다릴 수 있습니다. 다음 상태 보고로 인쇄를 확인합니다.","repetierSelectPrinter":"프린터 선택","resume":"출력 계속","select":"선택","selectAllTitle":"사용 가능한 모든 프린터를 선택하거나 선택 취소합니다.","selfSigned":"자체 서명됨","selfSignedTitle":"자체 서명 인증서를 사용하는 HTTPS 프린터에만 켜세요. 일반 HTTP LAN 프린터에는 필요하지 않습니다.","send":"보내기","sendFailed":"{printer}: 보내기 실패 — {error}","sendSelected":"선택한 프린터로 G-code 보내기…","sendSelectedCount":"선택한 프린터 {count}대로 G-code 보내기…","sendToPrinterTitle":"이 프린터로 보내고 출력 시작","sendingFile":"{name}을(를) 프린터 {count}대로 보내는 중…","sentToPrint":"출력 전송됨","serialAuto":"시리얼 번호(자동)","serialTitle":"시리얼 번호는 자동으로 검색됩니다. 특정 프린터로 고정하려는 경우에만 입력하세요. MQTT 포트 8883을 사용합니다.","startApprovalExpired":"시작 승인이 만료되었거나 설정이 변경되었습니다. 다시 확인하세요.","startBedClear":"베드가 비어 있고 새 출력을 시작할 준비가 되었습니다.","startBlocked":"{printer} 시작이 차단되었습니다: {reason}","startCompatibilityUnknown":"슬라이스 파일과 이 프린터의 호환성을 확인할 수 없습니다. 출력을 시작하지 않고 파일만 업로드할 수 있습니다.","startConfirmMissing":"시작이 취소되었습니다. 베드가 비어 있는지, 그리고 요청된 경우 파일이 프린터에 맞는지 확인하세요.","startFileCheck":"이 파일이 바로 이 프린터용으로 슬라이스되었는지 확인했습니다.","startImmediately":"업로드 후 바로 출력 시작","startPrint":"출력 시작","startReasonFileKind":"이 파일 형식은 이 프린터에서 시작할 수 없습니다.","startReasonNoStart":"이 연결에서는 Print Farm에서 출력 시작을 아직 사용할 수 없습니다. 파일은 업로드할 수 있습니다.","startReasonPlate":"선택한 플레이트가 이 파일과 맞지 않습니다.","startReasonProfileMatch":"이 파일은 이 프린터의 OrcaSlicer 프린터 사전 설정으로 슬라이스되었습니다.","startReasonProfileUnknown":"Print Farm은 파일만으로 어떤 프린터용으로 슬라이스되었는지 알 수 없습니다.","startReasonProject":"슬라이스되지 않은 프로젝트 파일입니다. 먼저 슬라이스하세요.","startReasonSlicedOnly":"이 프린터는 슬라이스된 3MF만 시작하며 일반 G-code는 시작하지 않습니다.","startReasonUnsupported":"이 연결 유형은 아직 지원되지 않습니다.","startReviewTitle":"각 출력 확인","startVerdictCompatible":"호환됨","startVerdictIncompatible":"호환되지 않음","startVerdictUnknown":"수동 확인","startWillStart":"시작할 프린터: {count}","stateAborted":"중단됨","stateBusy":"사용 중","stateChecking":"확인 중","stateComplete":"완료","stateError":"오류","stateFailed":"실패","stateIdle":"대기 중","stateOffline":"오프라인","stateOnline":"온라인","statePaused":"일시 정지됨","statePrinting":"출력 중","stateStandby":"스탠바이","stateUnavailable":"아직 사용할 수 없음","stateUnknown":"알 수 없음","stop":"정지","storageBar":"저장소: 파일 {count}개 · {size}","storageGroupTitle":"{name} · 파일 {count}개 · {size}","storageMore":"{count}개 더…","supportPlanned":"{type} 지원이 계획되어 있지만 아직 제공되지 않습니다.","sure":"확인할까요?","tlsCertificateChanged":"프린터 인증서가 변경되었습니다. 연결이 차단되었습니다.","tlsPermissionRequired":"OrcaSlicer에서 프린터 접근을 허용한 후 인증서 확인을 다시 시도하세요.","tlsProbeFailed":"인증서를 읽을 수 없습니다. 프린터를 확인하고 다시 시도하세요.","tlsTrustBusy":"프린터를 사용 중입니다. 작업이 끝날 때까지 기다리세요.","tlsTrustButton":"인증서…","tlsTrustConfirm":"이 인증서 신뢰","tlsTrustCurrent":"저장된 SHA-256","tlsTrustDetails":"세부 정보","tlsTrustFtps":"파일(FTPS 990)","tlsTrustIntro":"신뢰할 수 있는 네트워크에서만 인증서를 확인하세요. 최초 연결만으로는 프린터의 신원이 증명되지 않습니다.","tlsTrustMqtt":"상태 및 명령(MQTT 8883)","tlsTrustNoPin":"확인되지 않음","tlsTrustObserved":"수신한 SHA-256","tlsTrustProbe":"읽고 신뢰","tlsTrustReplacement":"인증서가 저장된 값과 다릅니다. 프린터 교체 또는 초기화 후처럼 변경을 예상한 경우에만 새 인증서를 확인하세요.","tlsTrustRequired":"연결하기 전에 프린터 인증서를 확인하세요.","tlsTrustSaveFailed":"인증서 확인 내용을 저장할 수 없습니다.","tlsTrustSaved":"인증서가 확인되었습니다.","tlsTrustStale":"프린터 설정이 변경되었거나 확인이 만료되었습니다. 인증서를 다시 읽으세요.","tlsTrustTitle":"Bambu 인증서","tlsTrustWorking":"인증서 읽는 중…","toolActive":"활성 도구","toolDetails":"{tool} · 현재: {current} · 목표: {target} · {state}","toolInactive":"비활성 도구","toolViewOnly":"보기 전용이며 활성 도구를 변경하지 않습니다","unassignedDelete":"삭제","unassignedDeleteAll":"모두 삭제","unassignedDeleteAllConfirm":"프린터에 연결되지 않은 파일 {count}개({size})를 Print Farm 저장소에서 모두 삭제할까요? 프린터에 있는 사본은 영향을 받지 않습니다.","unassignedDeleteConfirm":"Print Farm 저장소에서 {name} ({size})을(를) 삭제할까요? 프린터에 있는 사본에는 영향이 없습니다.","unassignedHeading":"프린터에 연결되지 않은 파일: {count} · {size}","unassignedNoPrinter":"준비된 프린터가 없습니다. 온라인이고 대기 중이며 업로드를 받을 수 있어야 합니다.","unassignedSend":"프린터로 보내기…","unassignedUpload":"업로드만","unassignedUploadStart":"업로드 후 시작","unassignedWhy":"패널의 어떤 프린터도 이 파일의 프린터 사전 설정과 일치하지 않습니다. 선택한 프린터로 한 번만 보낼 수 있으며 연결은 만들어지지 않습니다.","unavailableSuffix":"아직 사용할 수 없음","unmatchedQueued":"대기열의 파일 {count}개가 패널의 어떤 프린터와도 일치하지 않습니다","uploadShort":"업로드","uploadToPrinterTitle":"출력을 시작하지 않고 이 프린터에 파일 업로드","uploadToPrinters":"{name}을(를) 프린터 {count}대에 업로드:","uploadUnverifiedHardware":"업로드를 사용할 수 없음: 아직 실제 장비에서 검증되지 않았습니다","uploadedNotStarted":"업로드됨(시작 안 함)","useAms":"AMS(Bambu) 사용","webuiAddress":"웹 UI 주소 (선택 사항)","webuiFallbackHelp":"계속 로딩되면 주소를 브라우저에 복사하세요. 웹 포트는 연결에서 설정할 수 있습니다.","webuiHelp":"페이지가 열리지 않나요?"},"lt":{"accessCode":"Prieigos kodas","add":"Įtraukti","addConfiguredTitle":"Įtraukti spausdintuvą, sukonfigūruotą programoje OrcaSlicer","addPrinter":"Įtraukti spausdintuvą…","all":"visi","bambuError":"Spausdintuvo klaida {code}","bambuLayer":"sluoksnis {current}/{total}","bambuLeftHM":"Liko {hours} val. {minutes} min.","bambuLeftM":"Liko {minutes} min.","bed":"Pagrindas","busy":"{printer}: spausdintuvas užimtas ({state})","busyNotStarted":"{printer}: spausdintuvas užimtas ({state}) – spausdinimas nepradėtas.","cameraButton":"Tiesioginė kamera","cameraCapturedAt":"Užfiksuota {time}","cameraClose":"Uždaryti kamerą","cameraLoadFailed":"Vaizdas čia neįsikėlė. Šis langas gali blokuoti vietinio tinklo vaizdus.","cameraLoading":"Jungiamasi prie kameros…","cameraMode":"Kamera","cameraModeAuto":"Nustatyta internetinė kamera","cameraModeU1":"Originali Snapmaker U1 kamera","cameraNativeSession":"Kameros seansas atidarytas","cameraNone":"Šiam spausdintuvui kamera nenustatyta.","cameraOpenWindow":"Atidaryti kamerą lange","cameraPermissionDenied":"Foninis darbas atmestas. Leisk jį ir vėl atidaryk kamerą.","cameraReceivedAt":"Gauta {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Kameros pasiekti nepavyko.","cancel":"Atšaukti","cfgAutoDelete":"Automatiškai ištrinti senas kopijas","cfgAutoDeleteAge":"Ištrinti kopijas, senesnes nei","cfgAutoDeleteHint":"Pagal numatytuosius nustatymus išjungta. Tikrinama paleidžiant ir kartą per dieną; šalinamos tik šio papildinio kopijos, niekada naudojami failai.","cfgClearConfirm":"Išvalyti spausdinimo žurnalą? Veiksmo negalima atšaukti.","cfgClearDone":"Užklausa išsaugota. Žurnalas bus išvalytas, kai skydelis kitą kartą perskaitys parametrus.","cfgClearHistory":"Išvalyti spausdinimo žurnalą","cfgDays":"{days} d.","cfgJournalOrca":"Įrašyti į žurnalą iš Orca pradėtus siuntimus ir spausdinimus","cfgJournalOrcaHint":"Tik darbai, apie kuriuos praneša pats OrcaSlicer.","cfgKeepAll":"Visi","cfgKeepCopies":"Saugoti sluoksniuotų failų kopijas","cfgKeepCopiesHint":"Leidžia vėliau siųsti sluoksniavimą į spausdintuvą. Išjungus nieko nekopijuojama.","cfgKeepHistory":"Saugoti spausdinimo žurnalą","cfgKeepHistoryHint":"Išjungus nauji įrašai nesaugomi; esami lieka.","cfgKeepLast":"Palikti tik naujausius pjūvius kiekvienam spausdintuvui","cfgKeepLastHint":"Išsaugojus naują pjūvį, senesnės to paties spausdintuvo neišsiųstos kopijos ištrinamos. Su spausdinimo žurnalu susietos kopijos lieka.","cfgPauseHidden":"Neapklausti spausdintuvų, kol skydelis nematomas","cfgPauseHiddenHint":"Taupo tinklo užklausas, kol skirtukas ar langas paslėptas.","cfgPollInterval":"Spausdintuvų apklausos intervalas","cfgProfileHint":"Užuomina, kai papildinys nepasirinktas proceso profilyje","cfgProfileHintHint":"Rodoma skydelyje, kai sluoksniavimas nepasiekė šio papildinio.","cfgSeconds":"{seconds} s","close":"Uždaryti","comingLater":"planuojama","commandFailed":"{printer}: komandos „{action}“ įvykdyti nepavyko – {error}","commandSent":"{printer}: komanda „{action}“ išsiųsta.","confirmTitle":"Pradėti spausdinti keliais spausdintuvais?","confirmUploadTitle":"Įkelti failą į pasirinktus spausdintuvus?","connectionOptions":"Ryšys","connectionOptionsFailed":"Nepavyko išsaugoti. Patikrink adresą.","connectionOptionsHelp":"Naudok tą patį kompiuterį ir nurodyk žiniatinklio prievadą.","connectionSave":"Išsaugoti","connectionTypeTitle":"Ryšio tipas. Galimos funkcijos priklauso nuo spausdintuvo protokolo ir dabartinės būsenos.","controlsUnverified":"Pauzė ir sustabdymas šiam ryšiui nepasiekiami (nepatikrinta su įranga)","crealityWsPortPlaceholder":"WS prievadas (9999)","crealityWsPortTitle":"Neprivaloma. Spausdintuvo būsenos WebSocket prievadas. 9999 yra nepatvirtinta numatytoji reikšmė; pakeiskite, jei spausdintuvas naudoja kitą prievadą.","credentialLegacyWarning":"{count} spausdintuvų raktai dar saugomi paprastu tekstu. Perkelkite į sistemos saugyklą. Senos kopijos liks.","credentialMigrate":"Perkelti raktus","credentialMigrationConfirm":"Perkelti raktus į sistemos saugyklą? Senos kopijos liks.","credentialMigrationDone":"Raktai perkelti į sistemos saugyklą.","credentialRetry":"Bandyti prieigą dar kartą","credentialSaveFailed":"Nepavyko saugiai įrašyti raktų. Spausdintuvas neįrašytas.","credentialUnavailable":"Sistemos saugykla nepasiekiama. Ryšys užblokuotas.","dashboardOpened":"Print Farm skydelis atidarytas.","duetPasswordPlaceholder":"Duet įrenginio slaptažodis","errorNeedsAccessCode":"reikia spausdintuvo prieigos kodo","errorNeedsBambuCredentials":"reikia spausdintuvo IP, prieigos kodo ir serijos numerio","errorNoAddress":"trūksta spausdintuvo adreso","errorOutcomeUnknown":"spausdintuvas užklausą galėjo gauti arba negauti; prieš bandydami dar kartą patikrinkite spausdintuvą","errorPrintCommand":"nepavyko įvykdyti spausdinimo komandos: {error}","errorUnknownAction":"nežinomas spausdintuvo veiksmas","errorUnknownSerial":"įkelta, bet spausdintuvo serijos numeris vis dar nežinomas – paleiskite spausdinimą iš paties spausdintuvo","errorUnsupportedBackend":"šio tipo ryšys su spausdintuvu nepalaikomas","errorUpload":"įkelti nepavyko: {error}","errorUploadUnverified":"failas įkeltas, bet jo dydžio spausdintuve patikrinti nepavyko, todėl spausdinimas nepradėtas","errorUploadedNotStarted":"failas įkeltas, bet spausdinimas nepradėtas: {error}","feedbackButton":"Atsiliepimai","feedbackCopied":"Nukopijuota","feedbackCopy":"Kopijuoti","feedbackHelp":"Nukopijuok adresą į naršyklę ir naudok svetainės atsiliepimų mygtuką. Spausdintuvo duomenys nesiunčiami. “Beta Feedback”.","file3mfWarning":"Failą .3mf galima paleisti tik Bambu spausdintuvuose – kitiems reikia G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Nepavyko išsiųsti: failas nenuskaitomas.","fileTargetMismatch":"{printer}: eilėje esantis failas neatitinka šio spausdintuvo – spausdinimas nepradėtas.","flashforgeCheckCodePlaceholder":"Patikros kodas (spausdintuvo ekrane)","flashforgeCheckCodeTitle":"Patikros kodas iš spausdintuvo ekrano. Spausdintuve turi būti įjungtas LAN režimas.","flashforgeErrAuth":"Neteisingas serijos numeris arba patikros kodas.","flashforgeErrCredentials":"Įveskite serijos numerį ir patikros kodą.","flashforgeErrIdentity":"Nepavyko patvirtinti spausdintuvo modelio.","flashforgeErrLanMode":"Įjunkite LAN režimą spausdintuve.","flashforgeErrUnsupportedModel":"Šis FlashForge modelis nepalaikomas (tik Adventurer 5M, 5M Pro ir AD5X).","flashforgeSerialPlaceholder":"Serijos numeris","flashforgeSerialTitle":"Spausdintuvo serijos numeris iš jo ekrano (Nustatymai > Apie arba Tinklas). LAN režimas turi būti įjungtas.","fleetAttention":"Reikia dėmesio","fleetIdle":"Laisvi","fleetPrinting":"Spausdina","foundOnNetwork":"rastas tinkle","genericError":"klaida","history":"Spausdinimo istorija","historyCoverage":"Vietinė stebėtų spausdinimų istorija. Joje yra Print Farm pradėti spausdinimai ir užduotys, pastebėtos, kol buvo atidarytas šis skydelis; darbų, atliktų OrcaSlicer neveikiant, gali trūkti.","historyDurationHoursMinutes":"{hours} val. {minutes} min.","historyDurationMinutes":"{minutes} min","historyEmpty":"Šio spausdintuvo spausdinimų dar nepastebėta.","historyFromOrca":"pranešė OrcaSlicer","historyLoading":"Įkeliama spausdinimo istorija…","historyObserved":"pastebėta Print Farm","historyProgress":"{progress} %","historyStartedHere":"pradėta per Print Farm","historyStateCancelled":"atšaukta","historyStateCompleted":"užbaigta","historyStateEnded":"pasibaigė","historyStateFailed":"nepavyko","historyStatePaused":"pristabdyta","historyStatePrinting":"spausdinama","historyStateSent":"išsiųsta","historyTitle":"Spausdinimo istorija – {printer}","historyUnknownFile":"Nežinomas failas","integrationUnavailable":"Spausdintuvo integracija dar nepasiekiama","journalActiveCount":"Aktyvių: {count}","journalAllCount":"Įrašų: {count}","journalBlockedByHold":"ankstesnė šio spausdintuvo operacija neišspręsta; atidarykite spausdinimo žurnalą ir atblokuokite ją patikrinę spausdintuvą","journalButton":"Spausdinimo žurnalas","journalCompletedCount":"Užbaigta: {count}","journalEmptyAll":"Spausdinimų dar neužregistruota.","journalFileDelete":"Ištrinti failą","journalFileUnsent":"Sluoksniavimas, neišsiųsta","journalHoldLocked":"Ši operacija vis dar siunčiama, todėl dar negalima atblokuoti.","journalHoldReleased":"Atblokuota. Ankstesnė operacija lieka nepatikrinta.","journalHoldState":"Būsena: {state}","journalHoldUnavailable":"Neišspręstos operacijos informacija nepasiekiama. Pabandykite iš naujo atidaryti spausdinimo žurnalą.","journalHoldsHeading":"Neišspręstos operacijos – prieš atblokuodami patikrinkite fizinį spausdintuvą, užduotį ir spausdinimo plokštę.","journalNoResults":"Atitinkančių spausdinimų nerasta.","journalPrinter":"Spausdintuvas","journalReleaseConfirm":"Patikrinę fizinį spausdintuvą, užduotį ir spausdinimo plokštę („{target}“), atblokuoti? Tai tik leidžia bandyti ateityje; ankstesnis spausdinimas nepažymimas kaip sėkmingas ir nekartojamas.","journalReleaseHold":"Atblokuoti","journalResend":"Siųsti iš naujo…","journalResultsCount":"Rezultatų: {count}","journalSearchLabel":"Ieškoti spausdinimo žurnale","journalSearchPlaceholder":"Ieškoti failo arba spausdintuvo…","journalSendConfirm":"Įkelti {name} į {printer} nepradedant spausdinimo?","journalStoreUnavailable":"Spausdinimo žurnalas nepasiekiamas. Patikrinkite vietinę papildinio saugyklą.","journalTitle":"Spausdinimo žurnalas","legacyImportBlocked":"Duomenys lieka ankstesniame aplanke. Šio rinkinio negalima importuoti automatiškai.","legacyImportButton":"Importuoti senus duomenis","legacyImportConfirm":"Duomenys ir vietiniai prisijungimo duomenys bus nukopijuoti į vietinę OrcaSlicer papildinio saugyklą. Sena kopija bus išsaugota. Tęsti?","legacyImportDetail":"Rasti seni duomenys: spausdintuvų – {printers}, istorijos įrašų – {history}, eilės įrašų – {outbox}, failų – {files}.","legacyImportDone":"Importavimas baigtas.","legacyImportFailed":"Nepavyko importuoti senų duomenų.","loading":"Įkeliama…","massFailed":", nepavyko: {count}","massResult":"Sėkmingai išsiųsta: {count}{failed}.","namePlaceholder":"Pavadinimas","networkPermissionRequired":"Leiskite pasiekti spausdintuvą programoje „OrcaSlicer“. Jei ši parinktis yra, atverkite Papildiniai → Print Farm → Leidimai. Tada spustelėkite „Atnaujinti“ šios spausdintuvo kortelėje.","noPrinters":"Spausdintuvų nerasta. Sukonfigūruokite spausdintuvo mazgą (host) programoje OrcaSlicer arba įtraukite jį aukščiau.","notReachable":"{printer}: spausdintuvas nepasiekiamas","notReachableNotStarted":"{printer}: spausdintuvas nepasiekiamas – spausdinimas nepradėtas.","nozzle":"Purkštukas","octoprintApiKeyPlaceholder":"OctoPrint API raktas","open":"Atverti sąsają","operatorStartCheck":"Patikrinau, kad sluoksniuotas failas ir pasirinkta plokštė tinka šiam spausdintuvui, medžiagos bei įrankiai yra teisingi, o pagrindas laisvas.","other":"Kita","outboxCopiesOff":"Sluoksniavimo kopijos išjungtos papildinio parametruose.","outboxFallbackName":"sluoksniavimas {stamp}","outboxHintText":"Proceso profilyje nepasirinktas papildinys Printers Outbox – sluoksniavimo kopijos nesaugomos.","outboxHintWhere":"Pasirinkite jį skiltyje Procesas → Kita → Pjaustymo konvejerio papildinys.","outboxNotReady":"G-code failas neparengtas","outboxPrinterUsage":"Spausdintuvas: {name} · aplankas: {folder} · failų: {count} · {size}. Peržiūrėkite arba pašalinkite žemiau.","outboxQueued":"{name} įtraukta į eilę: {target}","outboxRemoveFailed":"Nepavyko pašalinti išsaugoto failo. Jis lieka sąraše, kad galėtumėte bandyti dar kartą.","outboxStorageCleanBlocked":"Likučius galima ištrinti tik tada, kai nevyksta įkėlimas ar spausdinimas, o failų indeksas tvarkingas.","outboxStorageCleanButton":"Ištrinti likučius (failų: {count}, {size})","outboxStorageCleanConfirm":"Ištrinti likusius failus (failų: {count}, {size}) iš Print Farm saugyklos? Spausdintuvų eilėse esantys failai neliečiami.","outboxStorageCleanDone":"Ištrinta likusių failų: {count} ({size}).","outboxStorageCleanFailed":"Nepavyko ištrinti failų ({count}): {paths}. Bandykite dar kartą.","outboxStorageEmpty":"Eilės failų ar atkūrimo kopijų nerasta.","outboxStorageEntry":"{label}: failų: {count} · {size} · {path}","outboxStorageKindIncoming":"Paruošti įkėlimai","outboxStorageKindIndex":"Eilės indeksas","outboxStorageKindIndexBackup":"Eilės indekso atsarginė kopija","outboxStorageKindLoose":"Pavieniai arba nebesusieti failai","outboxStorageKindRecovery":"Seni atkūrimo failai","outboxStorageKindUnassigned":"Nepriskirti failai","outboxStorageManualCleanup":"Likusius failus (pavienius failus, paruoštus įkėlimus, atkūrimo kopijas, indekso atsargines kopijas) ištrinkite mygtuku žemiau. Spausdintuvų eilėse esantys failai šalinami po vieną.","outboxStorageScanFailed":"Nepavyko patikrinti visų saugyklos kelių: {paths}. Sumos gali būti nepilnos.","outboxStorageWarning":"Saugykla auga; pašalinkite iš eilių failus, kurių nebereikia.","outboxUnassigned":"Nepriskirti failai: {count} · {size}. Peržiūrėkite ir pašalinkite rankiniu būdu žemiau.","outboxWriteFailed":"Nepavyko išsaugoti G-code failo","outboxWrongStep":"Ne G-code papildomo apdorojimo žingsnis","pause":"Pauzė","plateLabel":"Plokštė","preparedUploadDiscardFailed":"Nepavyko pašalinti laikinos įkėlimo kopijos; patikrinkite saugyklą.","print":"Spausdinti…","printShort":"Spausdinti","printerBusy":"Spausdintuvas užimtas","printerIpPlaceholder":"192.168.0.42 (spausdintuvo IP)","printerNotOnline":"Spausdintuvas neprisijungęs","prusalinkApiKeyPlaceholder":"PrusaLink API raktas","queueLess":"Rodyti mažiau","queueMore":"Rodyti dar {count}","refresh":"Atnaujinti","remove":"Pašalinti","removeRetainedTitle":"Pašalinti išsaugotą kopiją","repetierApiKeyPlaceholder":"Repetier API raktas","repetierLoadFailed":"Nepavyko įkelti Repetier spausdintuvo. Patikrink adresą, raktą ir sąrašą.","repetierLoadPrinters":"Įkelti spausdintuvus","repetierModeUnsupported":"Šios versijos ar jungties įrašymas nepatikrintas. Tik būsena.","repetierNotReady":"Serveris nepatvirtino, kad spausdintuvas priima komandas.","repetierRequestAccepted":"Užklausa priimta; užduotis gali laukti serverio eilėje. Kitas būsenos pranešimas patvirtins spausdinimą.","repetierSelectPrinter":"Pasirinkti spausdintuvą","resume":"Tęsti","select":"pasirinkti","selectAllTitle":"Pasirinkite arba panaikinkite visų galimų spausdintuvų pasirinkimą","selfSigned":"savarankiškai pasirašytas","selfSignedTitle":"Įjunkite tik HTTPS spausdintuvui su savarankiškai pasirašytu sertifikatu. Paprastiems HTTP LAN spausdintuvams to nereikia.","send":"Siųsti","sendFailed":"{printer}: išsiųsti nepavyko – {error}","sendSelected":"Siųsti G-code į pasirinktus…","sendSelectedCount":"Siųsti G-code į pasirinktus ({count})…","sendToPrinterTitle":"Siųsti į šį spausdintuvą ir pradėti spausdinti","sendingFile":"Siunčiama {name} į spausdintuvus ({count})…","sentToPrint":"išsiųsta spausdinti","serialAuto":"Serijos numeris (automatinis)","serialTitle":"Serijos numeris aptinkamas automatiškai. Įveskite jį tik norėdami nurodyti konkretų spausdintuvą. Naudojamas MQTT prievadas 8883.","startApprovalExpired":"Paleidimo patvirtinimo laikas baigėsi arba pasikeitė parametrai; patikrinkite dar kartą.","startBedClear":"Pagrindas laisvas ir paruoštas naujam spausdinimui.","startBlocked":"Paleidimas užblokuotas ({printer}): {reason}","startCompatibilityUnknown":"Nepavyko patvirtinti, ar sluoksniuotas failas suderinamas su šiuo spausdintuvu. Failą galima įkelti nepradedant spausdinti.","startConfirmMissing":"Paleidimas atšauktas: patvirtinkite, kad pagrindas laisvas, o kur prašoma – kad failas tinka spausdintuvui.","startFileCheck":"Patikrinau, kad šis failas sluoksniuotas būtent šiam spausdintuvui.","startImmediately":"Pradėti spausdinti iškart po įkėlimo","startPrint":"Pradėti spausdinti","startReasonFileKind":"Šio tipo failo šiame spausdintuve paleisti negalima.","startReasonNoStart":"Spausdinimo paleidimas iš Print Farm šiam ryšiui dar neprieinamas. Failą galite įkelti.","startReasonPlate":"Pasirinkta plokštė neatitinka šio failo.","startReasonProfileMatch":"Failas sluoksniuotas pagal šio spausdintuvo OrcaSlicer profilį.","startReasonProfileUnknown":"Print Farm iš failo negali nustatyti, kuriam spausdintuvui jis sluoksniuotas.","startReasonProject":"Tai nesluoksniuotas projekto failas. Pirmiausia jį sluoksniuokite.","startReasonSlicedOnly":"Šis spausdintuvas paleidžia tik sluoksniuotus 3MF failus, o ne paprastą G-code.","startReasonUnsupported":"Šio tipo ryšys dar nepalaikomas.","startReviewTitle":"Patvirtinkite kiekvieną spausdinimą","startVerdictCompatible":"Suderinama","startVerdictIncompatible":"Nesuderinama","startVerdictUnknown":"Patikrinkite rankiniu būdu","startWillStart":"Paleidžiami spausdintuvai: {count}","stateAborted":"nutraukta","stateBusy":"užimtas","stateChecking":"tikrinama","stateComplete":"užbaigta","stateError":"klaida","stateFailed":"nepavyko","stateIdle":"laukia","stateOffline":"neprisijungęs","stateOnline":"pasiekiamas","statePaused":"pristabdyta","statePrinting":"spausdinama","stateStandby":"budėjimo režimas","stateUnavailable":"dar nepasiekiamas","stateUnknown":"nežinoma","stop":"Sustabdyti","storageBar":"Saugykla: failų: {count} · {size}","storageGroupTitle":"{name} · failų: {count} · {size}","storageMore":"Dar {count}…","supportPlanned":"{type} palaikymas planuojamas, bet dar neprieinamas.","sure":"Patvirtinti?","tlsCertificateChanged":"Spausdintuvo sertifikatas pasikeitė. Ryšys užblokuotas.","tlsPermissionRequired":"Leiskite prieigą prie spausdintuvo OrcaSlicer ir pakartokite sertifikato patikrą.","tlsProbeFailed":"Nepavyko nuskaityti sertifikato. Patikrinkite spausdintuvą ir bandykite dar kartą.","tlsTrustBusy":"Spausdintuvas naudojamas. Palaukite, kol operacija bus baigta.","tlsTrustButton":"Sertifikatai…","tlsTrustConfirm":"Pasitikėti šiuo sertifikatu","tlsTrustCurrent":"Išsaugotas SHA-256","tlsTrustDetails":"Išsamiau","tlsTrustFtps":"Failai (FTPS 990)","tlsTrustIntro":"Sertifikatus patvirtinkite tik patikimame tinkle. Pirmasis ryšys neįrodo spausdintuvo tapatybės.","tlsTrustMqtt":"Būsena ir komandos (MQTT 8883)","tlsTrustNoPin":"Nepatvirtinta","tlsTrustObserved":"Gautas SHA-256","tlsTrustProbe":"Nuskaityti ir pasitikėti","tlsTrustReplacement":"Sertifikatas skiriasi nuo išsaugoto. Naują sertifikatą patvirtinkite tik jei tikėjotės šio pokyčio, pavyzdžiui, pakeitę arba iš naujo nustatę spausdintuvą.","tlsTrustRequired":"Prieš prisijungdami patvirtinkite spausdintuvo sertifikatą.","tlsTrustSaveFailed":"Nepavyko išsaugoti sertifikato patvirtinimo.","tlsTrustSaved":"Sertifikatas patvirtintas.","tlsTrustStale":"Pasikeitė spausdintuvo nustatymai arba baigėsi patvirtinimo galiojimas. Nuskaitykite sertifikatą dar kartą.","tlsTrustTitle":"„Bambu“ sertifikatai","tlsTrustWorking":"Skaitomas sertifikatas…","toolActive":"aktyvus įrankis","toolDetails":"{tool} · Dabartinė: {current} · Tikslinė: {target} · {state}","toolInactive":"neaktyvus įrankis","toolViewOnly":"Tik peržiūra; aktyvus įrankis nekeičiamas","unassignedDelete":"Ištrinti","unassignedDeleteAll":"Ištrinti visus","unassignedDeleteAllConfirm":"Ištrinti visus failus be priskirto spausdintuvo (failų: {count}, {size}) iš Print Farm saugyklos? Kopijos spausdintuvuose neliečiamos.","unassignedDeleteConfirm":"Ištrinti {name} ({size}) iš Print Farm saugyklos? Spausdintuvuose esančios kopijos neliečiamos.","unassignedHeading":"Failai be priskirto spausdintuvo: {count} · {size}","unassignedNoPrinter":"Nėra paruošto spausdintuvo. Jis turi būti pasiekiamas, laisvas ir priimti įkėlimus.","unassignedSend":"Siųsti į spausdintuvą…","unassignedUpload":"Tik įkelti","unassignedUploadStart":"Įkelti ir pradėti","unassignedWhy":"Joks skydelio spausdintuvas neatitinka šio failo spausdintuvo profilio. Galite vieną kartą jį siųsti pasirinktam spausdintuvui; joks ryšys nesukuriamas.","unavailableSuffix":"dar nepasiekiama","unmatchedQueued":"Eilėje esančių failų, neatitinkančių jokio skydelio spausdintuvo: {count}","uploadShort":"Įkelti","uploadToPrinterTitle":"Įkelti failą į šį spausdintuvą nepradedant spausdinti","uploadToPrinters":"Įkelti {name} į spausdintuvus ({count}):","uploadUnverifiedHardware":"Įkėlimas nepasiekiamas: dar nepatikrinta su įranga","uploadedNotStarted":"įkelta (nepradėta)","useAms":"Naudoti AMS (Bambu)","webuiAddress":"Žiniatinklio adresas (neprivaloma)","webuiFallbackHelp":"Jei puslapis vis kraunamas, nukopijuok adresą į naršyklę. Prievadas nustatomas Ryšio skiltyje.","webuiHelp":"Puslapis neįkeliamas?"},"nl":{"accessCode":"Toegangscode","add":"Toevoegen","addConfiguredTitle":"Een printer toevoegen die is geconfigureerd in OrcaSlicer","addPrinter":"Een printer toevoegen…","all":"alle","bambuError":"Printerfout {code}","bambuLayer":"laag {current}/{total}","bambuLeftHM":"Nog {hours} u {minutes} min","bambuLeftM":"Nog {minutes} min","bed":"Printbed","busy":"{printer}: printer is bezet ({state})","busyNotStarted":"{printer}: printer is bezet ({state}) — niet gestart.","cameraButton":"Livecamera","cameraCapturedAt":"Opgenomen {time}","cameraClose":"Camera sluiten","cameraLoadFailed":"De afbeelding kon hier niet worden geladen. Dit venster blokkeert mogelijk afbeeldingen van het lokale netwerk.","cameraLoading":"Verbinden met de camera…","cameraMode":"Camera","cameraModeAuto":"Ingestelde webcam","cameraModeU1":"Originele Snapmaker U1-camera","cameraNativeSession":"Camerasessie geopend","cameraNone":"Voor deze printer is geen camera ingesteld.","cameraOpenWindow":"Camera in venster openen","cameraPermissionDenied":"Achtergrondwerk geweigerd. Sta dit toe en open de camera opnieuw.","cameraReceivedAt":"Ontvangen {time}","cameraTitle":"Camera: {printer}","cameraUnavailable":"De camera is niet bereikbaar.","cancel":"Annuleren","cfgAutoDelete":"Oude kopieën automatisch verwijderen","cfgAutoDeleteAge":"Kopieën verwijderen die ouder zijn dan","cfgAutoDeleteHint":"Standaard uit. Controle bij het starten en eenmaal per dag; alleen kopieën van deze plug-in worden verwijderd, nooit bestanden in gebruik.","cfgClearConfirm":"Printlogboek wissen? Dit kan niet ongedaan worden gemaakt.","cfgClearDone":"Aangevraagd. Het logboek wordt gewist zodra het paneel de instellingen weer leest.","cfgClearHistory":"Printlogboek wissen","cfgDays":"{days} d","cfgJournalOrca":"Verstuurde bestanden en prints vanuit Orca in het printlogboek vastleggen","cfgJournalOrcaHint":"Alleen taken die OrcaSlicer zelf meldt.","cfgKeepAll":"Alle","cfgKeepCopies":"Kopieën van geslicede bestanden bewaren","cfgKeepCopiesHint":"Hiermee kun je een slice later naar een printer sturen. Als dit uit staat, wordt er niets gekopieerd.","cfgKeepHistory":"Printlogboek bewaren","cfgKeepHistoryHint":"Als dit uit staat, worden geen nieuwe items vastgelegd; bestaande blijven.","cfgKeepLast":"Alleen de nieuwste slices per printer bewaren","cfgKeepLastHint":"Bij het opslaan van een nieuwe slice worden oudere niet-verzonden kopieën van dezelfde printer verwijderd. Kopieën die aan het printlogboek zijn gekoppeld blijven.","cfgPauseHidden":"Printers niet opvragen zolang het paneel niet zichtbaar is","cfgPauseHiddenHint":"Bespaart netwerkverzoeken zolang het tabblad of venster verborgen is.","cfgPollInterval":"Opvraaginterval van printers","cfgProfileHint":"Hint als de plug-in niet is gekozen in de procesvoorinstelling","cfgProfileHintHint":"Wordt in het paneel getoond als een slice deze plug-in niet bereikte.","cfgSeconds":"{seconds} s","close":"Sluiten","comingLater":"komt later","commandFailed":"{printer}: opdracht “{action}” mislukt — {error}","commandSent":"{printer}: opdracht “{action}” verstuurd.","confirmTitle":"Printen starten op meerdere printers?","confirmUploadTitle":"Het bestand naar de geselecteerde printers uploaden?","connectionOptions":"Verbinding","connectionOptionsFailed":"Opslaan mislukt. Controleer het adres.","connectionOptionsHelp":"Gebruik dezelfde host en geef de webpoort op.","connectionSave":"Opslaan","connectionTypeTitle":"Verbindingstype. Beschikbare functies zijn afhankelijk van het printerprotocol en de huidige status.","controlsUnverified":"Pauzeren en stoppen zijn niet beschikbaar voor deze verbinding (niet op hardware geverifieerd)","crealityWsPortPlaceholder":"WS-poort (9999)","crealityWsPortTitle":"Optioneel. Poort van de status-WebSocket van de printer. 9999 is een onbevestigde standaardwaarde; wijzig deze als je printer een andere poort gebruikt.","credentialLegacyWarning":"Sleutels voor {count} printers staan nog in platte tekst. Verplaats ze naar de systeemkluis. Oude back-ups blijven.","credentialMigrate":"Sleutels verplaatsen","credentialMigrationConfirm":"Sleutels naar de systeemkluis verplaatsen? Oude back-ups blijven.","credentialMigrationDone":"Sleutels naar de systeemkluis verplaatst.","credentialRetry":"Toegang opnieuw proberen","credentialSaveFailed":"Veilig opslaan mislukt. Printer niet opgeslagen.","credentialUnavailable":"Systeemkluis niet beschikbaar. Verbinding geblokkeerd.","dashboardOpened":"Print Farm-paneel geopend.","duetPasswordPlaceholder":"Duet-machinewachtwoord","errorNeedsAccessCode":"de toegangscode van de printer is vereist","errorNeedsBambuCredentials":"printer-IP, toegangscode en serienummer zijn vereist","errorNoAddress":"printeradres ontbreekt","errorOutcomeUnknown":"de printer heeft het verzoek mogelijk wel of niet ontvangen; controleer de printer voordat je het opnieuw probeert","errorPrintCommand":"printopdracht mislukt: {error}","errorUnknownAction":"onbekende printeractie","errorUnknownSerial":"geüpload, maar het serienummer van de printer is nog steeds onbekend — start het vanaf de printer","errorUnsupportedBackend":"dit verbindingstype wordt niet ondersteund","errorUpload":"uploaden mislukt: {error}","errorUploadUnverified":"het bestand is geüpload, maar de grootte kon niet op de printer worden geverifieerd, dus de print is niet gestart","errorUploadedNotStarted":"het bestand is geüpload, maar de print is niet gestart: {error}","feedbackButton":"Feedback","feedbackCopied":"Gekopieerd","feedbackCopy":"Kopiëren","feedbackHelp":"Kopieer het adres naar een browser en gebruik de feedbackknop van de site. Er worden geen printergegevens verzonden. “Beta Feedback”.","file3mfWarning":".3mf start alleen op Bambu-printers; andere printers verwachten G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Versturen mislukt: kon het bestand niet lezen.","fileTargetMismatch":"{printer}: het bestand in de wachtrij hoort niet bij deze printer — niet gestart.","flashforgeCheckCodePlaceholder":"Controlecode (op het printerscherm)","flashforgeCheckCodeTitle":"Controlecode van het printerscherm. De LAN-modus moet op de printer zijn ingeschakeld.","flashforgeErrAuth":"Onjuist serienummer of onjuiste controlecode.","flashforgeErrCredentials":"Voer het serienummer en de controlecode in.","flashforgeErrIdentity":"Het printermodel kon niet worden geverifieerd.","flashforgeErrLanMode":"Schakel de LAN-modus in op de printer.","flashforgeErrUnsupportedModel":"Dit FlashForge-model wordt niet ondersteund (alleen Adventurer 5M, 5M Pro en AD5X).","flashforgeSerialPlaceholder":"Serienummer","flashforgeSerialTitle":"Serienummer van de printer op het printerscherm (Instellingen > Info of Netwerk). De LAN-modus moet aan staan.","fleetAttention":"Aandacht nodig","fleetIdle":"Vrij","fleetPrinting":"Aan het printen","foundOnNetwork":"gevonden op het netwerk","genericError":"fout","history":"Printgeschiedenis","historyCoverage":"Lokaal waargenomen printgeschiedenis. Dit omvat prints die door Print Farm zijn gestart en taken die zijn gezien terwijl dit paneel open was; werk dat is uitgevoerd terwijl OrcaSlicer offline was, ontbreekt mogelijk.","historyDurationHoursMinutes":"{hours} u {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Nog geen prints waargenomen voor deze printer.","historyFromOrca":"gemeld door OrcaSlicer","historyLoading":"Printgeschiedenis laden…","historyObserved":"waargenomen door Print Farm","historyProgress":"{progress}%","historyStartedHere":"gestart door Print Farm","historyStateCancelled":"geannuleerd","historyStateCompleted":"voltooid","historyStateEnded":"beëindigd","historyStateFailed":"mislukt","historyStatePaused":"gepauzeerd","historyStatePrinting":"printen","historyStateSent":"verstuurd","historyTitle":"Printgeschiedenis — {printer}","historyUnknownFile":"Onbekend bestand","integrationUnavailable":"Printerintegratie is nog niet beschikbaar","journalActiveCount":"{count} actief","journalAllCount":"{count} geregistreerd","journalBlockedByHold":"een eerdere bewerking voor deze printer is onopgelost; open het printlogboek en hef de blokkering op na controle van de printer","journalButton":"Printlogboek","journalCompletedCount":"{count} voltooid","journalEmptyAll":"Er zijn nog geen prints geregistreerd.","journalFileDelete":"Bestand verwijderen","journalFileUnsent":"Slice, niet verstuurd","journalHoldLocked":"Deze bewerking wordt nog verzonden en kan nog niet worden opgeheven.","journalHoldReleased":"Blokkering opgeheven. De oude bewerking blijft onbevestigd.","journalHoldState":"Status: {state}","journalHoldUnavailable":"Details van de onopgeloste bewerking zijn niet beschikbaar. Open het printlogboek opnieuw.","journalHoldsHeading":"Onopgeloste bewerkingen — controleer de fysieke printer, de taak en het printbed voordat je een blokkering opheft.","journalNoResults":"Geen overeenkomende prints gevonden.","journalPrinter":"Printer","journalReleaseConfirm":"Na controle van de fysieke printer, de taak en het printbed voor “{target}”: deze blokkering opheffen? Hiermee wordt alleen een volgende poging mogelijk; de oude print wordt niet als geslaagd gemarkeerd en ook niet opnieuw geprobeerd.","journalReleaseHold":"Blokkering opheffen","journalResend":"Opnieuw versturen…","journalResultsCount":"{count} resultaten","journalSearchLabel":"Zoeken in het printlogboek","journalSearchPlaceholder":"Zoek op bestand of printer…","journalSendConfirm":"{name} uploaden naar {printer} zonder de print te starten?","journalStoreUnavailable":"Het printlogboek is niet beschikbaar. Controleer de lokale opslag van de plug-in.","journalTitle":"Printlogboek","legacyImportBlocked":"Je gegevens blijven in de vorige opslagmap. Deze set kan niet automatisch worden geïmporteerd.","legacyImportButton":"Oude gegevens importeren","legacyImportConfirm":"Gegevens en lokale inloggegevens worden naar de lokale opslag van de OrcaSlicer-plug-in gekopieerd. De oude kopie blijft bewaard. Doorgaan?","legacyImportDetail":"Oude gegevens gevonden: {printers} printers, {history} geschiedenisitems, {outbox} wachtrijitems en {files} bestanden.","legacyImportDone":"Import voltooid.","legacyImportFailed":"Oude gegevens konden niet worden geïmporteerd.","loading":"Laden…","massFailed":", {count} mislukt","massResult":"Verstuurd naar {count} printer(s){failed}.","namePlaceholder":"Naam","networkPermissionRequired":"Sta toegang tot de printer toe in OrcaSlicer. Gebruik indien beschikbaar Plug-ins → Print Farm → Machtigingen. Klik daarna op ‘Vernieuwen’ op deze printerkaart.","noPrinters":"Geen printers gevonden. Configureer een printerhost in OrcaSlicer of voeg er hierboven een toe.","notReachable":"{printer}: printer is niet bereikbaar","notReachableNotStarted":"{printer}: printer is niet bereikbaar — niet gestart.","nozzle":"Mondstuk","octoprintApiKeyPlaceholder":"OctoPrint API-sleutel","open":"Web-UI openen","operatorStartCheck":"Ik heb gecontroleerd dat het geslicede bestand en de geselecteerde plaat geschikt zijn voor deze printer, dat de materialen en tools kloppen en dat het printbed leeg is.","other":"Anders","outboxCopiesOff":"Kopieën van slices zijn uitgeschakeld in de instellingen van de plug-in.","outboxFallbackName":"slicing {stamp}","outboxHintText":"In de procesvoorinstelling is geen Printers Outbox-plug-in geselecteerd; kopieën van slices worden niet opgeslagen.","outboxHintWhere":"Kies deze onder Proces → Andere → Plug-in voor de slicepijplijn.","outboxNotReady":"G-code-bestand niet gereed","outboxPrinterUsage":"Printer: {name} · map: {folder} · {count} bestanden · {size}. Bekijk of verwijder ze hieronder.","outboxQueued":"{name} in de wachtrij gezet voor {target}","outboxRemoveFailed":"Het opgeslagen bestand kon niet worden verwijderd. Het blijft in de lijst zodat je het opnieuw kunt proberen.","outboxStorageCleanBlocked":"Restanten kunnen alleen worden verwijderd als er geen upload of print bezig is en de bestandsindex in orde is.","outboxStorageCleanButton":"Restanten verwijderen ({count} bestanden, {size})","outboxStorageCleanConfirm":"{count} overgebleven bestanden ({size}) uit de Print Farm-opslag verwijderen? Bestanden in de wachtrijen van printers blijven ongemoeid.","outboxStorageCleanDone":"{count} overgebleven bestanden verwijderd ({size}).","outboxStorageCleanFailed":"{count} bestanden konden niet worden verwijderd: {paths}. Probeer het opnieuw.","outboxStorageEmpty":"Geen wachtrijbestanden of herstelkopieën gevonden.","outboxStorageEntry":"{label}: {count} bestanden · {size} · {path}","outboxStorageKindIncoming":"Voorbereide uploads","outboxStorageKindIndex":"Wachtrij-index","outboxStorageKindIndexBackup":"Back-up van wachtrij-index","outboxStorageKindLoose":"Losse of verweesde bestanden","outboxStorageKindRecovery":"Oude herstelbestanden","outboxStorageKindUnassigned":"Niet-toegewezen bestanden","outboxStorageManualCleanup":"Overgebleven bestanden (losse bestanden, voorbereide uploads, herstelkopieën, index-back-ups) verwijder je met de knop hieronder. Bestanden in de wachtrijen van printers verwijder je één voor één.","outboxStorageScanFailed":"Niet alle opslagpaden konden worden gescand: {paths}. De totalen kunnen onvolledig zijn.","outboxStorageWarning":"De opslag groeit; verwijder bestanden uit de wachtrijen die je niet meer nodig hebt.","outboxUnassigned":"Niet-toegewezen bestanden: {count} · {size}. Bekijk en verwijder ze hieronder handmatig.","outboxWriteFailed":"Kan het G-code-bestand niet bewaren","outboxWrongStep":"Niet de G-code-nabewerkingsstap","pause":"Pauze","plateLabel":"Plaat","preparedUploadDiscardFailed":"De tijdelijke uploadkopie kon niet worden verwijderd; controleer de opslag.","print":"Printen…","printShort":"Printen","printerBusy":"Printer is bezet","printerIpPlaceholder":"192.168.0.42 (printer-IP)","printerNotOnline":"Printer is niet online","prusalinkApiKeyPlaceholder":"PrusaLink API-sleutel","queueLess":"Minder tonen","queueMore":"Nog {count} tonen","refresh":"Vernieuwen","remove":"Verwijderen","removeRetainedTitle":"Bewaarde kopie verwijderen","repetierApiKeyPlaceholder":"Repetier API-sleutel","repetierLoadFailed":"Repetier-printer laden mislukt. Controleer adres, sleutel en lijst.","repetierLoadPrinters":"Printers laden","repetierModeUnsupported":"Schrijftoegang voor deze versie of verbinding is niet bevestigd. Alleen status.","repetierNotReady":"De server heeft niet bevestigd dat de printer opdrachten accepteert.","repetierRequestAccepted":"Verzoek geaccepteerd; de taak kan in de serverwachtrij wachten. De volgende status bevestigt het afdrukken.","repetierSelectPrinter":"Printer kiezen","resume":"Hervatten","select":"selecteren","selectAllTitle":"Selecteer of deselecteer elke beschikbare printer","selfSigned":"zelfondertekend","selfSignedTitle":"Schakel dit alleen in voor een printer die via HTTPS een zelfondertekend certificaat gebruikt. Gewone HTTP-LAN-printers hebben dit niet nodig.","send":"Versturen","sendFailed":"{printer}: versturen mislukt — {error}","sendSelected":"Verstuur G-code naar selectie…","sendSelectedCount":"Verstuur G-code naar {count} geselecteerde…","sendToPrinterTitle":"Naar deze printer versturen en printen starten","sendingFile":"{name} wordt verstuurd naar {count} printer(s)…","sentToPrint":"verstuurd om te printen","serialAuto":"Serienummer (automatisch)","serialTitle":"Het serienummer wordt automatisch gedetecteerd. Voer het alleen in om een specifieke printer vast te zetten. MQTT-poort 8883 wordt gebruikt.","startApprovalExpired":"De startbevestiging is verlopen of de instellingen zijn gewijzigd; controleer het opnieuw.","startBedClear":"Het printbed is leeg en klaar voor een nieuwe print.","startBlocked":"Start geblokkeerd voor {printer}: {reason}","startCompatibilityUnknown":"De compatibiliteit van het geslicede bestand met deze printer kon niet worden bevestigd. Je kunt het bestand uploaden zonder de print te starten.","startConfirmMissing":"Start geannuleerd: bevestig dat het printbed leeg is en, waar gevraagd, dat het bestand bij de printer past.","startFileCheck":"Ik heb gecontroleerd dat dit bestand voor precies deze printer is gesliced.","startImmediately":"Direct printen na het uploaden","startPrint":"Printen starten","startReasonFileKind":"Dit bestandstype kan op deze printer niet worden gestart.","startReasonNoStart":"Printen starten vanuit Print Farm is voor deze verbinding nog niet beschikbaar. Je kunt het bestand wel uploaden.","startReasonPlate":"De gekozen plaat past niet bij dit bestand.","startReasonProfileMatch":"Het bestand is gesliced voor de OrcaSlicer-printervoorinstelling van deze printer.","startReasonProfileUnknown":"Print Farm kan aan het bestand niet zien voor welke printer het is gesliced.","startReasonProject":"Dit is een projectbestand dat nog niet is gesliced. Slice het eerst.","startReasonSlicedOnly":"Deze printer start alleen geslicede 3MF-bestanden, geen kale G-code.","startReasonUnsupported":"Dit verbindingstype wordt nog niet ondersteund.","startReviewTitle":"Bevestig elke print","startVerdictCompatible":"Compatibel","startVerdictIncompatible":"Niet compatibel","startVerdictUnknown":"Handmatig controleren","startWillStart":"Printers die starten: {count}","stateAborted":"afgebroken","stateBusy":"bezet","stateChecking":"controleren","stateComplete":"voltooid","stateError":"fout","stateFailed":"mislukt","stateIdle":"inactief","stateOffline":"offline","stateOnline":"online","statePaused":"gepauzeerd","statePrinting":"printen","stateStandby":"stand-by","stateUnavailable":"nog niet beschikbaar","stateUnknown":"onbekend","stop":"Stoppen","storageBar":"Opslag: {count} bestanden · {size}","storageGroupTitle":"{name} · {count} bestanden · {size}","storageMore":"Nog {count}…","supportPlanned":"{type}-ondersteuning is gepland, maar nog niet beschikbaar.","sure":"Bevestigen?","tlsCertificateChanged":"Het printercertificaat is gewijzigd. Verbinding geblokkeerd.","tlsPermissionRequired":"Sta printertoegang toe in OrcaSlicer en probeer de certificaatcontrole opnieuw.","tlsProbeFailed":"Kan het certificaat niet lezen. Controleer de printer en probeer het opnieuw.","tlsTrustBusy":"De printer is in gebruik. Wacht tot de bewerking is voltooid.","tlsTrustButton":"Certificaten…","tlsTrustConfirm":"Dit certificaat vertrouwen","tlsTrustCurrent":"Opgeslagen SHA-256","tlsTrustDetails":"Details","tlsTrustFtps":"Bestanden (FTPS 990)","tlsTrustIntro":"Bevestig certificaten alleen op een netwerk dat je vertrouwt. De eerste verbinding bewijst de identiteit van de printer niet.","tlsTrustMqtt":"Status en opdrachten (MQTT 8883)","tlsTrustNoPin":"Niet bevestigd","tlsTrustObserved":"Ontvangen SHA-256","tlsTrustProbe":"Lezen en vertrouwen","tlsTrustReplacement":"Het certificaat wijkt af van het opgeslagen certificaat. Bevestig de vervanging alleen als je deze wijziging verwachtte, bijvoorbeeld na vervanging of reset van de printer.","tlsTrustRequired":"Bevestig het printercertificaat voordat je verbinding maakt.","tlsTrustSaveFailed":"Kan de certificaatbevestiging niet opslaan.","tlsTrustSaved":"Certificaat bevestigd.","tlsTrustStale":"Printerinstellingen zijn gewijzigd of de bevestiging is verlopen. Lees het certificaat opnieuw.","tlsTrustTitle":"Bambu-certificaten","tlsTrustWorking":"Certificaat wordt gelezen…","toolActive":"actieve tool","toolDetails":"{tool} · Huidig: {current} · Doel: {target} · {state}","toolInactive":"inactief gereedschap","toolViewOnly":"Alleen bekijken; verandert het actieve gereedschap niet","unassignedDelete":"Verwijderen","unassignedDeleteAll":"Alles verwijderen","unassignedDeleteAllConfirm":"Alle {count} bestanden zonder gekoppelde printer ({size}) uit de Print Farm-opslag verwijderen? Kopieën op printers blijven ongemoeid.","unassignedDeleteConfirm":"{name} ({size}) uit de Print Farm-opslag verwijderen? Kopieën op printers blijven ongemoeid.","unassignedHeading":"Bestanden zonder gekoppelde printer: {count} · {size}","unassignedNoPrinter":"Geen printer is klaar. Een printer moet online en vrij zijn en uploads accepteren.","unassignedSend":"Naar printer versturen…","unassignedUpload":"Alleen uploaden","unassignedUploadStart":"Uploaden en starten","unassignedWhy":"Geen printer in het paneel komt overeen met de printervoorinstelling in dit bestand. Je kunt het eenmalig naar een gekozen printer versturen; er wordt niets gekoppeld.","unavailableSuffix":"nog niet beschikbaar","unmatchedQueued":"{count} bestand(en) in de wachtrij komen met geen enkele printer in het paneel overeen","uploadShort":"Uploaden","uploadToPrinterTitle":"Bestand naar deze printer uploaden zonder de print te starten","uploadToPrinters":"{name} uploaden naar {count} printer(s):","uploadUnverifiedHardware":"Uploaden niet beschikbaar: nog niet op hardware geverifieerd","uploadedNotStarted":"geüpload (niet gestart)","useAms":"AMS (Bambu) gebruiken","webuiAddress":"Webadres (optioneel)","webuiFallbackHelp":"Blijft de pagina laden, kopieer het adres naar een browser. Stel de webpoort in bij Verbinding.","webuiHelp":"Pagina laadt niet?"},"pl":{"accessCode":"Kod dostępu","add":"Dodaj","addConfiguredTitle":"Dodaj drukarkę skonfigurowaną w OrcaSlicer","addPrinter":"Dodaj drukarkę…","all":"wszystkie","bambuError":"Błąd drukarki {code}","bambuLayer":"warstwa {current}/{total}","bambuLeftHM":"Zostało {hours} godz. {minutes} min","bambuLeftM":"Zostało {minutes} min","bed":"Stół","busy":"{printer}: drukarka jest zajęta ({state})","busyNotStarted":"{printer}: drukarka jest zajęta ({state}) — nie rozpoczęto.","cameraButton":"Kamera na żywo","cameraCapturedAt":"Zarejestrowano {time}","cameraClose":"Zamknij kamerę","cameraLoadFailed":"Obraz nie załadował się tutaj. To okno może blokować obrazy z sieci lokalnej.","cameraLoading":"Łączenie z kamerą…","cameraMode":"Kamera","cameraModeAuto":"Skonfigurowana kamera","cameraModeU1":"Fabryczna kamera Snapmaker U1","cameraNativeSession":"Sesja kamery otwarta","cameraNone":"Ta drukarka nie ma skonfigurowanej kamery.","cameraOpenWindow":"Otwórz kamerę w oknie","cameraPermissionDenied":"Odmówiono pracy w tle. Zezwól i ponownie otwórz kamerę.","cameraReceivedAt":"Odebrano {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Nie można połączyć się z kamerą.","cancel":"Anuluj","cfgAutoDelete":"Automatycznie usuwaj stare kopie","cfgAutoDeleteAge":"Usuwaj kopie starsze niż","cfgAutoDeleteHint":"Domyślnie wyłączone. Sprawdzanie przy starcie i raz dziennie; usuwane są tylko kopie tej wtyczki, nigdy pliki w użyciu.","cfgClearConfirm":"Wyczyścić dziennik wydruków? Tej czynności nie można cofnąć.","cfgClearDone":"Żądanie zapisane. Dziennik zostanie wyczyszczony, gdy panel następnym razem odczyta ustawienia.","cfgClearHistory":"Wyczyść dziennik wydruków","cfgDays":"{days} d.","cfgJournalOrca":"Zapisuj w dzienniku wydruków wysyłki i wydruki z Orca","cfgJournalOrcaHint":"Tylko zadania zgłaszane przez sam OrcaSlicer.","cfgKeepAll":"Wszystkie","cfgKeepCopies":"Zachowuj kopie pociętych plików","cfgKeepCopiesHint":"Pozwala wysłać pocięty plik na drukarkę później. Po wyłączeniu nic nie jest kopiowane.","cfgKeepHistory":"Zachowuj dziennik wydruków","cfgKeepHistoryHint":"Po wyłączeniu nowe wpisy nie są zapisywane; istniejące zostają.","cfgKeepLast":"Zachowuj tylko najnowsze slajsy dla drukarki","cfgKeepLastHint":"Przy zapisie nowego slajsu starsze niewysłane kopie tej samej drukarki są usuwane. Kopie powiązane z dziennikiem druku zostają.","cfgPauseHidden":"Nie odpytuj, gdy panel nie jest widoczny","cfgPauseHiddenHint":"Oszczędza zapytania sieciowe, gdy karta lub okno jest ukryte.","cfgPollInterval":"Interwał odpytywania drukarek","cfgProfileHint":"Podpowiedź, gdy wtyczka nie jest wybrana w profilu procesu","cfgProfileHintHint":"Pokazywana w panelu, gdy pocięty plik nie dotarł do tej wtyczki.","cfgSeconds":"{seconds} s","close":"Zamknij","comingLater":"wkrótce","commandFailed":"{printer}: polecenie „{action}” nie powiodło się — {error}","commandSent":"{printer}: wysłano polecenie „{action}”.","confirmTitle":"Rozpocząć drukowanie na wielu drukarkach?","confirmUploadTitle":"Przesłać plik do wybranych drukarek?","connectionOptions":"Połączenie","connectionOptionsFailed":"Nie można zapisać. Sprawdź adres.","connectionOptionsHelp":"Użyj tego samego hosta i podaj port WWW.","connectionSave":"Zapisz","connectionTypeTitle":"Typ połączenia. Dostępne funkcje zależą od protokołu drukarki i jej aktualnego stanu.","controlsUnverified":"Wstrzymanie i zatrzymanie nie są dostępne dla tego połączenia (niezweryfikowane na sprzęcie)","crealityWsPortPlaceholder":"Port WS (9999)","crealityWsPortTitle":"Opcjonalnie. Port WebSocket statusu drukarki. 9999 to niepotwierdzona wartość domyślna; zmień ją, jeśli drukarka używa innego portu.","credentialLegacyWarning":"Klucze {count} drukarek są nadal zapisane jawnym tekstem. Przenieś je do magazynu systemowego. Stare kopie pozostaną.","credentialMigrate":"Przenieś klucze","credentialMigrationConfirm":"Przenieść klucze do magazynu systemowego? Stare kopie pozostaną.","credentialMigrationDone":"Klucze przeniesiono do magazynu systemowego.","credentialRetry":"Ponów dostęp","credentialSaveFailed":"Nie udało się bezpiecznie zapisać kluczy. Drukarka niezapisana.","credentialUnavailable":"Magazyn systemowy niedostępny. Połączenie zablokowane.","dashboardOpened":"Panel Print Farm otwarty.","duetPasswordPlaceholder":"Hasło maszyny Duet","errorNeedsAccessCode":"wymagany jest kod dostępu do drukarki","errorNeedsBambuCredentials":"wymagane są adres IP drukarki, kod dostępu i numer seryjny","errorNoAddress":"brak adresu drukarki","errorOutcomeUnknown":"drukarka mogła otrzymać żądanie lub nie; sprawdź drukarkę przed ponowną próbą","errorPrintCommand":"polecenie drukowania nie powiodło się: {error}","errorUnknownAction":"nieznane działanie drukarki","errorUnknownSerial":"przesłano, ale numer seryjny drukarki jest nadal nieznany — uruchom druk z poziomu drukarki","errorUnsupportedBackend":"ten typ połączenia nie jest obsługiwany","errorUpload":"przesyłanie nie powiodło się: {error}","errorUploadUnverified":"plik został przesłany, ale nie udało się zweryfikować jego rozmiaru na drukarce, więc druku nie rozpoczęto","errorUploadedNotStarted":"plik został przesłany, ale druku nie rozpoczęto: {error}","feedbackButton":"Opinie","feedbackCopied":"Skopiowano","feedbackCopy":"Kopiuj","feedbackHelp":"Skopiuj adres do przeglądarki i użyj przycisku opinii na stronie. Dane drukarek nie są wysyłane. “Beta Feedback”.","file3mfWarning":".3mf uruchamia się tylko na drukarkach Bambu — pozostałe wymagają G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Wysyłanie nie powiodło się: nie można odczytać pliku.","fileTargetMismatch":"{printer}: plik w kolejce nie pasuje do tej drukarki — nie rozpoczęto.","flashforgeCheckCodePlaceholder":"Kod weryfikacyjny (na ekranie drukarki)","flashforgeCheckCodeTitle":"Kod weryfikacyjny z ekranu drukarki. Na drukarce musi być włączony tryb LAN.","flashforgeErrAuth":"Nieprawidłowy numer seryjny lub kod weryfikacyjny.","flashforgeErrCredentials":"Wpisz numer seryjny i kod weryfikacyjny.","flashforgeErrIdentity":"Nie udało się zweryfikować modelu drukarki.","flashforgeErrLanMode":"Włącz tryb LAN na drukarce.","flashforgeErrUnsupportedModel":"Ten model FlashForge nie jest obsługiwany (tylko Adventurer 5M, 5M Pro i AD5X).","flashforgeSerialPlaceholder":"Numer seryjny","flashforgeSerialTitle":"Numer seryjny drukarki z jej ekranu (Ustawienia > Informacje lub Sieć). Tryb LAN musi być włączony.","fleetAttention":"Wymagają uwagi","fleetIdle":"Wolne","fleetPrinting":"Drukują","foundOnNetwork":"znaleziono w sieci","genericError":"błąd","history":"Historia drukowania","historyCoverage":"Lokalna historia zaobserwowanych wydruków. Obejmuje wydruki rozpoczęte przez Print Farm oraz zadania widoczne, gdy ten panel był otwarty; może brakować zadań wykonanych, gdy OrcaSlicer był offline.","historyDurationHoursMinutes":"{hours} godz. {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Nie zaobserwowano jeszcze żadnych wydruków dla tej drukarki.","historyFromOrca":"zgłoszone przez OrcaSlicer","historyLoading":"Ładowanie historii drukowania…","historyObserved":"zaobserwowano w Print Farm","historyProgress":"{progress}%","historyStartedHere":"rozpoczęto w Print Farm","historyStateCancelled":"anulowano","historyStateCompleted":"ukończono","historyStateEnded":"zakończono","historyStateFailed":"nie powiodło się","historyStatePaused":"wstrzymano","historyStatePrinting":"drukowanie","historyStateSent":"wysłano","historyTitle":"Historia drukowania — {printer}","historyUnknownFile":"Nieznany plik","integrationUnavailable":"Integracja drukarki nie jest jeszcze dostępna","journalActiveCount":"Aktywne: {count}","journalAllCount":"Zarejestrowane: {count}","journalBlockedByHold":"wcześniejsza operacja dla tej drukarki jest nierozstrzygnięta; otwórz dziennik wydruków i zdejmij blokadę po sprawdzeniu drukarki","journalButton":"Dziennik wydruków","journalCompletedCount":"Ukończone: {count}","journalEmptyAll":"Nie zarejestrowano jeszcze żadnych wydruków.","journalFileDelete":"Usuń plik","journalFileUnsent":"Plik pocięty, niewysłany","journalHoldLocked":"Ta operacja jest nadal wysyłana, więc nie można jeszcze zdjąć blokady.","journalHoldReleased":"Blokada zdjęta. Stara operacja pozostaje niezweryfikowana.","journalHoldState":"Stan: {state}","journalHoldUnavailable":"Szczegóły nierozstrzygniętej operacji są niedostępne. Spróbuj ponownie otworzyć dziennik wydruków.","journalHoldsHeading":"Nierozstrzygnięte operacje — przed zdjęciem blokady sprawdź fizyczną drukarkę, zadanie i płytę roboczą.","journalNoResults":"Brak pasujących wydruków.","journalPrinter":"Drukarka","journalReleaseConfirm":"Po sprawdzeniu fizycznej drukarki, zadania i płyty roboczej dla „{target}” zdjąć tę blokadę? Pozwala to tylko na przyszłą próbę; stary wydruk nie zostanie oznaczony jako udany ani ponowiony.","journalReleaseHold":"Zdejmij blokadę","journalResend":"Wyślij ponownie…","journalResultsCount":"Wyniki: {count}","journalSearchLabel":"Szukaj w dzienniku wydruków","journalSearchPlaceholder":"Szukaj pliku lub drukarki…","journalSendConfirm":"Przesłać {name} do {printer} bez rozpoczynania drukowania?","journalStoreUnavailable":"Dziennik wydruków jest niedostępny. Sprawdź lokalny magazyn wtyczki.","journalTitle":"Dziennik wydruków","legacyImportBlocked":"Dane pozostają w poprzednim folderze. Tego zestawu nie można zaimportować automatycznie.","legacyImportButton":"Importuj starsze dane","legacyImportConfirm":"Dane i lokalne dane logowania zostaną skopiowane do lokalnego magazynu wtyczki OrcaSlicer. Stara kopia pozostanie zachowana. Kontynuować?","legacyImportDetail":"Znaleziono starsze dane: drukarek – {printers}, wpisów historii – {history}, pozycji kolejki – {outbox}, plików – {files}.","legacyImportDone":"Import zakończony.","legacyImportFailed":"Nie udało się zaimportować starszych danych.","loading":"Ładowanie…","massFailed":", niepowodzeń: {count}","massResult":"Wysłano do drukarek: {count}{failed}.","namePlaceholder":"Nazwa","networkPermissionRequired":"Zezwól na dostęp do drukarki w OrcaSlicer. Jeśli ta opcja jest dostępna, otwórz Wtyczki → Print Farm → Uprawnienia. Następnie kliknij „Odśwież” na karcie tej drukarki.","noPrinters":"Nie znaleziono drukarek. Skonfiguruj hosta drukarki w OrcaSlicer lub dodaj go powyżej.","notReachable":"{printer}: drukarka nieosiągalna","notReachableNotStarted":"{printer}: drukarka jest nieosiągalna — nie rozpoczęto.","nozzle":"Dysza","octoprintApiKeyPlaceholder":"Klucz API OctoPrint","open":"Interfejs WWW","operatorStartCheck":"Potwierdzam: pocięty plik i wybrana płyta pasują do tej drukarki, materiały i narzędzia są prawidłowe, a stół jest wolny.","other":"Inne","outboxCopiesOff":"Kopie pociętych plików są wyłączone w ustawieniach wtyczki.","outboxFallbackName":"cięcie {stamp}","outboxHintText":"W profilu procesu nie wybrano wtyczki Printers Outbox – kopie pociętych plików nie są zapisywane.","outboxHintWhere":"Wybierz ją w sekcji Proces → Inne → Wtyczka potoku cięcia.","outboxNotReady":"Plik G-code nie jest gotowy","outboxPrinterUsage":"Drukarka: {name} · folder: {folder} · plików: {count} · {size}. Przejrzyj je lub usuń poniżej.","outboxQueued":"Dodano {name} do kolejki dla {target}","outboxRemoveFailed":"Nie udało się usunąć zapisanego pliku. Pozostaje na liście, aby można było ponowić próbę.","outboxStorageCleanBlocked":"Pozostałości można usunąć tylko wtedy, gdy nie trwa przesyłanie ani wydruk, a indeks plików jest sprawny.","outboxStorageCleanButton":"Usuń pozostałości (plików: {count}, {size})","outboxStorageCleanConfirm":"Usunąć pozostałe pliki (liczba: {count}, {size}) z magazynu Print Farm? Pliki w kolejkach drukarek pozostaną nietknięte.","outboxStorageCleanDone":"Usunięto pozostałe pliki: {count} ({size}).","outboxStorageCleanFailed":"Nie udało się usunąć plików: {count} — {paths}. Spróbuj ponownie.","outboxStorageEmpty":"Nie znaleziono plików kolejki ani kopii odzyskiwania.","outboxStorageEntry":"{label} — plików: {count} · {size} · {path}","outboxStorageKindIncoming":"Pliki przygotowane do wysłania","outboxStorageKindIndex":"Indeks kolejki","outboxStorageKindIndexBackup":"Kopia zapasowa indeksu kolejki","outboxStorageKindLoose":"Luźne lub osierocone pliki","outboxStorageKindRecovery":"Starsze pliki odzyskiwania","outboxStorageKindUnassigned":"Nieprzypisane pliki","outboxStorageManualCleanup":"Pozostałe pliki (luźne pliki, przygotowane do wysłania, kopie odzyskiwania, kopie zapasowe indeksu) usuniesz przyciskiem poniżej. Pliki w kolejkach drukarek usuwa się pojedynczo.","outboxStorageScanFailed":"Nie udało się sprawdzić wszystkich ścieżek magazynu: {paths}. Suma może być niepełna.","outboxStorageWarning":"Magazyn rośnie; usuń z kolejek pliki, których już nie potrzebujesz.","outboxUnassigned":"Nieprzypisane pliki: {count} · {size}. Przejrzyj je i usuń ręcznie poniżej.","outboxWriteFailed":"Nie udało się zachować kopii pliku G-code","outboxWrongStep":"To nie etap przetwarzania końcowego G-code","pause":"Pauza","plateLabel":"Płyta","preparedUploadDiscardFailed":"Nie udało się usunąć tymczasowej kopii przesłanego pliku; sprawdź magazyn.","print":"Drukuj…","printShort":"Drukuj","printerBusy":"Drukarka jest zajęta","printerIpPlaceholder":"192.168.0.42 (adres IP drukarki)","printerNotOnline":"Drukarka nie jest online","prusalinkApiKeyPlaceholder":"Klucz API PrusaLink","queueLess":"Pokaż mniej","queueMore":"Pokaż jeszcze {count}","refresh":"Odśwież","remove":"Usuń","removeRetainedTitle":"Usuń zachowaną kopię","repetierApiKeyPlaceholder":"Klucz API Repetier","repetierLoadFailed":"Nie można wczytać drukarki Repetier. Sprawdź adres, klucz i listę.","repetierLoadPrinters":"Wczytaj drukarki","repetierModeUnsupported":"Zapis dla tej wersji lub połączenia nie został zweryfikowany. Tylko stan.","repetierNotReady":"Serwer nie potwierdził gotowości drukarki do przyjmowania poleceń.","repetierRequestAccepted":"Żądanie przyjęte; zadanie może czekać w kolejce serwera. Kolejny stan potwierdzi drukowanie.","repetierSelectPrinter":"Wybierz drukarkę","resume":"Wznów","select":"wybierz","selectAllTitle":"Zaznacz lub usuń zaznaczenie każdej dostępnej drukarki","selfSigned":"z podpisem własnym","selfSignedTitle":"Włącz tylko dla drukarki obsługiwanej przez HTTPS z certyfikatem z podpisem własnym. Zwykłe drukarki HTTP w sieci LAN tego nie wymagają.","send":"Wyślij","sendFailed":"{printer}: wysyłanie nie powiodło się — {error}","sendSelected":"Wyślij G-code do wybranych…","sendSelectedCount":"Wyślij G-code do wybranych ({count})…","sendToPrinterTitle":"Wyślij do tej drukarki i rozpocznij drukowanie","sendingFile":"Wysyłanie {name} do drukarek ({count})…","sentToPrint":"wysłano do druku","serialAuto":"Numer seryjny (automatyczny)","serialTitle":"Numer seryjny jest wykrywany automatycznie. Wpisz go tylko po to, aby przypiąć konkretną drukarkę. Używany jest port MQTT 8883.","startApprovalExpired":"Zatwierdzenie uruchomienia wygasło lub parametry uległy zmianie; sprawdź je ponownie.","startBedClear":"Stół jest wolny i gotowy na nowy wydruk.","startBlocked":"Start zablokowany dla {printer}: {reason}","startCompatibilityUnknown":"Nie udało się potwierdzić zgodności pociętego pliku z tą drukarką. Możesz przesłać plik bez rozpoczynania drukowania.","startConfirmMissing":"Start anulowany: potwierdź, że stół jest wolny i, gdzie trzeba, że plik pasuje do drukarki.","startFileCheck":"Sprawdzono: ten plik jest pocięty dokładnie dla tej drukarki.","startImmediately":"Rozpocznij drukowanie natychmiast po przesłaniu","startPrint":"Rozpocznij wydruk","startReasonFileKind":"Tego typu pliku nie można uruchomić na tej drukarce.","startReasonNoStart":"Uruchamianie wydruków z Print Farm nie jest jeszcze dostępne dla tego połączenia. Możesz przesłać plik.","startReasonPlate":"Wybrana płyta nie pasuje do tego pliku.","startReasonProfileMatch":"Plik został pocięty dla profilu OrcaSlicer tej drukarki.","startReasonProfileUnknown":"Print Farm nie może ustalić z pliku, dla jakiej drukarki został pocięty.","startReasonProject":"To niepocięty plik projektu. Najpierw go pokrój.","startReasonSlicedOnly":"Ta drukarka uruchamia tylko pocięte pliki 3MF, nie zwykły G-code.","startReasonUnsupported":"Ten typ połączenia nie jest jeszcze obsługiwany.","startReviewTitle":"Potwierdź każdy wydruk","startVerdictCompatible":"Zgodny","startVerdictIncompatible":"Niezgodny","startVerdictUnknown":"Sprawdź ręcznie","startWillStart":"Drukarki do uruchomienia: {count}","stateAborted":"przerwano","stateBusy":"zajęta","stateChecking":"sprawdzanie","stateComplete":"ukończono","stateError":"błąd","stateFailed":"niepowodzenie","stateIdle":"bezczynna","stateOffline":"offline","stateOnline":"online","statePaused":"wstrzymano","statePrinting":"drukowanie","stateStandby":"tryb gotowości","stateUnavailable":"jeszcze niedostępne","stateUnknown":"nieznany","stop":"Zatrzymaj","storageBar":"Magazyn · plików: {count} · {size}","storageGroupTitle":"{name} · plików: {count} · {size}","storageMore":"Jeszcze {count}…","supportPlanned":"Obsługa {type} jest planowana, ale jeszcze niedostępna.","sure":"Potwierdź?","tlsCertificateChanged":"Certyfikat drukarki uległ zmianie. Połączenie zablokowane.","tlsPermissionRequired":"Zezwól na dostęp do drukarki w OrcaSlicer i ponów sprawdzenie certyfikatu.","tlsProbeFailed":"Nie można odczytać certyfikatu. Sprawdź drukarkę i spróbuj ponownie.","tlsTrustBusy":"Drukarka jest używana. Poczekaj na zakończenie operacji.","tlsTrustButton":"Certyfikaty…","tlsTrustConfirm":"Zaufaj temu certyfikatowi","tlsTrustCurrent":"Zapisany SHA-256","tlsTrustDetails":"Szczegóły","tlsTrustFtps":"Pliki (FTPS 990)","tlsTrustIntro":"Potwierdzaj certyfikaty tylko w zaufanej sieci. Pierwsze połączenie nie potwierdza tożsamości drukarki.","tlsTrustMqtt":"Stan i polecenia (MQTT 8883)","tlsTrustNoPin":"Niepotwierdzony","tlsTrustObserved":"Otrzymany SHA-256","tlsTrustProbe":"Odczytaj i zaufaj","tlsTrustReplacement":"Certyfikat różni się od zapisanego. Potwierdź nowy certyfikat tylko wtedy, gdy spodziewasz się tej zmiany, na przykład po wymianie lub zresetowaniu drukarki.","tlsTrustRequired":"Potwierdź certyfikat drukarki przed połączeniem.","tlsTrustSaveFailed":"Nie można zapisać potwierdzenia certyfikatu.","tlsTrustSaved":"Certyfikat potwierdzony.","tlsTrustStale":"Ustawienia drukarki uległy zmianie lub potwierdzenie wygasło. Odczytaj certyfikat ponownie.","tlsTrustTitle":"Certyfikaty Bambu","tlsTrustWorking":"Odczytywanie certyfikatu…","toolActive":"aktywne narzędzie","toolDetails":"{tool} · Bieżąca: {current} · Docelowa: {target} · {state}","toolInactive":"nieaktywne narzędzie","toolViewOnly":"Tylko podgląd; nie zmienia aktywnego narzędzia","unassignedDelete":"Usuń","unassignedDeleteAll":"Usuń wszystkie","unassignedDeleteAllConfirm":"Usunąć wszystkie pliki bez przypisanej drukarki ({count}, {size}) z magazynu Print Farm? Kopie na drukarkach pozostaną nietknięte.","unassignedDeleteConfirm":"Usunąć {name} ({size}) z magazynu Print Farm? Kopie na drukarkach nie są naruszane.","unassignedHeading":"Pliki bez przypisanej drukarki: {count} · {size}","unassignedNoPrinter":"Żadna drukarka nie jest gotowa. Musi być online, wolna i przyjmować przesyłanie.","unassignedSend":"Wyślij do drukarki…","unassignedUpload":"Tylko prześlij","unassignedUploadStart":"Prześlij i rozpocznij","unassignedWhy":"Żadna drukarka w panelu nie pasuje do profilu drukarki w tym pliku. Możesz jednorazowo wysłać go do wybranej drukarki; nic nie zostanie powiązane.","unavailableSuffix":"jeszcze niedostępne","unmatchedQueued":"Pliki w kolejce niepasujące do żadnej drukarki w panelu: {count}","uploadShort":"Prześlij","uploadToPrinterTitle":"Prześlij plik do tej drukarki bez rozpoczynania drukowania","uploadToPrinters":"Prześlij {name} do drukarek ({count}):","uploadUnverifiedHardware":"Przesyłanie niedostępne: jeszcze niezweryfikowane na sprzęcie","uploadedNotStarted":"przesłano (nie rozpoczęto)","useAms":"Użyj AMS (Bambu)","webuiAddress":"Adres WWW (opcjonalny)","webuiFallbackHelp":"Jeśli strona wciąż się ładuje, skopiuj adres do przeglądarki. Port WWW ustawisz w Połączeniu.","webuiHelp":"Strona się nie ładuje?"},"pt_BR":{"accessCode":"Código de acesso","add":"Adicionar","addConfiguredTitle":"Adicionar uma impressora configurada no OrcaSlicer","addPrinter":"Adicionar uma impressora…","all":"todas","bambuError":"Erro da impressora {code}","bambuLayer":"camada {current}/{total}","bambuLeftHM":"Faltam {hours} h {minutes} min","bambuLeftM":"Faltam {minutes} min","bed":"Mesa","busy":"{printer}: a impressora está ocupada ({state})","busyNotStarted":"{printer}: a impressora está ocupada ({state}) — não foi iniciada.","cameraButton":"Câmera ao vivo","cameraCapturedAt":"Capturado {time}","cameraClose":"Fechar câmera","cameraLoadFailed":"A imagem não carregou aqui. Esta janela pode bloquear imagens da rede local.","cameraLoading":"Conectando à câmera…","cameraMode":"Câmera","cameraModeAuto":"Webcam configurada","cameraModeU1":"Câmera original Snapmaker U1","cameraNativeSession":"Sessão de câmera aberta","cameraNone":"Esta impressora não tem câmera configurada.","cameraOpenWindow":"Abrir câmera em uma janela","cameraPermissionDenied":"Trabalho em segundo plano negado. Permita e reabra a câmera.","cameraReceivedAt":"Recebido {time}","cameraTitle":"Câmera: {printer}","cameraUnavailable":"Não foi possível acessar a câmera.","cancel":"Cancelar","cfgAutoDelete":"Excluir cópias antigas automaticamente","cfgAutoDeleteAge":"Excluir cópias mais antigas que","cfgAutoDeleteHint":"Desativado por padrão. Verificado na inicialização e uma vez por dia; apenas cópias deste plugin são removidas, nunca arquivos em uso.","cfgClearConfirm":"Limpar o registro de impressão? Esta ação não pode ser desfeita.","cfgClearDone":"Solicitado. O registro é limpo na próxima vez que o painel ler as configurações.","cfgClearHistory":"Limpar o registro de impressão","cfgDays":"{days} d","cfgJournalOrca":"Registrar no registro de impressão os envios e impressões iniciados pelo Orca","cfgJournalOrcaHint":"Somente trabalhos informados pelo próprio OrcaSlicer.","cfgKeepAll":"Todos","cfgKeepCopies":"Manter cópias dos arquivos fatiados","cfgKeepCopiesHint":"Permite enviar um fatiamento a uma impressora depois. Se desativado, nada é copiado.","cfgKeepHistory":"Manter o registro de impressão","cfgKeepHistoryHint":"Se desativado, novas entradas não são registradas; as existentes permanecem.","cfgKeepLast":"Manter apenas os fatiamentos mais recentes por impressora","cfgKeepLastHint":"Ao salvar um novo fatiamento, as cópias antigas não enviadas da mesma impressora são excluídas. Cópias vinculadas ao registro de impressão permanecem.","cfgPauseHidden":"Não consultar enquanto o painel não estiver visível","cfgPauseHiddenHint":"Economiza requisições de rede enquanto a aba ou a janela está oculta.","cfgPollInterval":"Intervalo de consulta das impressoras","cfgProfileHint":"Aviso quando o plugin não está selecionado na predefinição de processo","cfgProfileHintHint":"Exibido no painel quando um fatiamento não chegou a este plugin.","cfgSeconds":"{seconds} s","close":"Fechar","comingLater":"em breve","commandFailed":"{printer}: comando “{action}” falhou — {error}","commandSent":"{printer}: comando “{action}” enviado.","confirmTitle":"Iniciar impressão em várias impressoras?","confirmUploadTitle":"Enviar o arquivo para as impressoras selecionadas?","connectionOptions":"Conexão","connectionOptionsFailed":"Não foi possível salvar. Verifique o endereço.","connectionOptionsHelp":"Use o mesmo host e informe a porta web.","connectionSave":"Salvar","connectionTypeTitle":"Tipo de conexão. As funções disponíveis dependem do protocolo da impressora e do estado atual.","controlsUnverified":"Pausar e parar não estão disponíveis para esta conexão (não verificado no hardware)","crealityWsPortPlaceholder":"Porta WS (9999)","crealityWsPortTitle":"Opcional. Porta do WebSocket de status da impressora. 9999 é um padrão não confirmado; altere se sua impressora usar outra porta.","credentialLegacyWarning":"As chaves de {count} impressoras ainda estão em texto simples. Mova-as para o cofre do sistema. Backups antigos permanecem.","credentialMigrate":"Mover chaves","credentialMigrationConfirm":"Mover as chaves para o cofre do sistema? Backups antigos permanecem.","credentialMigrationDone":"Chaves movidas para o cofre do sistema.","credentialRetry":"Tentar acesso novamente","credentialSaveFailed":"Não foi possível salvar as chaves com segurança. Impressora não salva.","credentialUnavailable":"Cofre do sistema indisponível. Conexão bloqueada.","dashboardOpened":"Painel do Print Farm aberto.","duetPasswordPlaceholder":"Senha da máquina Duet","errorNeedsAccessCode":"é necessário o código de acesso da impressora","errorNeedsBambuCredentials":"são necessários o IP, o código de acesso e o número de série da impressora","errorNoAddress":"falta o endereço da impressora","errorOutcomeUnknown":"a impressora pode ou não ter recebido a solicitação; verifique a impressora antes de tentar novamente","errorPrintCommand":"comando de impressão falhou: {error}","errorUnknownAction":"ação desconhecida da impressora","errorUnknownSerial":"enviado, mas o número de série da impressora ainda é desconhecido — inicie a impressão pela impressora","errorUnsupportedBackend":"este tipo de conexão não é compatível","errorUpload":"falha no envio do arquivo: {error}","errorUploadUnverified":"o arquivo foi enviado, mas não foi possível verificar seu tamanho na impressora, então a impressão não foi iniciada","errorUploadedNotStarted":"o arquivo foi enviado, mas a impressão não foi iniciada: {error}","feedbackButton":"Comentários","feedbackCopied":"Copiado","feedbackCopy":"Copiar","feedbackHelp":"Copie o endereço em um navegador e use o botão de comentários do site. Nenhum dado de impressora é enviado. “Beta Feedback”.","file3mfWarning":".3mf só inicia em impressoras Bambu — as outras esperam G-code.","fileOperationDone":"{printer}: {name} {result}.","fileReadFailed":"Falha no envio: não foi possível ler o arquivo.","fileTargetMismatch":"{printer}: o arquivo na fila não corresponde a esta impressora; a impressão não foi iniciada.","flashforgeCheckCodePlaceholder":"Código de verificação (na tela da impressora)","flashforgeCheckCodeTitle":"Código de verificação exibido na tela da impressora. O modo LAN deve estar ativado na impressora.","flashforgeErrAuth":"Número de série ou código de verificação incorreto.","flashforgeErrCredentials":"Informe o número de série e o código de verificação.","flashforgeErrIdentity":"Não foi possível verificar o modelo da impressora.","flashforgeErrLanMode":"Ative o modo LAN na impressora.","flashforgeErrUnsupportedModel":"Este modelo FlashForge não é compatível (somente Adventurer 5M, 5M Pro e AD5X).","flashforgeSerialPlaceholder":"Número de série","flashforgeSerialTitle":"Número de série da impressora exibido na tela dela (Configurações > Sobre ou Rede). O modo LAN deve estar ativado.","fleetAttention":"Precisam de atenção","fleetIdle":"Livres","fleetPrinting":"Imprimindo","foundOnNetwork":"encontrada na rede","genericError":"erro","history":"Histórico de impressão","historyCoverage":"Histórico local de impressões observadas. Inclui impressões iniciadas pelo Print Farm e trabalhos vistos enquanto este painel estava aberto; o trabalho feito enquanto o OrcaSlicer estava offline pode não aparecer.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Nenhuma impressão observada para esta impressora ainda.","historyFromOrca":"informado pelo OrcaSlicer","historyLoading":"Carregando histórico de impressão…","historyObserved":"observada pelo Print Farm","historyProgress":"{progress}%","historyStartedHere":"iniciada pelo Print Farm","historyStateCancelled":"cancelada","historyStateCompleted":"concluída","historyStateEnded":"encerrada","historyStateFailed":"falhou","historyStatePaused":"pausada","historyStatePrinting":"imprimindo","historyStateSent":"enviado","historyTitle":"Histórico de impressão — {printer}","historyUnknownFile":"Arquivo desconhecido","integrationUnavailable":"A integração da impressora ainda não está disponível","journalActiveCount":"Ativos: {count}","journalAllCount":"Registrados: {count}","journalBlockedByHold":"uma operação anterior desta impressora está sem resolução; abra o registro de impressão e libere o bloqueio depois de verificar a impressora","journalButton":"Registro de impressão","journalCompletedCount":"Concluídos: {count}","journalEmptyAll":"Ainda não há impressões registradas.","journalFileDelete":"Excluir arquivo","journalFileUnsent":"Fatiado, não enviado","journalHoldLocked":"Esta operação ainda está sendo enviada e não pode ser liberada agora.","journalHoldReleased":"Bloqueio liberado. A operação antiga continua não verificada.","journalHoldState":"Estado: {state}","journalHoldUnavailable":"Os detalhes da operação não resolvida não estão disponíveis. Tente reabrir o registro de impressão.","journalHoldsHeading":"Operações não resolvidas — verifique a impressora física, o trabalho e a placa de impressão antes de liberar um bloqueio.","journalNoResults":"Nenhuma impressão correspondente.","journalPrinter":"Impressora","journalReleaseConfirm":"Depois de verificar a impressora física, o trabalho e a placa de impressão de “{target}”, liberar este bloqueio? Isso apenas desbloqueia uma tentativa futura; não marca a impressão antiga como bem-sucedida nem a repete.","journalReleaseHold":"Liberar bloqueio","journalResend":"Enviar novamente…","journalResultsCount":"Resultados: {count}","journalSearchLabel":"Buscar no registro de impressão","journalSearchPlaceholder":"Buscar arquivo ou impressora…","journalSendConfirm":"Enviar {name} para {printer} sem iniciar a impressão?","journalStoreUnavailable":"O registro de impressão está indisponível. Verifique o armazenamento local do plugin.","journalTitle":"Registro de impressão","legacyImportBlocked":"Seus dados permanecem na pasta anterior. Este conjunto não pode ser importado automaticamente.","legacyImportButton":"Importar dados antigos","legacyImportConfirm":"Os dados e as credenciais locais serão copiados para o armazenamento local do plugin OrcaSlicer. A cópia antiga será mantida. Continuar?","legacyImportDetail":"Dados antigos: {printers} impressoras, {history} registros de histórico, {outbox} itens na fila e {files} arquivos.","legacyImportDone":"Importação concluída.","legacyImportFailed":"Não foi possível importar os dados antigos.","loading":"Carregando…","massFailed":", falhas: {count}","massResult":"Enviado para {count} impressora(s){failed}.","namePlaceholder":"Nome","networkPermissionRequired":"Permita o acesso à impressora no OrcaSlicer. Se disponível, use Plugins → Print Farm → Permissões. Em seguida, clique em “Atualizar” no cartão desta impressora.","noPrinters":"Nenhuma impressora encontrada. Configure um host de impressora no OrcaSlicer ou adicione um acima.","notReachable":"{printer}: a impressora não está acessível","notReachableNotStarted":"{printer}: a impressora não está acessível — não foi iniciada.","nozzle":"Bico","octoprintApiKeyPlaceholder":"Chave de API do OctoPrint","open":"Abrir interface web","operatorStartCheck":"Verifiquei que o arquivo fatiado e a placa selecionada são adequados para esta impressora, que os materiais e as ferramentas estão corretos e que a mesa está livre.","other":"Outro","outboxCopiesOff":"As cópias de fatiamentos estão desativadas nas configurações do plugin.","outboxFallbackName":"fatiamento {stamp}","outboxHintText":"Nenhum plugin Printers Outbox está selecionado na predefinição de processo: as cópias dos fatiamentos não são salvas.","outboxHintWhere":"Selecione-o em Processo → Outros → Plugin de Pipeline de Fatiamento.","outboxNotReady":"Arquivo G-code não está pronto","outboxPrinterUsage":"Impressora: {name} · pasta: {folder} · {count} arquivo(s) · {size}. Confira ou remova abaixo.","outboxQueued":"{name} adicionado à fila para {target}","outboxRemoveFailed":"Não foi possível remover o arquivo salvo. Ele continua listado para você tentar novamente.","outboxStorageCleanBlocked":"As sobras só podem ser excluídas enquanto não houver envio nem impressão em andamento e o índice de arquivos estiver íntegro.","outboxStorageCleanButton":"Excluir sobras ({count} arquivo(s), {size})","outboxStorageCleanConfirm":"Excluir {count} arquivo(s) restante(s) ({size}) do armazenamento do Print Farm? Os arquivos na fila das impressoras não são alterados.","outboxStorageCleanDone":"{count} arquivo(s) restante(s) excluído(s) ({size}).","outboxStorageCleanFailed":"Não foi possível excluir {count} arquivo(s): {paths}. Tente novamente.","outboxStorageEmpty":"Nenhum arquivo na fila ou cópia de recuperação foi encontrado.","outboxStorageEntry":"{label}: {count} arquivo(s) · {size} · {path}","outboxStorageKindIncoming":"Envios preparados","outboxStorageKindIndex":"Índice da fila","outboxStorageKindIndexBackup":"Backup do índice da fila","outboxStorageKindLoose":"Arquivos soltos ou órfãos","outboxStorageKindRecovery":"Arquivos antigos de recuperação","outboxStorageKindUnassigned":"Arquivos sem impressora","outboxStorageManualCleanup":"Os arquivos restantes (soltos, envios preparados, cópias de recuperação, backups do índice) podem ser excluídos com o botão abaixo. Os arquivos na fila das impressoras são removidos um a um.","outboxStorageScanFailed":"Não foi possível verificar todos os caminhos de armazenamento: {paths}. Os totais podem estar incompletos.","outboxStorageWarning":"O armazenamento está crescendo; remova das filas os arquivos de que você não precisa mais.","outboxUnassigned":"Arquivos sem impressora: {count} · {size}. Confira e remova manualmente abaixo.","outboxWriteFailed":"Não foi possível manter a cópia do arquivo G-code","outboxWrongStep":"Não é a etapa de pós-processamento G-code","pause":"Pausa","plateLabel":"Placa","preparedUploadDiscardFailed":"Não foi possível remover a cópia temporária do arquivo enviado; verifique o armazenamento.","print":"Imprimir…","printShort":"Imprimir","printerBusy":"A impressora está ocupada","printerIpPlaceholder":"192.168.0.42 (IP da impressora)","printerNotOnline":"A impressora não está online","prusalinkApiKeyPlaceholder":"Chave de API do PrusaLink","queueLess":"Mostrar menos","queueMore":"Mostrar mais {count}","refresh":"Atualizar","remove":"Remover","removeRetainedTitle":"Remover cópia retida","repetierApiKeyPlaceholder":"Chave de API do Repetier","repetierLoadFailed":"Não foi possível carregar a impressora Repetier. Verifique endereço, chave e lista.","repetierLoadPrinters":"Carregar impressoras","repetierModeUnsupported":"Gravação não verificada para esta versão ou conexão. Apenas estado.","repetierNotReady":"O servidor não confirmou que a impressora aceita comandos.","repetierRequestAccepted":"Solicitação aceita; o trabalho pode aguardar na fila do servidor. O próximo estado confirmará a impressão.","repetierSelectPrinter":"Escolher impressora","resume":"Continuar","select":"selecionar","selectAllTitle":"Selecione ou desmarque todas as impressoras disponíveis","selfSigned":"autoassinado","selfSignedTitle":"Ative apenas para impressoras acessadas via HTTPS com certificado autoassinado. Impressoras HTTP simples na LAN não precisam disso.","send":"Enviar","sendFailed":"{printer}: falha no envio — {error}","sendSelected":"Enviar G-code para as selecionadas…","sendSelectedCount":"Enviar G-code para selecionadas ({count})…","sendToPrinterTitle":"Enviar para esta impressora e iniciar a impressão","sendingFile":"Enviando {name} para {count} impressora(s)…","sentToPrint":"enviado para impressão","serialAuto":"Número de série (automático)","serialTitle":"O número de série é detectado automaticamente. Informe-o apenas para fixar uma impressora específica. A porta MQTT 8883 é usada.","startApprovalExpired":"A confirmação de início expirou ou as configurações mudaram; confira novamente.","startBedClear":"A mesa está livre e pronta para uma nova impressão.","startBlocked":"Início bloqueado para {printer}: {reason}","startCompatibilityUnknown":"Não foi possível confirmar se o arquivo fatiado é compatível com esta impressora. Você pode enviá-lo sem iniciar a impressão.","startConfirmMissing":"Início cancelado: confirme que a mesa está livre e, quando solicitado, que o arquivo é adequado à impressora.","startFileCheck":"Verifiquei que este arquivo foi fatiado para esta impressora específica.","startImmediately":"Iniciar a impressão logo após o envio","startPrint":"Iniciar impressão","startReasonFileKind":"Este tipo de arquivo não pode ser iniciado nesta impressora.","startReasonNoStart":"Iniciar impressões pelo Print Farm ainda não está disponível para esta conexão. Você pode enviar o arquivo.","startReasonPlate":"A placa selecionada não corresponde a este arquivo.","startReasonProfileMatch":"O arquivo foi fatiado com a predefinição de impressora do OrcaSlicer desta impressora.","startReasonProfileUnknown":"O Print Farm não consegue saber pelo arquivo para qual impressora ele foi fatiado.","startReasonProject":"Este é um arquivo de projeto não fatiado. Fatie-o primeiro.","startReasonSlicedOnly":"Esta impressora só inicia arquivos 3MF fatiados, não G-code simples.","startReasonUnsupported":"Este tipo de conexão ainda não é compatível.","startReviewTitle":"Confirme cada impressão","startVerdictCompatible":"Compatível","startVerdictIncompatible":"Incompatível","startVerdictUnknown":"Verificar manualmente","startWillStart":"Impressoras que serão iniciadas: {count}","stateAborted":"abortada","stateBusy":"ocupada","stateChecking":"verificando","stateComplete":"concluída","stateError":"erro","stateFailed":"falhou","stateIdle":"ociosa","stateOffline":"offline","stateOnline":"online","statePaused":"pausada","statePrinting":"imprimindo","stateStandby":"em espera","stateUnavailable":"ainda não disponível","stateUnknown":"desconhecido","stop":"Parar","storageBar":"Armazenamento: {count} arquivo(s) · {size}","storageGroupTitle":"{name} · {count} arquivo(s) · {size}","storageMore":"Mais {count}…","supportPlanned":"O suporte a {type} está planejado, mas ainda não está disponível.","sure":"Confirmar?","tlsCertificateChanged":"O certificado da impressora mudou. Conexão bloqueada.","tlsPermissionRequired":"Permita o acesso à impressora no OrcaSlicer e repita a verificação do certificado.","tlsProbeFailed":"Não foi possível ler o certificado. Verifique a impressora e tente novamente.","tlsTrustBusy":"A impressora está em uso. Aguarde a operação terminar.","tlsTrustButton":"Certificados…","tlsTrustConfirm":"Confiar neste certificado","tlsTrustCurrent":"SHA-256 salvo","tlsTrustDetails":"Detalhes","tlsTrustFtps":"Arquivos (FTPS 990)","tlsTrustIntro":"Confirme certificados somente em uma rede confiável. A primeira conexão não comprova a identidade da impressora.","tlsTrustMqtt":"Status e comandos (MQTT 8883)","tlsTrustNoPin":"Não confirmado","tlsTrustObserved":"SHA-256 recebido","tlsTrustProbe":"Ler e confiar","tlsTrustReplacement":"O certificado é diferente do salvo. Confirme a substituição somente se esperava essa mudança, por exemplo, após substituir ou redefinir a impressora.","tlsTrustRequired":"Confirme o certificado da impressora antes de conectar.","tlsTrustSaveFailed":"Não foi possível salvar a confirmação do certificado.","tlsTrustSaved":"Certificado confirmado.","tlsTrustStale":"As configurações da impressora mudaram ou a confirmação expirou. Leia o certificado novamente.","tlsTrustTitle":"Certificados Bambu","tlsTrustWorking":"Lendo certificado…","toolActive":"ferramenta ativa","toolDetails":"{tool} · Atual: {current} · Alvo: {target} · {state}","toolInactive":"ferramenta inativa","toolViewOnly":"Apenas visualização; não altera a ferramenta ativa","unassignedDelete":"Excluir","unassignedDeleteAll":"Excluir tudo","unassignedDeleteAllConfirm":"Excluir todos os arquivos sem impressora vinculada ({count}, {size}) do armazenamento do Print Farm? As cópias nas impressoras não são afetadas.","unassignedDeleteConfirm":"Excluir {name} ({size}) do armazenamento do Print Farm? As cópias nas impressoras não são afetadas.","unassignedHeading":"Arquivos sem impressora vinculada: {count} · {size}","unassignedNoPrinter":"Nenhuma impressora está pronta. Ela deve estar online, livre e aceitar envios.","unassignedSend":"Enviar para uma impressora…","unassignedUpload":"Somente enviar","unassignedUploadStart":"Enviar e iniciar","unassignedWhy":"Nenhuma impressora do painel corresponde à predefinição de impressora deste arquivo. Você pode enviá-lo uma vez para a impressora escolhida; nenhum vínculo é criado.","unavailableSuffix":"ainda não disponível","unmatchedQueued":"{count} arquivo(s) na fila não correspondem a nenhuma impressora do painel","uploadShort":"Enviar","uploadToPrinterTitle":"Enviar o arquivo para esta impressora sem iniciar a impressão","uploadToPrinters":"Enviar {name} para {count} impressora(s):","uploadUnverifiedHardware":"Envio indisponível: ainda não verificado no hardware","uploadedNotStarted":"enviado (não iniciado)","useAms":"Usar AMS (Bambu)","webuiAddress":"Endereço web (opcional)","webuiFallbackHelp":"Se o carregamento continuar, copie o endereço em um navegador. A porta web pode ser definida em Conexão.","webuiHelp":"A página não carrega?"},"ru":{"accessCode":"Код доступа","add":"Добавить","addConfiguredTitle":"Добавить принтер, настроенный в OrcaSlicer","addPrinter":"Добавить принтер…","all":"все","bambuError":"Ошибка принтера {code}","bambuLayer":"слой {current}/{total}","bambuLeftHM":"Осталось {hours} ч {minutes} мин","bambuLeftM":"Осталось {minutes} мин","bed":"Стол","busy":"{printer}: принтер занят ({state})","busyNotStarted":"{printer}: принтер занят ({state}), печать не запущена.","cameraButton":"Камера в реальном времени","cameraCapturedAt":"Снято {time}","cameraClose":"Закрыть камеру","cameraLoadFailed":"Изображение здесь не загрузилось. Окно может блокировать картинки из локальной сети.","cameraLoading":"Подключаемся к камере…","cameraMode":"Камера","cameraModeAuto":"Камера из настроек принтера","cameraModeU1":"Штатная камера Snapmaker U1","cameraNativeSession":"Сеанс камеры открыт","cameraNone":"У этого принтера нет настроенной камеры.","cameraOpenWindow":"Открыть камеру в окне","cameraPermissionDenied":"Нет разрешения на фоновую работу. Разрешите её и снова откройте камеру.","cameraReceivedAt":"Получено {time}","cameraTitle":"Камера: {printer}","cameraUnavailable":"Камера недоступна.","cancel":"Отмена","cfgAutoDelete":"Автоматически удалять старые копии","cfgAutoDeleteAge":"Удалять копии старше","cfgAutoDeleteHint":"По умолчанию выключено. Проверка при запуске и раз в сутки; удаляются только копии этого плагина, файлы в работе не трогаются.","cfgClearConfirm":"Очистить журнал печати? Действие необратимо.","cfgClearDone":"Запрос сохранён. Журнал очистится, когда панель в следующий раз прочитает настройки.","cfgClearHistory":"Очистить журнал печати","cfgDays":"{days} дн.","cfgJournalOrca":"Записывать отправки и печати из Orca в журнал","cfgJournalOrcaHint":"Только задания, о которых сообщает сам OrcaSlicer.","cfgKeepAll":"Все","cfgKeepCopies":"Сохранять копии нарезок","cfgKeepCopiesHint":"Позволяет отправить нарезку на принтер позже. Если выключено, копии не создаются.","cfgKeepHistory":"Сохранять журнал печати","cfgKeepHistoryHint":"Если выключено, новые записи не создаются; существующие остаются.","cfgKeepLast":"Хранить только последние нарезки на принтер","cfgKeepLastHint":"При сохранении новой нарезки старые неотправленные копии того же принтера удаляются. Копии, связанные с журналом печати, остаются.","cfgPauseHidden":"Не опрашивать, пока панель не видна","cfgPauseHiddenHint":"Экономит сетевые запросы, пока вкладка или окно скрыты.","cfgPollInterval":"Интервал опроса принтеров","cfgProfileHint":"Подсказка про невыбранный плагин в профиле процесса","cfgProfileHintHint":"Показывается в панели, если нарезка не дошла до этого плагина.","cfgSeconds":"{seconds} с","close":"Закрыть","comingLater":"появится позже","commandFailed":"{printer}: команда «{action}» не выполнена — {error}","commandSent":"{printer}: команда «{action}» отправлена.","confirmTitle":"Запустить печать на нескольких принтерах?","confirmUploadTitle":"Загрузить файл на выбранные принтеры?","connectionOptions":"Подключение","connectionOptionsFailed":"Не удалось сохранить. Проверьте адрес и повторите.","connectionOptionsHelp":"Используйте адрес того же принтера, явно указав порт веб-интерфейса.","connectionSave":"Сохранить","connectionTypeTitle":"Тип подключения. Доступные действия зависят от протокола и состояния принтера.","controlsUnverified":"Пауза и остановка недоступны для этого подключения (не проверено на оборудовании)","crealityWsPortPlaceholder":"Порт WS (9999)","crealityWsPortTitle":"Необязательно. Порт WebSocket статуса принтера. 9999 — неподтверждённое значение по умолчанию; измените, если ваш принтер использует другой порт.","credentialLegacyWarning":"Ключи {count} принтеров пока хранятся открытым текстом. Перенесите их в системное хранилище. Старые резервные копии не удаляются.","credentialMigrate":"Перенести ключи","credentialMigrationConfirm":"Перенести сохранённые ключи в системное хранилище? Старые резервные копии останутся.","credentialMigrationDone":"Ключи перенесены в системное хранилище.","credentialRetry":"Повторить доступ","credentialSaveFailed":"Не удалось сохранить ключи в системном хранилище. Принтер не сохранён.","credentialUnavailable":"Системное хранилище ключей недоступно. Подключение к принтеру заблокировано.","dashboardOpened":"Панель Print Farm открыта.","duetPasswordPlaceholder":"Пароль принтера Duet","errorNeedsAccessCode":"требуется код доступа к принтеру","errorNeedsBambuCredentials":"требуются IP принтера, код доступа и серийный номер","errorNoAddress":"не указан адрес принтера","errorOutcomeUnknown":"принтер мог получить запрос, а мог и не получить; проверьте принтер, прежде чем повторять","errorPrintCommand":"не удалось запустить печать: {error}","errorUnknownAction":"неизвестная команда принтера","errorUnknownSerial":"файл загружен, но серийный номер принтера неизвестен — запустите печать на самом принтере","errorUnsupportedBackend":"этот тип подключения не поддерживается","errorUpload":"не удалось загрузить: {error}","errorUploadUnverified":"файл загружен, но его размер не удалось проверить на принтере, поэтому печать не запущена","errorUploadedNotStarted":"файл загружен, но печать не запущена: {error}","feedbackButton":"Обратная связь","feedbackCopied":"Скопировано","feedbackCopy":"Копировать","feedbackHelp":"Скопируйте адрес в браузер и нажмите на сайте «Бета-фидбек». Print Farm не отправляет данные принтеров.","file3mfWarning":".3mf запускается только на принтерах Bambu — остальным нужен G-code.","fileOperationDone":"{printer}: {name} — {result}.","fileReadFailed":"Не удалось отправить: файл не читается.","fileTargetMismatch":"{printer}: файл в очереди не соответствует этому принтеру, печать не запущена.","flashforgeCheckCodePlaceholder":"Check code (на экране принтера)","flashforgeCheckCodeTitle":"Check code с экрана принтера. На принтере должен быть включён LAN-режим.","flashforgeErrAuth":"Неверный серийный номер или check code.","flashforgeErrCredentials":"Введите серийный номер и check code.","flashforgeErrIdentity":"Не удалось подтвердить модель принтера.","flashforgeErrLanMode":"Включите LAN-режим на принтере.","flashforgeErrUnsupportedModel":"Эта модель FlashForge не поддерживается (только Adventurer 5M, 5M Pro и AD5X).","flashforgeSerialPlaceholder":"Серийный номер","flashforgeSerialTitle":"Серийный номер принтера с его экрана (Настройки > О принтере или Сеть). Должен быть включён LAN-режим.","fleetAttention":"Требуют внимания","fleetIdle":"Свободны","fleetPrinting":"Печатают","foundOnNetwork":"найден в сети","genericError":"ошибка","history":"История печати","historyCoverage":"Локальная наблюдаемая история. В неё входят печати, запущенные через Print Farm, и задания, замеченные при открытой панели; работа за время, когда OrcaSlicer не была запущена, может отсутствовать.","historyDurationHoursMinutes":"{hours} ч {minutes} мин","historyDurationMinutes":"{minutes} мин","historyEmpty":"Для этого принтера пока нет записей о печати.","historyFromOrca":"сообщено OrcaSlicer","historyLoading":"Загрузка истории печати…","historyObserved":"обнаружено Print Farm","historyProgress":"{progress}%","historyStartedHere":"запущено через Print Farm","historyStateCancelled":"отменено","historyStateCompleted":"завершено","historyStateEnded":"остановлено","historyStateFailed":"ошибка","historyStatePaused":"пауза","historyStatePrinting":"печать","historyStateSent":"отправлено","historyTitle":"История печатей — {printer}","historyUnknownFile":"Неизвестный файл","integrationUnavailable":"Интеграция с этим принтером пока недоступна","journalActiveCount":"В процессе: {count}","journalAllCount":"Записей: {count}","journalBlockedByHold":"предыдущая операция для этого принтера не разобрана; откройте журнал печати и снимите блокировку после проверки принтера","journalButton":"Журнал печати","journalCompletedCount":"Завершено: {count}","journalEmptyAll":"Записей о печати пока нет.","journalFileDelete":"Удалить файл","journalFileUnsent":"Нарезка, не отправлена","journalHoldLocked":"Операция ещё отправляется; снять блокировку пока нельзя.","journalHoldReleased":"Блокировка снята. Результат прежней операции остаётся неподтверждённым.","journalHoldState":"Состояние: {state}","journalHoldUnavailable":"Не удалось загрузить незавершённые операции. Закройте и снова откройте журнал печати.","journalHoldsHeading":"Операции без подтверждённого результата. Перед снятием блокировки проверьте физический принтер, задание и пластину.","journalNoResults":"Ничего не найдено.","journalPrinter":"Принтер","journalReleaseConfirm":"Вы проверили физический принтер, задание и пластину для «{target}». Снять блокировку? Это только разрешит новую попытку: прежняя печать не считается успешной, повторной отправки не будет.","journalReleaseHold":"Снять блокировку","journalResend":"Отправить снова…","journalResultsCount":"Результатов: {count}","journalSearchLabel":"Поиск по журналу печати","journalSearchPlaceholder":"Поиск по файлу или принтеру…","journalSendConfirm":"Загрузить {name} на {printer} без запуска печати?","journalStoreUnavailable":"Журнал печати недоступен. Проверьте локальное хранилище плагина.","journalTitle":"Журнал печати","legacyImportBlocked":"Данные сохранены в прежнем хранилище. Автоматический перенос этого набора недоступен.","legacyImportButton":"Импортировать старые данные","legacyImportConfirm":"Данные и локальные учётные данные будут скопированы в локальное хранилище плагина OrcaSlicer. Старая копия сохранится. Продолжить?","legacyImportDetail":"Найдены старые данные: принтеров — {printers}, записей истории — {history}, записей очереди — {outbox}, файлов — {files}.","legacyImportDone":"Импорт завершён.","legacyImportFailed":"Не удалось импортировать старые данные.","loading":"Загрузка…","massFailed":", ошибок: {count}","massResult":"Успешно отправлено на принтеры: {count}{failed}.","namePlaceholder":"Название","networkPermissionRequired":"Разреши доступ к принтеру в OrcaSlicer. Если вкладка доступна, открой Плагины → Print Farm → Разрешения. Затем нажми «Обновить» на карточке этого принтера.","noPrinters":"Принтеры не найдены. Настройте подключение в OrcaSlicer или добавьте принтер выше.","notReachable":"{printer}: принтер недоступен","notReachableNotStarted":"{printer}: принтер недоступен, печать не запущена.","nozzle":"Сопло","octoprintApiKeyPlaceholder":"API-ключ OctoPrint","open":"Открыть","operatorStartCheck":"Проверено: нарезка и выбранная пластина подходят именно этому принтеру, материалы и инструменты верны, стол свободен.","other":"Другой","outboxCopiesOff":"Копии нарезок отключены в настройках плагина.","outboxFallbackName":"нарезка {stamp}","outboxHintText":"В профиле процесса не выбран плагин Printers Outbox — копии нарезок не сохраняются.","outboxHintWhere":"Выберите его в разделе Процесс → Прочее → Плагин конвейера нарезки.","outboxNotReady":"Файл G-code ещё не готов","outboxPrinterUsage":"Принтер: {name} · папка: {folder} · файлов: {count} · {size}. Просматривайте и удаляйте файлы ниже.","outboxQueued":"Файл {name} подготовлен для {target}","outboxRemoveFailed":"Не удалось удалить сохранённый файл. Он остаётся в списке — можно повторить попытку.","outboxStorageCleanBlocked":"Остатки можно удалить, только пока не идёт загрузка или печать и индекс файлов в порядке.","outboxStorageCleanButton":"Удалить остатки ({count} файлов, {size})","outboxStorageCleanConfirm":"Удалить остатки ({count} файлов, {size}) из хранилища Print Farm? Файлы в очередях принтеров не затрагиваются.","outboxStorageCleanDone":"Удалено остатков: {count} ({size}).","outboxStorageCleanFailed":"Не удалось удалить файлов: {count} — {paths}. Повторите попытку.","outboxStorageEmpty":"Файлы очереди и копии восстановления не найдены.","outboxStorageEntry":"{label}: файлов — {count} · {size} · {path}","outboxStorageKindIncoming":"Подготовленные загрузки","outboxStorageKindIndex":"Индекс очереди","outboxStorageKindIndexBackup":"Резервная копия индекса","outboxStorageKindLoose":"Свободные или осиротевшие файлы","outboxStorageKindRecovery":"Файлы восстановления","outboxStorageKindUnassigned":"Файлы без привязки","outboxStorageManualCleanup":"Остаточные файлы (потерянные файлы, подготовленные загрузки, копии восстановления, резервные копии индекса) удаляются кнопкой ниже. Файлы в очередях принтеров удаляются по одному.","outboxStorageScanFailed":"Не удалось проверить все пути хранения: {paths}. Итоги могут быть неполными.","outboxStorageWarning":"Хранилище растёт; удалите из очередей ненужные файлы.","outboxUnassigned":"Файлы без привязки: {count} · {size}. Просматривайте и удаляйте их вручную ниже.","outboxWriteFailed":"Не удалось сохранить копию G-code","outboxWrongStep":"Это не этап постобработки G-code","pause":"Пауза","plateLabel":"Пластина","preparedUploadDiscardFailed":"Не удалось удалить временную копию загрузки; проверьте хранилище.","print":"Печать…","printShort":"Печать","printerBusy":"Принтер занят","printerIpPlaceholder":"192.168.0.42 (IP принтера)","printerNotOnline":"Принтер не в сети","prusalinkApiKeyPlaceholder":"API-ключ PrusaLink","queueLess":"Свернуть","queueMore":"Ещё {count}","refresh":"Обновить","remove":"Удалить","removeRetainedTitle":"Удалить сохранённую копию","repetierApiKeyPlaceholder":"API-ключ Repetier","repetierLoadFailed":"Не удалось загрузить выбранный принтер Repetier. Проверь адрес, ключ и список принтеров.","repetierLoadPrinters":"Загрузить принтеры","repetierModeUnsupported":"Для этой версии сервера или подключения запись не проверена. Доступен только статус.","repetierNotReady":"Сервер не подтвердил готовность принтера принимать команды.","repetierRequestAccepted":"Запрос принят; задание может ждать в очереди сервера. Печать подтвердится следующим статусом.","repetierSelectPrinter":"Выберите принтер","resume":"Продолжить","select":"выбрать","selectAllTitle":"Выбрать или снять выбор со всех доступных принтеров","selfSigned":"самоподписанный","selfSignedTitle":"Включайте только для HTTPS-принтера с самоподписанным сертификатом. Для обычных HTTP-принтеров в локальной сети это не требуется.","send":"Отправить","sendFailed":"{printer}: не удалось отправить — {error}","sendSelected":"Отправить G-code на выбранные…","sendSelectedCount":"Отправить G-code на выбранные принтеры: {count}","sendToPrinterTitle":"Отправить на этот принтер и начать печать","sendingFile":"Отправка {name} на принтеры: {count}…","sentToPrint":"отправлен на печать","serialAuto":"Серийный номер (авто)","serialTitle":"Серийный номер определяется автоматически. Укажите его только для привязки конкретного принтера. Используется MQTT-порт 8883.","startApprovalExpired":"Подтверждение запуска истекло или параметры изменились; проверьте ещё раз.","startBedClear":"Стол свободен и готов к новой печати.","startBlocked":"Запуск заблокирован для {printer}: {reason}","startCompatibilityUnknown":"Не удалось подтвердить совместимость нарезки с этим принтером. Файл можно загрузить без запуска.","startConfirmMissing":"Запуск отменён: подтвердите, что стол свободен и, где это требуется, что файл подходит принтеру.","startFileCheck":"Проверено: файл нарезан именно под этот принтер.","startImmediately":"Начать печать сразу после загрузки","startPrint":"Начать печать","startReasonFileKind":"Файл такого типа нельзя запустить на этом принтере.","startReasonNoStart":"Запуск печати из Print Farm для этого подключения пока недоступен. Файл можно загрузить.","startReasonPlate":"Выбранная пластина не соответствует этому файлу.","startReasonProfileMatch":"Файл нарезан под профиль OrcaSlicer этого принтера.","startReasonProfileUnknown":"По файлу Print Farm не может определить, под какой принтер он нарезан.","startReasonProject":"Это ненарезанный файл проекта. Сначала нарежьте его.","startReasonSlicedOnly":"Этот принтер запускает только нарезанные 3MF, а не обычный G-code.","startReasonUnsupported":"Этот тип подключения пока не поддерживается.","startReviewTitle":"Подтвердите каждую печать","startVerdictCompatible":"Совместимо","startVerdictIncompatible":"Несовместимо","startVerdictUnknown":"Проверьте вручную","startWillStart":"Принтеров к запуску: {count}","stateAborted":"прервано","stateBusy":"занят","stateChecking":"проверка","stateComplete":"завершено","stateError":"ошибка","stateFailed":"сбой","stateIdle":"готов","stateOffline":"не в сети","stateOnline":"в сети","statePaused":"пауза","statePrinting":"печать","stateStandby":"ожидание","stateUnavailable":"пока недоступно","stateUnknown":"неизвестно","stop":"Стоп","storageBar":"Хранилище: {count} файлов · {size}","storageGroupTitle":"{name} · {count} файлов · {size}","storageMore":"Ещё {count}…","supportPlanned":"Поддержка {type} запланирована, но пока недоступна.","sure":"Подтвердить?","tlsCertificateChanged":"Сертификат принтера изменился. Подключение заблокировано.","tlsPermissionRequired":"Разрешите доступ к принтеру в окне OrcaSlicer и повторите проверку сертификата.","tlsProbeFailed":"Не удалось прочитать сертификат. Проверьте принтер и повторите попытку.","tlsTrustBusy":"Принтер занят. Дождитесь завершения операции.","tlsTrustButton":"Сертификаты…","tlsTrustConfirm":"Доверять этому сертификату","tlsTrustCurrent":"Сохранённый SHA-256","tlsTrustDetails":"Подробности","tlsTrustFtps":"Файлы (FTPS 990)","tlsTrustIntro":"Подтверждайте сертификаты только в сети, которой доверяете. Первое подключение не подтверждает подлинность принтера.","tlsTrustMqtt":"Состояние и команды (MQTT 8883)","tlsTrustNoPin":"Не подтверждён","tlsTrustObserved":"Полученный SHA-256","tlsTrustProbe":"Прочитать и доверять","tlsTrustReplacement":"Сертификат отличается от сохранённого. Подтверждайте новый сертификат, только если ожидали изменений, например после замены или сброса принтера.","tlsTrustRequired":"Подтвердите сертификат принтера перед подключением.","tlsTrustSaveFailed":"Не удалось сохранить подтверждение сертификата.","tlsTrustSaved":"Сертификат подтверждён.","tlsTrustStale":"Настройки принтера изменились или срок подтверждения истёк. Прочитайте сертификат ещё раз.","tlsTrustTitle":"Сертификаты Bambu","tlsTrustWorking":"Чтение сертификата…","toolActive":"активный инструмент","toolDetails":"{tool} · Сейчас: {current} · Цель: {target} · {state}","toolInactive":"неактивная голова","toolViewOnly":"Только просмотр; активная голова не меняется","unassignedDelete":"Удалить","unassignedDeleteAll":"Удалить все","unassignedDeleteAllConfirm":"Удалить все файлы без привязки к принтеру ({count}, {size}) из хранилища Print Farm? Копии на принтерах не затрагиваются.","unassignedDeleteConfirm":"Удалить {name} ({size}) из хранилища Print Farm? Копии на принтерах не затрагиваются.","unassignedHeading":"Файлы без привязки к принтеру: {count} · {size}","unassignedNoPrinter":"Нет готового принтера: он должен быть в сети, свободен и принимать загрузку.","unassignedSend":"Отправить на принтер…","unassignedUpload":"Только загрузить","unassignedUploadStart":"Загрузить и начать","unassignedWhy":"Ни один принтер в панели не совпадает с профилем принтера в этом файле. Его можно один раз отправить на выбранный вами принтер; привязка не создаётся.","unavailableSuffix":"пока недоступно","unmatchedQueued":"Файлы без подходящего принтера в панели: {count}","uploadShort":"Загрузить","uploadToPrinterTitle":"Загрузить файл на этот принтер без запуска печати","uploadToPrinters":"Загрузить {name} на принтеры ({count}):","uploadUnverifiedHardware":"Загрузка недоступна: ещё не проверено на оборудовании","uploadedNotStarted":"загружен без запуска","useAms":"Использовать AMS (Bambu)","webuiAddress":"Адрес веб-интерфейса (необязательно)","webuiFallbackHelp":"Если страница продолжает загружаться, выделите и скопируйте адрес в браузер. Отдельный порт веб-интерфейса задаётся в «Подключение».","webuiHelp":"Страница не загружается?"},"sv":{"accessCode":"Åtkomstkod","add":"Lägg till","addConfiguredTitle":"Lägg till en skrivare konfigurerad i OrcaSlicer","addPrinter":"Lägg till en skrivare…","all":"alla","bambuError":"Skrivarfel {code}","bambuLayer":"lager {current}/{total}","bambuLeftHM":"{hours} h {minutes} min kvar","bambuLeftM":"{minutes} min kvar","bed":"Byggplatta","busy":"{printer}: skrivaren är upptagen ({state})","busyNotStarted":"{printer}: skrivaren är upptagen ({state}) — utskriften startades inte.","cameraButton":"Livekamera","cameraCapturedAt":"Fotograferad {time}","cameraClose":"Stäng kameran","cameraLoadFailed":"Bilden kunde inte läsas in här. Det här fönstret kan blockera bilder från det lokala nätverket.","cameraLoading":"Ansluter till kameran…","cameraMode":"Kamera","cameraModeAuto":"Konfigurerad webbkamera","cameraModeU1":"Originalkamera för Snapmaker U1","cameraNativeSession":"Kamerasession öppen","cameraNone":"Ingen kamera är konfigurerad för den här skrivaren.","cameraOpenWindow":"Öppna kameran i ett fönster","cameraPermissionDenied":"Bakgrundsarbete nekades. Tillåt det och öppna kameran igen.","cameraReceivedAt":"Mottagen {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Kameran kunde inte nås.","cancel":"Avbryt","cfgAutoDelete":"Ta bort gamla kopior automatiskt","cfgAutoDeleteAge":"Ta bort kopior äldre än","cfgAutoDeleteHint":"Av som standard. Kontrolleras vid start och en gång per dygn; bara kopior från den här insticksmodulen tas bort, aldrig filer som används.","cfgClearConfirm":"Rensa utskriftsloggen? Det går inte att ångra.","cfgClearDone":"Begärt. Utskriftsloggen rensas nästa gång panelen läser inställningarna.","cfgClearHistory":"Rensa utskriftslogg","cfgDays":"{days} dagar","cfgJournalOrca":"Logga sändningar och utskrifter från Orca i utskriftsloggen","cfgJournalOrcaHint":"Bara jobb som OrcaSlicer själv rapporterar.","cfgKeepAll":"Alla","cfgKeepCopies":"Behåll kopior av beredda filer","cfgKeepCopiesHint":"Gör att du kan skicka en beredning till en skrivare senare. När det är av kopieras inget.","cfgKeepHistory":"Behåll utskriftslogg","cfgKeepHistoryHint":"När det är av sparas inga nya poster; befintliga finns kvar.","cfgKeepLast":"Behåll bara de senaste skivorna per skrivare","cfgKeepLastHint":"När en ny skiva sparas tas äldre, ej skickade kopior för samma skrivare bort. Kopior som är kopplade till utskriftsjournalen behålls.","cfgPauseHidden":"Avfråga inte när panelen inte syns","cfgPauseHiddenHint":"Sparar nätverksanrop medan fliken eller fönstret är dolt.","cfgPollInterval":"Avfrågningsintervall för skrivare","cfgProfileHint":"Tips när insticksmodulen inte är vald i processprofilen","cfgProfileHintHint":"Visas i panelen när en beredning inte nådde den här insticksmodulen.","cfgSeconds":"{seconds} s","close":"Stäng","comingLater":"kommer senare","commandFailed":"{printer}: kommandot ”{action}” misslyckades — {error}","commandSent":"{printer}: kommandot ”{action}” skickades.","confirmTitle":"Starta utskrift på flera skrivare?","confirmUploadTitle":"Ladda upp filen till de valda skrivarna?","connectionOptions":"Anslutning","connectionOptionsFailed":"Kunde inte spara. Kontrollera adressen.","connectionOptionsHelp":"Använd samma värd och ange webbporten.","connectionSave":"Spara","connectionTypeTitle":"Anslutningstyp. Tillgängliga funktioner beror på skrivarens protokoll och aktuella tillstånd.","controlsUnverified":"Paus och stopp är inte tillgängliga för den här anslutningen (inte verifierat på hårdvaran)","crealityWsPortPlaceholder":"WS-port (9999)","crealityWsPortTitle":"Valfritt. Port för skrivarens status-WebSocket. 9999 är ett obekräftat standardvärde; ändra det om din skrivare använder en annan port.","credentialLegacyWarning":"Nycklar för {count} skrivare finns kvar i klartext. Flytta dem till systemets valv. Gamla säkerhetskopior finns kvar.","credentialMigrate":"Flytta nycklar","credentialMigrationConfirm":"Flytta nycklar till systemets valv? Gamla säkerhetskopior finns kvar.","credentialMigrationDone":"Nycklar flyttade till systemets valv.","credentialRetry":"Försök igen","credentialSaveFailed":"Nycklarna kunde inte sparas säkert. Skrivaren sparades inte.","credentialUnavailable":"Systemets valv är inte tillgängligt. Anslutningen blockerad.","dashboardOpened":"Print Farm-panelen har öppnats.","duetPasswordPlaceholder":"Duet-skrivarlösenord","errorNeedsAccessCode":"skrivarens åtkomstkod krävs","errorNeedsBambuCredentials":"skrivarens IP, åtkomstkod och serienummer krävs","errorNoAddress":"skrivaradress saknas","errorOutcomeUnknown":"skrivaren kan ha tagit emot begäran eller inte; kontrollera skrivaren innan du försöker igen","errorPrintCommand":"utskriftskommandot misslyckades: {error}","errorUnknownAction":"okänd skrivaråtgärd","errorUnknownSerial":"filen laddades upp, men skrivarens serienummer är fortfarande okänt — starta utskriften på skrivaren","errorUnsupportedBackend":"den här anslutningstypen stöds inte","errorUpload":"uppladdning misslyckades: {error}","errorUploadUnverified":"filen laddades upp, men dess storlek kunde inte verifieras på skrivaren, så utskriften startades inte","errorUploadedNotStarted":"filen laddades upp, men utskriften startades inte: {error}","feedbackButton":"Återkoppling","feedbackCopied":"Kopierat","feedbackCopy":"Kopiera","feedbackHelp":"Kopiera adressen till en webbläsare och använd webbplatsens återkopplingsknapp. Inga skrivardata skickas. “Beta Feedback”.","file3mfWarning":".3mf startar endast på Bambu-skrivare — de andra förväntar sig G-code.","fileOperationDone":"{printer}: {name} — {result}.","fileReadFailed":"Det gick inte att skicka: filen kunde inte läsas.","fileTargetMismatch":"{printer}: filen i kön matchar inte den här skrivaren; utskriften startades inte.","flashforgeCheckCodePlaceholder":"Kontrollkod (på skrivarens skärm)","flashforgeCheckCodeTitle":"Kontrollkod från skrivarens skärm. LAN-läget måste vara aktiverat på skrivaren.","flashforgeErrAuth":"Fel serienummer eller kontrollkod.","flashforgeErrCredentials":"Ange serienummer och kontrollkod.","flashforgeErrIdentity":"Skrivarmodellen kunde inte verifieras.","flashforgeErrLanMode":"Aktivera LAN-läget på skrivaren.","flashforgeErrUnsupportedModel":"Den här FlashForge-modellen stöds inte (endast Adventurer 5M, 5M Pro och AD5X).","flashforgeSerialPlaceholder":"Serienummer","flashforgeSerialTitle":"Skrivarens serienummer från skrivarens skärm (Inställningar > Om eller Nätverk). LAN-läget måste vara på.","fleetAttention":"Kräver åtgärd","fleetIdle":"Lediga","fleetPrinting":"Skriver ut","foundOnNetwork":"hittades i nätverket","genericError":"fel","history":"Utskriftshistorik","historyCoverage":"Lokal observerad utskriftshistorik. Den omfattar utskrifter som startats av Print Farm och jobb som setts medan den här panelen var öppen; arbete som utfördes medan OrcaSlicer inte var igång kan saknas.","historyDurationHoursMinutes":"{hours} h {minutes} min","historyDurationMinutes":"{minutes} min","historyEmpty":"Inga observerade utskrifter för denna skrivare ännu.","historyFromOrca":"rapporterad av OrcaSlicer","historyLoading":"Läser in utskriftshistorik…","historyObserved":"observerad av Print Farm","historyProgress":"{progress} %","historyStartedHere":"startad av Print Farm","historyStateCancelled":"avbruten","historyStateCompleted":"slutförd","historyStateEnded":"avslutad","historyStateFailed":"misslyckades","historyStatePaused":"pausad","historyStatePrinting":"skriver ut","historyStateSent":"skickad","historyTitle":"Utskriftshistorik — {printer}","historyUnknownFile":"Okänd fil","integrationUnavailable":"Skrivarintegrationen är inte tillgänglig ännu","journalActiveCount":"{count} aktiva","journalAllCount":"{count} registrerade","journalBlockedByHold":"en tidigare åtgärd för den här skrivaren är olöst; öppna utskriftsloggen och häv spärren efter att ha kontrollerat skrivaren","journalButton":"Utskriftslogg","journalCompletedCount":"{count} slutförda","journalEmptyAll":"Inga utskrifter har registrerats ännu.","journalFileDelete":"Ta bort fil","journalFileUnsent":"Beredning, ej skickad","journalHoldLocked":"Åtgärden skickas fortfarande och spärren kan inte hävas ännu.","journalHoldReleased":"Spärren har hävts. Den gamla åtgärden förblir overifierad.","journalHoldState":"Tillstånd: {state}","journalHoldUnavailable":"Information om olösta åtgärder är inte tillgänglig. Stäng och öppna utskriftsloggen igen.","journalHoldsHeading":"Olösta åtgärder — kontrollera den fysiska skrivaren, jobbet och byggplattan innan du hävar spärren.","journalNoResults":"Inga matchande utskrifter.","journalPrinter":"Skrivare","journalReleaseConfirm":"Har du kontrollerat den fysiska skrivaren, jobbet och byggplattan för ”{target}”? Häv spärren? Det låser bara upp ett nytt försök; den gamla utskriften markeras inte som lyckad och skickas inte på nytt.","journalReleaseHold":"Häv spärr","journalResend":"Skicka igen…","journalResultsCount":"{count} resultat","journalSearchLabel":"Sök i utskriftsloggen","journalSearchPlaceholder":"Sök efter fil eller skrivare…","journalSendConfirm":"Ladda upp {name} till {printer} utan att starta utskriften?","journalStoreUnavailable":"Utskriftsloggen är inte tillgänglig. Kontrollera insticksmodulens lokala lagring.","journalTitle":"Utskriftslogg","legacyImportBlocked":"Dina data finns kvar i den tidigare mappen. Denna uppsättning kan inte importeras automatiskt.","legacyImportButton":"Importera äldre data","legacyImportConfirm":"Data och lokala inloggningsuppgifter kopieras till OrcaSlicer-insticksmodulens lokala lagring. Den gamla kopian behålls. Fortsätta?","legacyImportDetail":"Äldre data hittades: {printers} skrivare, {history} historikposter, {outbox} köposter och {files} filer.","legacyImportDone":"Importen är klar.","legacyImportFailed":"Det gick inte att importera äldre data.","loading":"Läser in…","massFailed":", {count} misslyckades","massResult":"Skickat till {count} skrivare{failed}.","namePlaceholder":"Namn","networkPermissionRequired":"Tillåt åtkomst till skrivaren i OrcaSlicer. Om alternativet finns, öppna Tillägg → Print Farm → Behörigheter. Klicka sedan på ”Uppdatera” på det här skrivarkortet.","noPrinters":"Inga skrivare hittades. Konfigurera en utskriftsvärd i OrcaSlicer eller lägg till en skrivare ovan.","notReachable":"{printer}: skrivaren går inte att nå","notReachableNotStarted":"{printer}: skrivaren går inte att nå — utskriften startades inte.","nozzle":"Nozzel","octoprintApiKeyPlaceholder":"OctoPrint API-nyckel","open":"Öppna webbgränssnitt","operatorStartCheck":"Jag har kontrollerat att den beredda filen och den valda plattan passar den här skrivaren, att material och verktyg stämmer och att byggplattan är tom.","other":"Övrigt","outboxCopiesOff":"Kopior av beredningar är avstängda i insticksmodulens inställningar.","outboxFallbackName":"beredning {stamp}","outboxHintText":"Ingen Printers Outbox-insticksmodul är vald i processprofilen — kopior av beredningar sparas inte.","outboxHintWhere":"Välj den under Bearbeta → Andra → Insticksmodul för beredningspipeline.","outboxNotReady":"G-code-filen är inte klar","outboxPrinterUsage":"Skrivare: {name} · mapp: {folder} · {count} filer · {size}. Granska eller ta bort filer nedan.","outboxQueued":"{name} lades i kö för {target}","outboxRemoveFailed":"Det gick inte att ta bort den sparade filen. Den finns kvar i listan så att du kan försöka igen.","outboxStorageCleanBlocked":"Rester kan bara tas bort när ingen uppladdning eller utskrift pågår och filindexet är felfritt.","outboxStorageCleanButton":"Ta bort rester ({count} filer, {size})","outboxStorageCleanConfirm":"Ta bort {count} kvarlämnade filer ({size}) från Print Farms lagring? Filer i skrivarnas köer rörs inte.","outboxStorageCleanDone":"Tog bort {count} kvarlämnade filer ({size}).","outboxStorageCleanFailed":"Det gick inte att ta bort {count} filer: {paths}. Försök igen.","outboxStorageEmpty":"Inga köfiler eller återställningskopior hittades.","outboxStorageEntry":"{label}: {count} filer · {size} · {path}","outboxStorageKindIncoming":"Förberedda uppladdningar","outboxStorageKindIndex":"Köindex","outboxStorageKindIndexBackup":"Säkerhetskopia av köindex","outboxStorageKindLoose":"Lösa eller föräldralösa filer","outboxStorageKindRecovery":"Äldre återställningsfiler","outboxStorageKindUnassigned":"Otilldelade filer","outboxStorageManualCleanup":"Kvarlämnade filer (lösa filer, förberedda uppladdningar, återställningskopior, indexbackuper) tas bort med knappen nedan. Filer i skrivarnas köer tas bort en i taget.","outboxStorageScanFailed":"Det gick inte att genomsöka alla lagringssökvägar: {paths}. Summorna kan vara ofullständiga.","outboxStorageWarning":"Lagringen växer; ta bort köade filer som du inte längre behöver.","outboxUnassigned":"Otilldelade filer: {count} · {size}. Granska och ta bort manuellt nedan.","outboxWriteFailed":"Det gick inte att behålla G-code-filen","outboxWrongStep":"Inte efterbearbetningssteget för G-code","pause":"Paus","plateLabel":"Platta","preparedUploadDiscardFailed":"Det gick inte att ta bort den tillfälliga uppladdningskopian; kontrollera lagringen.","print":"Skriv ut…","printShort":"Skriv ut","printerBusy":"Skrivaren är upptagen","printerIpPlaceholder":"192.168.0.42 (skrivarens IP)","printerNotOnline":"Skrivaren är inte ansluten","prusalinkApiKeyPlaceholder":"PrusaLink API-nyckel","queueLess":"Visa mindre","queueMore":"Visa {count} till","refresh":"Uppdatera","remove":"Ta bort","removeRetainedTitle":"Ta bort bevarad kopia","repetierApiKeyPlaceholder":"Repetier API-nyckel","repetierLoadFailed":"Kunde inte läsa in Repetier-skrivaren. Kontrollera adress, nyckel och lista.","repetierLoadPrinters":"Läs in skrivare","repetierModeUnsupported":"Skrivning för denna version eller anslutning är inte verifierad. Endast status.","repetierNotReady":"Servern har inte bekräftat att skrivaren tar emot kommandon.","repetierRequestAccepted":"Begäran accepterad; jobbet kan vänta i serverkön. Nästa status bekräftar utskriften.","repetierSelectPrinter":"Välj skrivare","resume":"Återuppta","select":"välj","selectAllTitle":"Välj eller avmarkera alla tillgängliga skrivare","selfSigned":"självsignerad","selfSignedTitle":"Aktivera endast för en skrivare som nås via HTTPS med ett självsignerat certifikat. Skrivare med vanlig HTTP i LAN behöver inte detta.","send":"Skicka","sendFailed":"{printer}: det gick inte att skicka — {error}","sendSelected":"Skicka G-code till valda…","sendSelectedCount":"Skicka G-code till {count} valda…","sendToPrinterTitle":"Skicka till den här skrivaren och starta utskriften","sendingFile":"Skickar {name} till {count}…","sentToPrint":"skickad för utskrift","serialAuto":"Serienummer (auto)","serialTitle":"Serienumret hittas automatiskt. Ange det endast om du vill välja en viss skrivare. MQTT-port 8883 används.","startApprovalExpired":"Startgodkännandet har löpt ut eller inställningarna har ändrats; kontrollera igen.","startBedClear":"Byggplattan är tom och redo för en ny utskrift.","startBlocked":"Start blockerad för {printer}: {reason}","startCompatibilityUnknown":"Det gick inte att bekräfta att den beredda filen är kompatibel med den här skrivaren. Du kan ladda upp filen utan att starta utskriften.","startConfirmMissing":"Start avbruten: bekräfta att byggplattan är tom och, där det efterfrågas, att filen passar skrivaren.","startFileCheck":"Jag har kontrollerat att filen är beredd för just den här skrivaren.","startImmediately":"Starta utskriften direkt efter uppladdning","startPrint":"Starta utskrift","startReasonFileKind":"Den här filtypen kan inte startas på den här skrivaren.","startReasonNoStart":"Att starta utskrifter från Print Farm är ännu inte tillgängligt för den här anslutningen. Du kan ladda upp filen.","startReasonPlate":"Den valda plattan matchar inte filen.","startReasonProfileMatch":"Filen är beredd för den här skrivarens OrcaSlicer-profil.","startReasonProfileUnknown":"Print Farm kan inte avgöra utifrån filen vilken skrivare den är beredd för.","startReasonProject":"Det här är en projektfil som inte har beretts. Bered den först.","startReasonSlicedOnly":"Den här skrivaren startar bara beredda 3MF-filer, inte vanlig G-code.","startReasonUnsupported":"Den här anslutningstypen stöds inte ännu.","startReviewTitle":"Bekräfta varje utskrift","startVerdictCompatible":"Kompatibel","startVerdictIncompatible":"Inkompatibel","startVerdictUnknown":"Kontrollera manuellt","startWillStart":"Skrivare som startar: {count}","stateAborted":"avbröts","stateBusy":"upptagen","stateChecking":"kontrollerar","stateComplete":"slutförd","stateError":"fel","stateFailed":"misslyckades","stateIdle":"inaktiv","stateOffline":"frånkopplad","stateOnline":"ansluten","statePaused":"pausad","statePrinting":"skriver ut","stateStandby":"standby","stateUnavailable":"inte tillgänglig ännu","stateUnknown":"okänd","stop":"Stopp","storageBar":"Lagring: {count} filer · {size}","storageGroupTitle":"{name} · {count} filer · {size}","storageMore":"{count} till…","supportPlanned":"Stöd för {type} är planerat men inte tillgängligt ännu.","sure":"Bekräfta?","tlsCertificateChanged":"Skrivarens certifikat har ändrats. Anslutningen blockeras.","tlsPermissionRequired":"Tillåt skrivaråtkomst i OrcaSlicer och försök kontrollera certifikatet igen.","tlsProbeFailed":"Det gick inte att läsa certifikatet. Kontrollera skrivaren och försök igen.","tlsTrustBusy":"Skrivaren används. Vänta tills åtgärden är klar.","tlsTrustButton":"Certifikat…","tlsTrustConfirm":"Lita på det här certifikatet","tlsTrustCurrent":"Sparad SHA-256","tlsTrustDetails":"Detaljer","tlsTrustFtps":"Filer (FTPS 990)","tlsTrustIntro":"Bekräfta certifikat endast i ett nätverk du litar på. Den första anslutningen bevisar inte skrivarens identitet.","tlsTrustMqtt":"Status och kommandon (MQTT 8883)","tlsTrustNoPin":"Inte bekräftat","tlsTrustObserved":"Mottagen SHA-256","tlsTrustProbe":"Läs och lita på","tlsTrustReplacement":"Certifikatet skiljer sig från det sparade. Bekräfta ersättningen endast om du väntade dig ändringen, till exempel efter att skrivaren bytts ut eller återställts.","tlsTrustRequired":"Bekräfta skrivarens certifikat innan du ansluter.","tlsTrustSaveFailed":"Det gick inte att spara certifikatbekräftelsen.","tlsTrustSaved":"Certifikatet har bekräftats.","tlsTrustStale":"Skrivarinställningarna har ändrats eller bekräftelsen har löpt ut. Läs certifikatet igen.","tlsTrustTitle":"Bambu-certifikat","tlsTrustWorking":"Läser certifikat…","toolActive":"aktivt verktyg","toolDetails":"{tool} · Aktuell: {current} · Mål: {target} · {state}","toolInactive":"inaktivt verktyg","toolViewOnly":"Endast visning; ändrar inte det aktiva verktyget","unassignedDelete":"Ta bort","unassignedDeleteAll":"Ta bort alla","unassignedDeleteAllConfirm":"Ta bort alla {count} filer utan kopplad skrivare ({size}) från Print Farms lagring? Kopior på skrivarna påverkas inte.","unassignedDeleteConfirm":"Ta bort {name} ({size}) från Print Farms lagring? Kopior på skrivarna påverkas inte.","unassignedHeading":"Filer utan kopplad skrivare: {count} · {size}","unassignedNoPrinter":"Ingen skrivare är redo. Den måste vara ansluten, inaktiv och ta emot uppladdningar.","unassignedSend":"Skicka till skrivare…","unassignedUpload":"Endast uppladdning","unassignedUploadStart":"Ladda upp och starta","unassignedWhy":"Ingen skrivare i panelen matchar skrivarprofilen i den här filen. Du kan skicka den en gång till en skrivare du väljer; ingen koppling skapas.","unavailableSuffix":"inte tillgänglig ännu","unmatchedQueued":"{count} köade filer matchar ingen skrivare i panelen","uploadShort":"Ladda upp","uploadToPrinterTitle":"Ladda upp filen till den här skrivaren utan att starta utskriften","uploadToPrinters":"Ladda upp {name} till {count} skrivare:","uploadUnverifiedHardware":"Uppladdning är inte tillgänglig: inte verifierad på hårdvaran ännu","uploadedNotStarted":"uppladdad (ej startad)","useAms":"Använd AMS (Bambu)","webuiAddress":"Webbadress (valfri)","webuiFallbackHelp":"Om sidan fortsätter ladda, kopiera adressen till en webbläsare. Webbporten anges under Anslutning.","webuiHelp":"Laddas inte sidan?"},"th":{"accessCode":"รหัสเข้าถึง","add":"เพิ่ม","addConfiguredTitle":"เพิ่มเครื่องพิมพ์ที่ตั้งค่าใน OrcaSlicer","addPrinter":"เพิ่มเครื่องพิมพ์…","all":"ทั้งหมด","bambuError":"ข้อผิดพลาดเครื่องพิมพ์ {code}","bambuLayer":"เลเยอร์ {current}/{total}","bambuLeftHM":"เหลือ {hours} ชม. {minutes} นาที","bambuLeftM":"เหลือ {minutes} นาที","bed":"ฐานพิมพ์","busy":"{printer}: เครื่องพิมพ์ไม่ว่าง ({state})","busyNotStarted":"{printer}: เครื่องพิมพ์ไม่ว่าง ({state}) — ไม่ได้เริ่มพิมพ์","cameraButton":"กล้องสด","cameraCapturedAt":"ถ่าย {time}","cameraClose":"ปิดกล้อง","cameraLoadFailed":"โหลดภาพที่นี่ไม่สำเร็จ หน้าต่างนี้อาจบล็อกภาพจากเครือข่ายภายใน","cameraLoading":"กำลังเชื่อมต่อกับกล้อง…","cameraMode":"กล้อง","cameraModeAuto":"เว็บแคมที่ตั้งค่าไว้","cameraModeU1":"กล้องเดิม Snapmaker U1","cameraNativeSession":"เปิดเซสชันกล้องแล้ว","cameraNone":"เครื่องพิมพ์นี้ไม่ได้ตั้งค่ากล้องไว้","cameraOpenWindow":"เปิดกล้องในหน้าต่าง","cameraPermissionDenied":"ไม่ได้รับอนุญาตให้ทำงานเบื้องหลัง โปรดอนุญาตแล้วเปิดกล้องอีกครั้ง","cameraReceivedAt":"ได้รับ {time}","cameraTitle":"กล้อง: {printer}","cameraUnavailable":"ไม่สามารถเชื่อมต่อกับกล้องได้","cancel":"ยกเลิก","cfgAutoDelete":"ลบสำเนาเก่าอัตโนมัติ","cfgAutoDeleteAge":"ลบสำเนาที่เก่ากว่า","cfgAutoDeleteHint":"ปิดไว้เป็นค่าเริ่มต้น ตรวจสอบเมื่อเริ่มต้นและวันละครั้ง ลบเฉพาะสำเนาของปลั๊กอินนี้ ไม่ลบไฟล์ที่กำลังใช้งาน","cfgClearConfirm":"ล้างบันทึกการพิมพ์หรือไม่ ไม่สามารถย้อนกลับได้","cfgClearDone":"บันทึกคำขอแล้ว บันทึกจะถูกล้างเมื่อแดชบอร์ดอ่านการตั้งค่าครั้งถัดไป","cfgClearHistory":"ล้างบันทึกการพิมพ์","cfgDays":"{days} วัน","cfgJournalOrca":"บันทึกการส่งและการพิมพ์ที่เริ่มจาก Orca ลงในบันทึกการพิมพ์","cfgJournalOrcaHint":"เฉพาะงานที่ OrcaSlicer รายงานเอง","cfgKeepAll":"ทั้งหมด","cfgKeepCopies":"เก็บสำเนาไฟล์ที่สไลซ์แล้ว","cfgKeepCopiesHint":"ช่วยให้ส่งไฟล์สไลซ์ไปยังเครื่องพิมพ์ภายหลังได้ หากปิดจะไม่คัดลอกอะไรเลย","cfgKeepHistory":"เก็บบันทึกการพิมพ์","cfgKeepHistoryHint":"เมื่อปิด จะไม่บันทึกรายการใหม่ รายการเดิมยังอยู่","cfgKeepLast":"เก็บเฉพาะการสไลซ์ล่าสุดต่อเครื่องพิมพ์","cfgKeepLastHint":"เมื่อบันทึกการสไลซ์ใหม่ สำเนาเก่าที่ยังไม่ได้ส่งของเครื่องพิมพ์เดียวกันจะถูกลบ สำเนาที่เชื่อมกับบันทึกการพิมพ์จะยังอยู่","cfgPauseHidden":"ไม่สอบถามเครื่องพิมพ์ขณะที่แดชบอร์ดไม่แสดงอยู่","cfgPauseHiddenHint":"ลดคำขอเครือข่ายขณะที่แท็บหรือหน้าต่างถูกซ่อน","cfgPollInterval":"ช่วงเวลาสอบถามเครื่องพิมพ์","cfgProfileHint":"แจ้งเตือนเมื่อไม่ได้เลือกปลั๊กอินในโปรไฟล์กระบวนการ","cfgProfileHintHint":"แสดงในแดชบอร์ดเมื่อไฟล์สไลซ์ไม่ถึงปลั๊กอินนี้","cfgSeconds":"{seconds} วินาที","close":"ปิด","comingLater":"จะมาในภายหลัง","commandFailed":"{printer}: คำสั่ง “{action}” ล้มเหลว — {error}","commandSent":"{printer}: ส่งคำสั่ง “{action}” แล้ว","confirmTitle":"เริ่มพิมพ์บนเครื่องพิมพ์หลายเครื่อง?","confirmUploadTitle":"อัปโหลดไฟล์ไปยังเครื่องพิมพ์ที่เลือกหรือไม่","connectionOptions":"การเชื่อมต่อ","connectionOptionsFailed":"บันทึกไม่สำเร็จ ตรวจสอบที่อยู่","connectionOptionsHelp":"ใช้โฮสต์เดียวกันและระบุพอร์ตเว็บ","connectionSave":"บันทึก","connectionTypeTitle":"ประเภทการเชื่อมต่อ ฟังก์ชันที่ใช้ได้ขึ้นอยู่กับโปรโตคอลและสถานะปัจจุบันของเครื่องพิมพ์","controlsUnverified":"การหยุดชั่วคราวและการหยุดไม่พร้อมใช้งานสำหรับการเชื่อมต่อนี้ (ยังไม่ได้ตรวจสอบกับฮาร์ดแวร์จริง)","crealityWsPortPlaceholder":"พอร์ต WS (9999)","crealityWsPortTitle":"ไม่บังคับ พอร์ต WebSocket สำหรับสถานะของเครื่องพิมพ์ 9999 เป็นค่าเริ่มต้นที่ยังไม่ยืนยัน หากเครื่องพิมพ์ใช้พอร์ตอื่นให้เปลี่ยนค่านี้","credentialLegacyWarning":"คีย์ของเครื่องพิมพ์ {count} เครื่องยังเก็บเป็นข้อความธรรมดา ย้ายไปที่เก็บข้อมูลระบบ สำเนาสำรองเดิมจะยังอยู่","credentialMigrate":"ย้ายคีย์","credentialMigrationConfirm":"ย้ายคีย์ไปที่เก็บข้อมูลระบบหรือไม่ สำเนาสำรองเดิมจะยังอยู่","credentialMigrationDone":"ย้ายคีย์ไปที่เก็บข้อมูลระบบแล้ว","credentialRetry":"ลองเข้าถึงอีกครั้ง","credentialSaveFailed":"บันทึกคีย์อย่างปลอดภัยไม่ได้ ยังไม่ได้บันทึกเครื่องพิมพ์","credentialUnavailable":"เข้าถึงที่เก็บข้อมูลระบบไม่ได้ การเชื่อมต่อถูกบล็อก","dashboardOpened":"เปิดแดชบอร์ด Print Farm แล้ว","duetPasswordPlaceholder":"รหัสผ่านเครื่อง Duet","errorNeedsAccessCode":"ต้องระบุรหัสเข้าถึงเครื่องพิมพ์","errorNeedsBambuCredentials":"ต้องระบุ IP ของเครื่องพิมพ์ รหัสเข้าถึง และหมายเลขซีเรียล","errorNoAddress":"ไม่ได้ระบุที่อยู่เครื่องพิมพ์","errorOutcomeUnknown":"เครื่องพิมพ์อาจได้รับหรือไม่ได้รับคำขอ โปรดตรวจสอบเครื่องพิมพ์ก่อนลองอีกครั้ง","errorPrintCommand":"คำสั่งพิมพ์ล้มเหลว: {error}","errorUnknownAction":"ไม่รู้จักคำสั่งของเครื่องพิมพ์","errorUnknownSerial":"อัปโหลดไฟล์แล้ว แต่ยังไม่ทราบหมายเลขซีเรียลของเครื่องพิมพ์ — โปรดเริ่มพิมพ์จากเครื่องพิมพ์","errorUnsupportedBackend":"ไม่รองรับการเชื่อมต่อประเภทนี้","errorUpload":"การอัปโหลดล้มเหลว: {error}","errorUploadUnverified":"อัปโหลดไฟล์แล้ว แต่ตรวจสอบขนาดบนเครื่องพิมพ์ไม่ได้ จึงไม่ได้เริ่มพิมพ์","errorUploadedNotStarted":"อัปโหลดไฟล์แล้ว แต่ไม่ได้เริ่มพิมพ์: {error}","feedbackButton":"ข้อเสนอแนะ","feedbackCopied":"คัดลอกแล้ว","feedbackCopy":"คัดลอก","feedbackHelp":"คัดลอกที่อยู่ลงในเบราว์เซอร์แล้วใช้ปุ่มข้อเสนอแนะบนเว็บไซต์ ไม่มีการส่งข้อมูลเครื่องพิมพ์ “Beta Feedback”.","file3mfWarning":".3mf เริ่มต้นได้เฉพาะบนเครื่องพิมพ์ Bambu — เครื่องอื่นๆ ต้องการ G-code","fileOperationDone":"{printer}: {name} — {result}","fileReadFailed":"การส่งล้มเหลว: ไม่สามารถอ่านไฟล์ได้","fileTargetMismatch":"{printer}: ไฟล์ในคิวไม่ตรงกับเครื่องพิมพ์นี้ จึงไม่ได้เริ่มพิมพ์","flashforgeCheckCodePlaceholder":"รหัสตรวจสอบ (บนหน้าจอเครื่องพิมพ์)","flashforgeCheckCodeTitle":"รหัสตรวจสอบจากหน้าจอเครื่องพิมพ์ ต้องเปิดใช้โหมด LAN บนเครื่องพิมพ์","flashforgeErrAuth":"หมายเลขซีเรียลหรือรหัสตรวจสอบไม่ถูกต้อง","flashforgeErrCredentials":"กรอกหมายเลขซีเรียลและรหัสตรวจสอบ","flashforgeErrIdentity":"ไม่สามารถยืนยันรุ่นของเครื่องพิมพ์ได้","flashforgeErrLanMode":"เปิดโหมด LAN บนเครื่องพิมพ์","flashforgeErrUnsupportedModel":"ไม่รองรับ FlashForge รุ่นนี้ (รองรับเฉพาะ Adventurer 5M, 5M Pro และ AD5X)","flashforgeSerialPlaceholder":"หมายเลขซีเรียล","flashforgeSerialTitle":"หมายเลขซีเรียลของเครื่องพิมพ์จากหน้าจอเครื่อง (การตั้งค่า > เกี่ยวกับ หรือ เครือข่าย) ต้องเปิดโหมด LAN ไว้","fleetAttention":"ต้องตรวจสอบ","fleetIdle":"ว่าง","fleetPrinting":"กำลังพิมพ์","foundOnNetwork":"พบในเครือข่าย","genericError":"ข้อผิดพลาด","history":"ประวัติการพิมพ์","historyCoverage":"ประวัติการพิมพ์ที่บันทึกในเครื่องนี้ ครอบคลุมงานพิมพ์ที่เริ่มจาก Print Farm และงานที่พบขณะเปิดแดชบอร์ดนี้ งานที่ทำขณะที่ OrcaSlicer ไม่ได้ทำงานอาจไม่ปรากฏ","historyDurationHoursMinutes":"{hours} ชม. {minutes} นาที","historyDurationMinutes":"{minutes} นาที","historyEmpty":"ยังไม่มีบันทึกการพิมพ์ของเครื่องพิมพ์นี้","historyFromOrca":"รายงานโดย OrcaSlicer","historyLoading":"กำลังโหลดประวัติการพิมพ์…","historyObserved":"ตรวจพบโดย Print Farm","historyProgress":"{progress}%","historyStartedHere":"เริ่มโดย Print Farm","historyStateCancelled":"ยกเลิก","historyStateCompleted":"เสร็จสิ้น","historyStateEnded":"สิ้นสุดแล้ว","historyStateFailed":"ล้มเหลว","historyStatePaused":"หยุดชั่วคราว","historyStatePrinting":"กำลังพิมพ์","historyStateSent":"ส่งแล้ว","historyTitle":"ประวัติการพิมพ์ — {printer}","historyUnknownFile":"ไฟล์ที่ไม่รู้จัก","integrationUnavailable":"ยังไม่รองรับการผสานรวมกับเครื่องพิมพ์นี้","journalActiveCount":"กำลังทำงาน {count} รายการ","journalAllCount":"บันทึกแล้ว {count} รายการ","journalBlockedByHold":"การดำเนินการก่อนหน้าของเครื่องพิมพ์นี้ยังไม่ได้ข้อสรุป เปิดบันทึกการพิมพ์แล้วปลดล็อกหลังตรวจสอบเครื่องพิมพ์","journalButton":"บันทึกการพิมพ์","journalCompletedCount":"เสร็จสิ้น {count} รายการ","journalEmptyAll":"ยังไม่มีประวัติการพิมพ์","journalFileDelete":"ลบไฟล์","journalFileUnsent":"ไฟล์สไลซ์ ยังไม่ได้ส่ง","journalHoldLocked":"การดำเนินการนี้ยังอยู่ระหว่างการส่ง จึงยังปลดล็อกไม่ได้","journalHoldReleased":"ปลดล็อกแล้ว ผลของการดำเนินการเดิมยังไม่ได้รับการยืนยัน","journalHoldState":"สถานะ: {state}","journalHoldUnavailable":"ไม่สามารถโหลดรายละเอียดการดำเนินการที่ยังไม่ได้ข้อสรุป โปรดปิดแล้วเปิดบันทึกการพิมพ์อีกครั้ง","journalHoldsHeading":"การดำเนินการที่ยังไม่ได้ข้อสรุป — ตรวจสอบเครื่องพิมพ์จริง งาน และเพลตก่อนปลดล็อก","journalNoResults":"ไม่พบรายการพิมพ์ที่ตรงกัน","journalPrinter":"เครื่องพิมพ์","journalReleaseConfirm":"หลังตรวจสอบเครื่องพิมพ์จริง งาน และเพลตของ “{target}” แล้ว ปลดล็อกนี้หรือไม่ การปลดล็อกเพียงอนุญาตให้ลองใหม่ได้ ไม่ได้ทำเครื่องหมายว่างานพิมพ์เดิมสำเร็จ และไม่ได้ส่งซ้ำ","journalReleaseHold":"ปลดล็อก","journalResend":"ส่งอีกครั้ง…","journalResultsCount":"ผลลัพธ์ {count} รายการ","journalSearchLabel":"ค้นหาในบันทึกการพิมพ์","journalSearchPlaceholder":"ค้นหาไฟล์หรือเครื่องพิมพ์…","journalSendConfirm":"อัปโหลด {name} ไปยัง {printer} โดยไม่เริ่มพิมพ์ใช่ไหม","journalStoreUnavailable":"บันทึกการพิมพ์ไม่พร้อมใช้งาน โปรดตรวจสอบพื้นที่จัดเก็บในเครื่องของปลั๊กอิน","journalTitle":"บันทึกการพิมพ์","legacyImportBlocked":"ข้อมูลยังอยู่ในโฟลเดอร์เดิม ไม่สามารถนำเข้าข้อมูลชุดนี้โดยอัตโนมัติได้","legacyImportButton":"นำเข้าข้อมูลเดิม","legacyImportConfirm":"คัดลอกข้อมูลและข้อมูลรับรองในเครื่องไปยังพื้นที่จัดเก็บในเครื่องของปลั๊กอิน OrcaSlicer โดยเก็บสำเนาเดิมไว้ ดำเนินการต่อหรือไม่?","legacyImportDetail":"พบข้อมูลเดิม: เครื่องพิมพ์ {printers} เครื่อง ประวัติ {history} รายการ คิว {outbox} รายการ และไฟล์ {files} ไฟล์","legacyImportDone":"นำเข้าเสร็จแล้ว","legacyImportFailed":"ไม่สามารถนำเข้าข้อมูลเดิมได้","loading":"กำลังโหลด…","massFailed":", ล้มเหลว {count}","massResult":"ส่งไปยังเครื่องพิมพ์ {count} เครื่องแล้ว{failed}","namePlaceholder":"ชื่อ","networkPermissionRequired":"อนุญาตให้เข้าถึงเครื่องพิมพ์ใน OrcaSlicer หากมีตัวเลือกนี้ ให้เปิดปลั๊กอิน → Print Farm → สิทธิ์ จากนั้นคลิก “รีเฟรช” บนการ์ดเครื่องพิมพ์นี้","noPrinters":"ไม่พบเครื่องพิมพ์ ตั้งค่าโฮสต์เครื่องพิมพ์ใน OrcaSlicer หรือเพิ่มเครื่องพิมพ์ด้านบน","notReachable":"{printer}: เชื่อมต่อเครื่องพิมพ์ไม่ได้","notReachableNotStarted":"{printer}: เชื่อมต่อเครื่องพิมพ์ไม่ได้ — ไม่ได้เริ่มพิมพ์","nozzle":"หัวฉีด","octoprintApiKeyPlaceholder":"คีย์ API ของ OctoPrint","open":"เปิดเว็บ UI","operatorStartCheck":"ตรวจสอบแล้วว่าไฟล์ที่สไลซ์และเพลตที่เลือกเหมาะกับเครื่องพิมพ์นี้ วัสดุและเครื่องมือถูกต้อง และฐานพิมพ์ว่าง","other":"อื่น ๆ","outboxCopiesOff":"การคัดลอกไฟล์สไลซ์ถูกปิดในการตั้งค่าปลั๊กอิน","outboxFallbackName":"สไลซ์ {stamp}","outboxHintText":"ไม่ได้เลือกปลั๊กอิน Printers Outbox ในโปรไฟล์กระบวนการ จึงไม่มีการบันทึกสำเนาผลการสไลซ์","outboxHintWhere":"เลือกได้ที่ กระบวนการ → อื่นๆ → ปลั๊กอินไปป์ไลน์การสไลซ์","outboxNotReady":"ไฟล์ G-code ยังไม่พร้อม","outboxPrinterUsage":"เครื่องพิมพ์: {name} · โฟลเดอร์: {folder} · {count} ไฟล์ · {size} ตรวจดูหรือลบไฟล์ด้านล่าง","outboxQueued":"เพิ่ม {name} ลงคิวสำหรับ {target} แล้ว","outboxRemoveFailed":"ลบไฟล์ที่บันทึกไว้ไม่ได้ ไฟล์ยังอยู่ในรายการเพื่อให้ลองอีกครั้ง","outboxStorageCleanBlocked":"ลบไฟล์ที่เหลือได้เมื่อไม่มีการอัปโหลดหรือการพิมพ์ที่กำลังทำงานและดัชนีไฟล์อยู่ในสภาพดีเท่านั้น","outboxStorageCleanButton":"ลบไฟล์ที่เหลือ ({count} ไฟล์, {size})","outboxStorageCleanConfirm":"ลบไฟล์ที่เหลือ {count} ไฟล์ ({size}) ออกจากพื้นที่จัดเก็บของ Print Farm หรือไม่ ไฟล์ในคิวของเครื่องพิมพ์จะไม่ถูกแตะต้อง","outboxStorageCleanDone":"ลบไฟล์ที่เหลือแล้ว {count} ไฟล์ ({size})","outboxStorageCleanFailed":"ลบไม่ได้ {count} ไฟล์: {paths} กรุณาลองอีกครั้ง","outboxStorageEmpty":"ไม่พบไฟล์ในคิวหรือสำเนาสำหรับกู้คืน","outboxStorageEntry":"{label}: {count} ไฟล์ · {size} · {path}","outboxStorageKindIncoming":"ไฟล์อัปโหลดที่เตรียมไว้","outboxStorageKindIndex":"ดัชนีคิว","outboxStorageKindIndexBackup":"สำเนาดัชนีสำรอง","outboxStorageKindLoose":"ไฟล์เดี่ยวหรือไฟล์ตกค้าง","outboxStorageKindRecovery":"ไฟล์กู้คืนเดิม","outboxStorageKindUnassigned":"ไฟล์ที่ไม่ได้ผูกกับเครื่องพิมพ์","outboxStorageManualCleanup":"ไฟล์ที่เหลือ (ไฟล์เดี่ยว การอัปโหลดที่เตรียมไว้ สำเนากู้คืน สำรองดัชนี) ลบได้ด้วยปุ่มด้านล่าง ไฟล์ในคิวของเครื่องพิมพ์จะถูกลบทีละไฟล์","outboxStorageScanFailed":"ตรวจดูเส้นทางจัดเก็บบางรายการไม่ได้: {paths} ยอดรวมอาจไม่ครบถ้วน","outboxStorageWarning":"พื้นที่จัดเก็บเพิ่มขึ้น โปรดลบไฟล์ในคิวที่ไม่ต้องการอีกต่อไป","outboxUnassigned":"ไฟล์ที่ไม่ได้ผูกกับเครื่องพิมพ์: {count} · {size} ตรวจดูและลบด้วยตนเองด้านล่าง","outboxWriteFailed":"ไม่สามารถเก็บไฟล์ G-code ไว้ได้","outboxWrongStep":"ไม่ใช่ขั้นตอนหลังประมวลผล G-code","pause":"หยุดชั่วคราว","plateLabel":"เพลต","preparedUploadDiscardFailed":"ลบสำเนาไฟล์อัปโหลดชั่วคราวไม่สำเร็จ โปรดตรวจสอบพื้นที่จัดเก็บ","print":"พิมพ์…","printShort":"พิมพ์","printerBusy":"เครื่องพิมพ์ไม่ว่าง","printerIpPlaceholder":"192.168.0.42 (IP เครื่องพิมพ์)","printerNotOnline":"เครื่องพิมพ์ไม่ได้ออนไลน์","prusalinkApiKeyPlaceholder":"คีย์ API ของ PrusaLink","queueLess":"ย่อ","queueMore":"แสดงเพิ่มอีก {count}","refresh":"รีเฟรช","remove":"ลบ","removeRetainedTitle":"ลบสำเนาที่เก็บไว้","repetierApiKeyPlaceholder":"คีย์ API ของ Repetier","repetierLoadFailed":"โหลดเครื่องพิมพ์ Repetier ไม่สำเร็จ ตรวจสอบที่อยู่ คีย์ และรายการเครื่องพิมพ์","repetierLoadPrinters":"โหลดเครื่องพิมพ์","repetierModeUnsupported":"ยังไม่ยืนยันการเขียนสำหรับรุ่นเซิร์ฟเวอร์หรือการเชื่อมต่อนี้ แสดงสถานะเท่านั้น","repetierNotReady":"เซิร์ฟเวอร์ยังไม่ยืนยันว่าเครื่องพิมพ์รับคำสั่งได้","repetierRequestAccepted":"รับคำขอแล้ว งานอาจรอในคิวของเซิร์ฟเวอร์ สถานะถัดไปจะยืนยันการพิมพ์","repetierSelectPrinter":"เลือกเครื่องพิมพ์","resume":"พิมพ์ต่อ","select":"เลือก","selectAllTitle":"เลือกหรือยกเลิกการเลือกเครื่องพิมพ์ที่มีอยู่ทั้งหมด","selfSigned":"ลงนามเอง","selfSignedTitle":"เปิดใช้เฉพาะเครื่องพิมพ์ที่ให้บริการผ่าน HTTPS ด้วยใบรับรองที่ลงนามเอง เครื่องพิมพ์ HTTP ธรรมดาในเครือข่าย LAN ไม่จำเป็นต้องใช้","send":"ส่ง","sendFailed":"{printer}: การส่งล้มเหลว — {error}","sendSelected":"ส่ง G-code ไปยังเครื่องพิมพ์ที่เลือก…","sendSelectedCount":"ส่ง G-code ไปยังเครื่องพิมพ์ที่เลือก {count} เครื่อง…","sendToPrinterTitle":"ส่งไปยังเครื่องพิมพ์นี้และเริ่มพิมพ์","sendingFile":"กำลังส่ง {name} ไปยังเครื่องพิมพ์ {count} เครื่อง…","sentToPrint":"ส่งไปพิมพ์แล้ว","serialAuto":"หมายเลขซีเรียล (อัตโนมัติ)","serialTitle":"ระบบจะค้นหาหมายเลขซีเรียลโดยอัตโนมัติ กรอกเฉพาะเมื่อต้องการระบุเครื่องพิมพ์เครื่องใดเครื่องหนึ่ง ใช้พอร์ต MQTT 8883","startApprovalExpired":"การยืนยันการเริ่มพิมพ์หมดอายุหรือการตั้งค่าเปลี่ยนแปลงแล้ว โปรดตรวจสอบอีกครั้ง","startBedClear":"ฐานพิมพ์ว่างและพร้อมสำหรับงานพิมพ์ใหม่","startBlocked":"บล็อกการเริ่มพิมพ์สำหรับ {printer}: {reason}","startCompatibilityUnknown":"ไม่สามารถยืนยันได้ว่าไฟล์ที่สไลซ์เข้ากันได้กับเครื่องพิมพ์นี้ คุณสามารถอัปโหลดไฟล์โดยไม่เริ่มพิมพ์ได้","startConfirmMissing":"ยกเลิกการเริ่มพิมพ์: โปรดยืนยันว่าฐานพิมพ์ว่าง และหากมีการถาม ให้ยืนยันว่าไฟล์เหมาะกับเครื่องพิมพ์","startFileCheck":"ตรวจสอบแล้วว่าไฟล์นี้สไลซ์สำหรับเครื่องพิมพ์เครื่องนี้โดยเฉพาะ","startImmediately":"เริ่มพิมพ์ทันทีหลังจากอัปโหลด","startPrint":"เริ่มพิมพ์","startReasonFileKind":"ไม่สามารถเริ่มไฟล์ประเภทนี้บนเครื่องพิมพ์นี้ได้","startReasonNoStart":"การเริ่มพิมพ์จาก Print Farm ยังไม่พร้อมใช้งานสำหรับการเชื่อมต่อนี้ แต่คุณอัปโหลดไฟล์ได้","startReasonPlate":"เพลตที่เลือกไม่ตรงกับไฟล์นี้","startReasonProfileMatch":"ไฟล์ถูกสไลซ์ตามโปรไฟล์ OrcaSlicer ของเครื่องพิมพ์นี้","startReasonProfileUnknown":"Print Farm ไม่สามารถทราบจากไฟล์ได้ว่าสไลซ์ไว้สำหรับเครื่องพิมพ์ใด","startReasonProject":"นี่คือไฟล์โปรเจกต์ที่ยังไม่ได้สไลซ์ กรุณาสไลซ์ก่อน","startReasonSlicedOnly":"เครื่องพิมพ์นี้เริ่มพิมพ์ได้เฉพาะไฟล์ 3MF ที่สไลซ์แล้ว ไม่ใช่ G-code ล้วน","startReasonUnsupported":"ยังไม่รองรับการเชื่อมต่อประเภทนี้","startReviewTitle":"ยืนยันงานพิมพ์แต่ละงาน","startVerdictCompatible":"เข้ากันได้","startVerdictIncompatible":"เข้ากันไม่ได้","startVerdictUnknown":"ตรวจสอบด้วยตนเอง","startWillStart":"จำนวนเครื่องพิมพ์ที่จะเริ่ม: {count}","stateAborted":"ยกเลิกแล้ว","stateBusy":"ไม่ว่าง","stateChecking":"กำลังตรวจสอบ","stateComplete":"เสร็จสิ้น","stateError":"ข้อผิดพลาด","stateFailed":"ล้มเหลว","stateIdle":"ว่าง","stateOffline":"ออฟไลน์","stateOnline":"ออนไลน์","statePaused":"หยุดชั่วคราว","statePrinting":"กำลังพิมพ์","stateStandby":"สแตนด์บาย","stateUnavailable":"ยังไม่พร้อมใช้งาน","stateUnknown":"ไม่ทราบ","stop":"หยุด","storageBar":"พื้นที่จัดเก็บ: {count} ไฟล์ · {size}","storageGroupTitle":"{name} · {count} ไฟล์ · {size}","storageMore":"อีก {count}…","supportPlanned":"มีแผนรองรับ {type} แต่ยังใช้งานไม่ได้","sure":"ยืนยัน?","tlsCertificateChanged":"ใบรับรองของเครื่องพิมพ์เปลี่ยนแปลง การเชื่อมต่อถูกบล็อก","tlsPermissionRequired":"อนุญาตให้เข้าถึงเครื่องพิมพ์ใน OrcaSlicer แล้วลองตรวจสอบใบรับรองอีกครั้ง","tlsProbeFailed":"อ่านใบรับรองไม่ได้ ตรวจสอบเครื่องพิมพ์แล้วลองอีกครั้ง","tlsTrustBusy":"เครื่องพิมพ์กำลังทำงาน รอให้การดำเนินการเสร็จสิ้น","tlsTrustButton":"ใบรับรอง…","tlsTrustConfirm":"เชื่อถือใบรับรองนี้","tlsTrustCurrent":"SHA-256 ที่บันทึกไว้","tlsTrustDetails":"รายละเอียด","tlsTrustFtps":"ไฟล์ (FTPS 990)","tlsTrustIntro":"ยืนยันใบรับรองเฉพาะบนเครือข่ายที่เชื่อถือได้เท่านั้น การเชื่อมต่อครั้งแรกไม่ได้ยืนยันตัวตนของเครื่องพิมพ์","tlsTrustMqtt":"สถานะและคำสั่ง (MQTT 8883)","tlsTrustNoPin":"ยังไม่ได้ยืนยัน","tlsTrustObserved":"SHA-256 ที่ได้รับ","tlsTrustProbe":"อ่านและเชื่อถือ","tlsTrustReplacement":"ใบรับรองไม่ตรงกับรายการที่บันทึกไว้ ยืนยันใบรับรองใหม่เฉพาะเมื่อคาดว่าจะมีการเปลี่ยนแปลง เช่น หลังเปลี่ยนหรือรีเซ็ตเครื่องพิมพ์","tlsTrustRequired":"ยืนยันใบรับรองของเครื่องพิมพ์ก่อนเชื่อมต่อ","tlsTrustSaveFailed":"บันทึกการยืนยันใบรับรองไม่ได้","tlsTrustSaved":"ยืนยันใบรับรองแล้ว","tlsTrustStale":"การตั้งค่าเครื่องพิมพ์เปลี่ยนไปหรือการยืนยันหมดอายุ อ่านใบรับรองอีกครั้ง","tlsTrustTitle":"ใบรับรอง Bambu","tlsTrustWorking":"กำลังอ่านใบรับรอง…","toolActive":"เครื่องมือที่ใช้งานอยู่","toolDetails":"{tool} · ปัจจุบัน: {current} · เป้าหมาย: {target} · {state}","toolInactive":"หัวพิมพ์ที่ไม่ใช้งาน","toolViewOnly":"ดูรายละเอียดเท่านั้น ไม่เปลี่ยนหัวพิมพ์ที่ใช้งาน","unassignedDelete":"ลบ","unassignedDeleteAll":"ลบทั้งหมด","unassignedDeleteAllConfirm":"ลบไฟล์ที่ไม่ได้ผูกกับเครื่องพิมพ์ทั้ง {count} ไฟล์ ({size}) ออกจากพื้นที่จัดเก็บของ Print Farm หรือไม่ สำเนาบนเครื่องพิมพ์จะไม่ได้รับผลกระทบ","unassignedDeleteConfirm":"ลบ {name} ({size}) ออกจากพื้นที่จัดเก็บของ Print Farm หรือไม่ สำเนาบนเครื่องพิมพ์จะไม่ได้รับผลกระทบ","unassignedHeading":"ไฟล์ที่ไม่ได้ผูกกับเครื่องพิมพ์: {count} · {size}","unassignedNoPrinter":"ไม่มีเครื่องพิมพ์ที่พร้อม ต้องออนไลน์ ว่าง และรับการอัปโหลดได้","unassignedSend":"ส่งไปยังเครื่องพิมพ์…","unassignedUpload":"อัปโหลดอย่างเดียว","unassignedUploadStart":"อัปโหลดและเริ่ม","unassignedWhy":"ไม่มีเครื่องพิมพ์ในแดชบอร์ดที่ตรงกับโปรไฟล์เครื่องพิมพ์ในไฟล์นี้ คุณส่งไฟล์ได้หนึ่งครั้งไปยังเครื่องพิมพ์ที่เลือก โดยจะไม่มีการผูกไฟล์กับเครื่องพิมพ์","unavailableSuffix":"ยังไม่พร้อมใช้งาน","unmatchedQueued":"ไฟล์ในคิว {count} ไฟล์ไม่ตรงกับเครื่องพิมพ์ใดบนแดชบอร์ด","uploadShort":"อัปโหลด","uploadToPrinterTitle":"อัปโหลดไฟล์ไปยังเครื่องพิมพ์นี้โดยไม่เริ่มพิมพ์","uploadToPrinters":"อัปโหลด {name} ไปยังเครื่องพิมพ์ {count} เครื่อง:","uploadUnverifiedHardware":"ไม่สามารถอัปโหลดได้: ยังไม่ได้ตรวจสอบกับฮาร์ดแวร์จริง","uploadedNotStarted":"อัปโหลดแล้ว (ยังไม่เริ่ม)","useAms":"ใช้ AMS (Bambu)","webuiAddress":"ที่อยู่เว็บ (ไม่บังคับ)","webuiFallbackHelp":"หากหน้าโหลดไม่เสร็จ ให้คัดลอกที่อยู่ลงเบราว์เซอร์ ตั้งค่าพอร์ตเว็บใน การเชื่อมต่อ","webuiHelp":"หน้าเว็บไม่โหลด?"},"tr":{"accessCode":"Erişim kodu","add":"Ekle","addConfiguredTitle":"OrcaSlicer'de yapılandırılmış bir yazıcı ekleyin","addPrinter":"Yazıcı ekle…","all":"tümü","bambuError":"Yazıcı hatası {code}","bambuLayer":"katman {current}/{total}","bambuLeftHM":"{hours} sa {minutes} dk kaldı","bambuLeftM":"{minutes} dk kaldı","bed":"Yatak","busy":"{printer}: yazıcı meşgul ({state})","busyNotStarted":"{printer}: yazıcı meşgul ({state}) — baskı başlatılmadı.","cameraButton":"Canlı kamera","cameraCapturedAt":"Çekim {time}","cameraClose":"Kamerayı kapat","cameraLoadFailed":"Görüntü burada yüklenemedi. Bu pencere yerel ağdaki görüntüleri engelliyor olabilir.","cameraLoading":"Kameraya bağlanılıyor…","cameraMode":"Kamera","cameraModeAuto":"Yapılandırılmış kamera","cameraModeU1":"Snapmaker U1 stok kamera","cameraNativeSession":"Kamera oturumu açık","cameraNone":"Bu yazıcı için kamera yapılandırılmamış.","cameraOpenWindow":"Kamerayı pencerede aç","cameraPermissionDenied":"Arka plan izni reddedildi. İzin verip kamerayı yeniden açın.","cameraReceivedAt":"Alınma {time}","cameraTitle":"Kamera: {printer}","cameraUnavailable":"Kameraya ulaşılamadı.","cancel":"İptal","cfgAutoDelete":"Eski kopyaları otomatik sil","cfgAutoDeleteAge":"Şundan eski kopyaları sil","cfgAutoDeleteHint":"Varsayılan olarak kapalı. Başlangıçta ve günde bir kez kontrol edilir; yalnızca bu eklentinin kopyaları silinir, kullanımdaki dosyalar asla.","cfgClearConfirm":"Baskı günlüğü temizlensin mi? Bu işlem geri alınamaz.","cfgClearDone":"İstendi. Panel ayarları bir sonraki okuduğunda günlük temizlenir.","cfgClearHistory":"Baskı günlüğünü temizle","cfgDays":"{days} gün","cfgJournalOrca":"Orca'dan başlatılan gönderimleri ve baskıları günlüğe kaydet","cfgJournalOrcaHint":"Yalnızca OrcaSlicer'ın kendisinin bildirdiği işler.","cfgKeepAll":"Tümü","cfgKeepCopies":"Dilimlenmiş dosyaların kopyalarını sakla","cfgKeepCopiesHint":"Bir dilimi daha sonra yazıcıya göndermenizi sağlar. Kapalıyken hiçbir şey kopyalanmaz.","cfgKeepHistory":"Baskı günlüğünü sakla","cfgKeepHistoryHint":"Kapalıyken yeni kayıtlar tutulmaz; mevcutlar kalır.","cfgKeepLast":"Yazıcı başına yalnızca en yeni dilimleri sakla","cfgKeepLastHint":"Yeni bir dilim kaydedildiğinde aynı yazıcının gönderilmemiş eski kopyaları silinir. Baskı günlüğüne bağlı kopyalar kalır.","cfgPauseHidden":"Panel görünmezken sorgulama yapma","cfgPauseHiddenHint":"Sekme veya pencere gizliyken ağ isteklerinden tasarruf sağlar.","cfgPollInterval":"Yazıcı sorgulama aralığı","cfgProfileHint":"Eklenti işlem profilinde seçili değilse ipucu göster","cfgProfileHintHint":"Bir dilim bu eklentiye ulaşmadığında panelde gösterilir.","cfgSeconds":"{seconds} sn","close":"Kapat","comingLater":"daha sonra gelecek","commandFailed":"{printer}: “{action}” komutu başarısız oldu — {error}","commandSent":"{printer}: “{action}” komutu gönderildi.","confirmTitle":"Birden fazla yazıcıda yazdırma başlatılsın mı?","confirmUploadTitle":"Dosya seçilen yazıcılara yüklensin mi?","connectionOptions":"Bağlantı","connectionOptionsFailed":"Kaydedilemedi. Adresi denetleyin.","connectionOptionsHelp":"Aynı sunucuyu kullanıp web portunu belirtin.","connectionSave":"Kaydet","connectionTypeTitle":"Bağlantı türü. Kullanılabilir işlevler yazıcı protokolüne ve mevcut duruma bağlıdır.","controlsUnverified":"Bu bağlantı için duraklatma ve durdurma kullanılamıyor (donanımda doğrulanmadı)","crealityWsPortPlaceholder":"WS bağlantı noktası (9999)","crealityWsPortTitle":"İsteğe bağlı. Yazıcının durum WebSocket bağlantı noktası. 9999 doğrulanmamış bir varsayılandır; yazıcınız başka bir bağlantı noktası kullanıyorsa değiştirin.","credentialLegacyWarning":"{count} yazıcının anahtarları hâlâ düz metin olarak saklanıyor. Sistem kasasına taşıyın. Eski yedekler kalır.","credentialMigrate":"Anahtarları taşı","credentialMigrationConfirm":"Anahtarlar sistem kasasına taşınsın mı? Eski yedekler kalır.","credentialMigrationDone":"Anahtarlar sistem kasasına taşındı.","credentialRetry":"Erişimi yeniden dene","credentialSaveFailed":"Anahtarlar güvenli kaydedilemedi. Yazıcı kaydedilmedi.","credentialUnavailable":"Sistem kasası kullanılamıyor. Bağlantı engellendi.","dashboardOpened":"Print Farm kontrol paneli açıldı.","duetPasswordPlaceholder":"Duet makine parolası","errorNeedsAccessCode":"yazıcı erişim kodu gerekli","errorNeedsBambuCredentials":"yazıcı IP'si, erişim kodu ve seri numarası gerekli","errorNoAddress":"yazıcı adresi eksik","errorOutcomeUnknown":"yazıcı isteği almış olabilir ya da olmayabilir; yeniden denemeden önce yazıcıyı kontrol edin","errorPrintCommand":"yazdırma komutu başarısız oldu: {error}","errorUnknownAction":"bilinmeyen yazıcı eylemi","errorUnknownSerial":"yüklendi, ancak yazıcının seri numarası hâlâ bilinmiyor — baskıyı yazıcıdan başlatın","errorUnsupportedBackend":"bu bağlantı türü desteklenmiyor","errorUpload":"yükleme başarısız oldu: {error}","errorUploadUnverified":"dosya yüklendi ancak boyutu yazıcıda doğrulanamadı, bu yüzden baskı başlatılmadı","errorUploadedNotStarted":"dosya yüklendi ancak baskı başlatılmadı: {error}","feedbackButton":"Geri bildirim","feedbackCopied":"Kopyalandı","feedbackCopy":"Kopyala","feedbackHelp":"Adresi tarayıcıya kopyalayıp sitenin geri bildirim düğmesini kullanın. Yazıcı verisi gönderilmez. “Beta Feedback”.","file3mfWarning":".3mf yalnızca Bambu yazıcılarda başlar — diğerleri G-code bekler.","fileOperationDone":"{printer}: {name} — {result}.","fileReadFailed":"Gönderme başarısız oldu: dosya okunamadı.","fileTargetMismatch":"{printer}: kuyruktaki dosya bu yazıcıyla eşleşmiyor; baskı başlatılmadı.","flashforgeCheckCodePlaceholder":"Doğrulama kodu (yazıcı ekranında)","flashforgeCheckCodeTitle":"Yazıcı ekranındaki doğrulama kodu. Yazıcıda LAN modu etkin olmalıdır.","flashforgeErrAuth":"Seri numarası veya doğrulama kodu yanlış.","flashforgeErrCredentials":"Seri numarasını ve doğrulama kodunu girin.","flashforgeErrIdentity":"Yazıcı modeli doğrulanamadı.","flashforgeErrLanMode":"Yazıcıda LAN modunu açın.","flashforgeErrUnsupportedModel":"Bu FlashForge modeli desteklenmiyor (yalnızca Adventurer 5M, 5M Pro ve AD5X).","flashforgeSerialPlaceholder":"Seri numarası","flashforgeSerialTitle":"Yazıcının ekranında görünen seri numarası (Ayarlar > Hakkında veya Ağ). LAN modu açık olmalıdır.","fleetAttention":"İlgi gerekiyor","fleetIdle":"Boşta","fleetPrinting":"Yazdırıyor","foundOnNetwork":"ağda bulundu","genericError":"hata","history":"Baskı geçmişi","historyCoverage":"Yerel olarak gözlemlenen baskı geçmişi. Print Farm ile başlatılan baskıları ve bu panel açıkken görülen işleri içerir; OrcaSlicer kapalıyken yapılan işler eksik olabilir.","historyDurationHoursMinutes":"{hours} sa {minutes} dk","historyDurationMinutes":"{minutes} dk","historyEmpty":"Bu yazıcı için henüz gözlemlenen baskı yok.","historyFromOrca":"OrcaSlicer bildirdi","historyLoading":"Baskı geçmişi yükleniyor…","historyObserved":"Print Farm tarafından gözlemlendi","historyProgress":"%{progress}","historyStartedHere":"Print Farm ile başlatıldı","historyStateCancelled":"iptal edildi","historyStateCompleted":"tamamlandı","historyStateEnded":"sona erdi","historyStateFailed":"başarısız","historyStatePaused":"duraklatıldı","historyStatePrinting":"yazdırılıyor","historyStateSent":"gönderildi","historyTitle":"Baskı geçmişi — {printer}","historyUnknownFile":"Bilinmeyen dosya","integrationUnavailable":"Yazıcı entegrasyonu henüz kullanılamıyor","journalActiveCount":"Etkin: {count}","journalAllCount":"Kaydedilen: {count}","journalBlockedByHold":"bu yazıcının önceki bir işlemi çözümlenmedi; yazıcıyı kontrol ettikten sonra baskı günlüğünü açıp kilidi kaldırın","journalButton":"Baskı günlüğü","journalCompletedCount":"Tamamlanan: {count}","journalEmptyAll":"Henüz baskı kaydı yok.","journalFileDelete":"Dosyayı sil","journalFileUnsent":"Dilim, gönderilmedi","journalHoldLocked":"Bu işlem hâlâ gönderiliyor; kilit henüz kaldırılamaz.","journalHoldReleased":"Kilit kaldırıldı. Eski işlemin sonucu doğrulanmış değildir.","journalHoldState":"Durum: {state}","journalHoldUnavailable":"Çözümlenmemiş işlemlerin ayrıntıları yüklenemedi. Baskı günlüğünü kapatıp yeniden açın.","journalHoldsHeading":"Çözümlenmemiş işlemler — kilidi kaldırmadan önce fiziksel yazıcıyı, işi ve baskı plakasını kontrol edin.","journalNoResults":"Eşleşen baskı bulunamadı.","journalPrinter":"Yazıcı","journalReleaseConfirm":"“{target}” için fiziksel yazıcıyı, işi ve baskı plakasını kontrol ettikten sonra bu kilit kaldırılsın mı? Bu yalnızca yeni bir denemenin önünü açar; eski baskıyı başarılı saymaz ve yeniden göndermez.","journalReleaseHold":"Kilidi kaldır","journalResend":"Yeniden gönder…","journalResultsCount":"{count} sonuç","journalSearchLabel":"Baskı günlüğünde ara","journalSearchPlaceholder":"Dosya veya yazıcı ara…","journalSendConfirm":"{name} dosyası baskı başlatılmadan {printer} yazıcısına yüklensin mi?","journalStoreUnavailable":"Baskı günlüğü kullanılamıyor. Eklentinin yerel depolama alanını kontrol edin.","journalTitle":"Baskı günlüğü","legacyImportBlocked":"Verileriniz önceki depolama klasöründe duruyor. Bu veri kümesi otomatik olarak içe aktarılamaz.","legacyImportButton":"Eski verileri içe aktar","legacyImportConfirm":"Veriler ve yerel kimlik bilgileri OrcaSlicer eklentisinin yerel depolama alanına kopyalanacak. Eski kopya korunacak. Devam edilsin mi?","legacyImportDetail":"Eski veriler bulundu: {printers} yazıcı, {history} geçmiş kaydı, {outbox} kuyruk kaydı ve {files} dosya.","legacyImportDone":"İçe aktarma tamamlandı.","legacyImportFailed":"Eski veriler içe aktarılamadı.","loading":"Yükleniyor…","massFailed":", {count} başarısız oldu","massResult":"{count} yazıcıya gönderildi{failed}.","namePlaceholder":"İsim","networkPermissionRequired":"OrcaSlicer'da yazıcı erişimine izin ver. Varsa Eklentiler → Print Farm → İzinler bölümünü kullan. Ardından bu yazıcı kartındaki “Yenile” düğmesine tıkla.","noPrinters":"Yazıcı bulunamadı. OrcaSlicer'de bir yazıcı bağlantısı yapılandırın veya yukarıdan bir yazıcı ekleyin.","notReachable":"{printer}: yazıcıya ulaşılamıyor","notReachableNotStarted":"{printer}: yazıcıya ulaşılamıyor — baskı başlatılmadı.","nozzle":"Nozul","octoprintApiKeyPlaceholder":"OctoPrint API anahtarı","open":"Web arayüzünü aç","operatorStartCheck":"Dilimlenmiş dosyanın ve seçilen plakanın bu yazıcıya uygun olduğunu, malzeme ve araçların doğru olduğunu, yatağın boş olduğunu kontrol ettim.","other":"Diğer","outboxCopiesOff":"Dilim kopyaları eklenti ayarlarında kapalı.","outboxFallbackName":"dilim {stamp}","outboxHintText":"İşlem profilinde Printers Outbox eklentisi seçili değil; dilimleme kopyaları kaydedilmiyor.","outboxHintWhere":"İşlem → Diğer → Dilimleme Hattı Eklentisi bölümünden seçin.","outboxNotReady":"G-code dosyası hazır değil","outboxPrinterUsage":"Yazıcı: {name} · klasör: {folder} · {count} dosya · {size}. Aşağıdan inceleyin veya kaldırın.","outboxQueued":"{name}, {target} için sıraya alındı","outboxRemoveFailed":"Kaydedilen dosya kaldırılamadı. Yeniden deneyebilmeniz için listede kalır.","outboxStorageCleanBlocked":"Artıklar yalnızca yükleme veya baskı sürmüyorken ve dosya dizini sağlamken silinebilir.","outboxStorageCleanButton":"Artıkları sil ({count} dosya, {size})","outboxStorageCleanConfirm":"Print Farm depolamasından {count} artık dosya ({size}) silinsin mi? Yazıcı kuyruklarındaki dosyalara dokunulmaz.","outboxStorageCleanDone":"{count} artık dosya silindi ({size}).","outboxStorageCleanFailed":"{count} dosya silinemedi: {paths}. Yeniden deneyin.","outboxStorageEmpty":"Kuyruk dosyası veya kurtarma kopyası bulunamadı.","outboxStorageEntry":"{label}: {count} dosya · {size} · {path}","outboxStorageKindIncoming":"Hazırlanan yüklemeler","outboxStorageKindIndex":"Kuyruk dizini","outboxStorageKindIndexBackup":"Kuyruk dizini yedeği","outboxStorageKindLoose":"Başıboş veya sahipsiz dosyalar","outboxStorageKindRecovery":"Eski kurtarma dosyaları","outboxStorageKindUnassigned":"Yazıcıya bağlı olmayan dosyalar","outboxStorageManualCleanup":"Artık dosyalar (başıboş dosyalar, hazırlanmış yüklemeler, kurtarma kopyaları, dizin yedekleri) aşağıdaki düğmeyle silinebilir. Yazıcı kuyruklarındaki dosyalar tek tek kaldırılır.","outboxStorageScanFailed":"Tüm depolama yolları taranamadı: {paths}. Toplamlar eksik olabilir.","outboxStorageWarning":"Depolama büyüyor; artık ihtiyacınız olmayan kuyruk dosyalarını kaldırın.","outboxUnassigned":"Yazıcıya bağlı olmayan dosyalar: {count} · {size}. Aşağıdan inceleyip elle kaldırın.","outboxWriteFailed":"G-code dosyası saklanamadı","outboxWrongStep":"G-code son işleme adımı değil","pause":"Duraklat","plateLabel":"Plaka","preparedUploadDiscardFailed":"Geçici yükleme kopyası silinemedi; depolama alanını kontrol edin.","print":"Yazdır…","printShort":"Yazdır","printerBusy":"Yazıcı meşgul","printerIpPlaceholder":"192.168.0.42 (yazıcı IP'si)","printerNotOnline":"Yazıcı çevrimiçi değil","prusalinkApiKeyPlaceholder":"PrusaLink API anahtarı","queueLess":"Daha az göster","queueMore":"{count} tane daha göster","refresh":"Yenile","remove":"Kaldır","removeRetainedTitle":"Saklanan kopyayı kaldır","repetierApiKeyPlaceholder":"Repetier API anahtarı","repetierLoadFailed":"Repetier yazıcısı yüklenemedi. Adresi, anahtarı ve listeyi denetle.","repetierLoadPrinters":"Yazıcıları yükle","repetierModeUnsupported":"Bu sürüm veya bağlantı için yazma desteği doğrulanmadı. Yalnızca durum.","repetierNotReady":"Sunucu yazıcının komut kabul ettiğini doğrulamadı.","repetierRequestAccepted":"İstek kabul edildi; iş sunucu kuyruğunda bekleyebilir. Sonraki durum yazdırmayı doğrulayacak.","repetierSelectPrinter":"Yazıcı seç","resume":"Sürdür","select":"seç","selectAllTitle":"Mevcut tüm yazıcıları seçin veya seçimi kaldırın","selfSigned":"kendinden imzalı","selfSignedTitle":"Yalnızca kendinden imzalı sertifikalı HTTPS yazıcılar için etkinleştirin. Düz HTTP kullanan yerel ağ yazıcılarının buna ihtiyacı yoktur.","send":"Gönder","sendFailed":"{printer}: gönderme başarısız oldu — {error}","sendSelected":"Seçilenlere G-code gönder…","sendSelectedCount":"Seçilen {count} yazıcıya G-code gönder…","sendToPrinterTitle":"Bu yazıcıya gönder ve baskıyı başlat","sendingFile":"{name} dosyası {count} yazıcıya gönderiliyor…","sentToPrint":"baskıya gönderildi","serialAuto":"Seri numarası (otomatik)","serialTitle":"Seri numarası otomatik bulunur. Yalnızca belirli bir yazıcıya sabitlemek için girin. MQTT 8883 numaralı bağlantı noktası kullanılır.","startApprovalExpired":"Başlatma onayının süresi doldu veya ayarlar değişti; lütfen yeniden kontrol edin.","startBedClear":"Yatak boş ve yeni bir baskıya hazır.","startBlocked":"{printer} için başlatma engellendi: {reason}","startCompatibilityUnknown":"Dilimlenmiş dosyanın bu yazıcıyla uyumluluğu doğrulanamadı. Yazdırmayı başlatmadan dosyayı yükleyebilirsiniz.","startConfirmMissing":"Başlatma iptal edildi: yatağın boş olduğunu ve istenen yerlerde dosyanın yazıcıya uygun olduğunu onaylayın.","startFileCheck":"Bu dosyanın tam olarak bu yazıcı için dilimlendiğini kontrol ettim.","startImmediately":"Yüklemeden hemen sonra baskıyı başlat","startPrint":"Baskıyı başlat","startReasonFileKind":"Bu dosya türü bu yazıcıda başlatılamaz.","startReasonNoStart":"Print Farm'dan baskı başlatma bu bağlantı için henüz kullanılamıyor. Dosyayı yükleyebilirsiniz.","startReasonPlate":"Seçilen plaka bu dosyayla eşleşmiyor.","startReasonProfileMatch":"Dosya bu yazıcının OrcaSlicer profiline göre dilimlendi.","startReasonProfileUnknown":"Print Farm, dosyadan hangi yazıcı için dilimlendiğini belirleyemiyor.","startReasonProject":"Bu, dilimlenmemiş bir proje dosyası. Önce dilimleyin.","startReasonSlicedOnly":"Bu yazıcı yalnızca dilimlenmiş 3MF dosyalarını başlatır, düz G-code'u başlatmaz.","startReasonUnsupported":"Bu bağlantı türü henüz desteklenmiyor.","startReviewTitle":"Her baskıyı onaylayın","startVerdictCompatible":"Uyumlu","startVerdictIncompatible":"Uyumsuz","startVerdictUnknown":"Elle kontrol edin","startWillStart":"Başlayacak yazıcılar: {count}","stateAborted":"yarıda kesildi","stateBusy":"meşgul","stateChecking":"kontrol ediliyor","stateComplete":"tamamlandı","stateError":"hata","stateFailed":"başarısız","stateIdle":"boşta","stateOffline":"çevrimdışı","stateOnline":"çevrimiçi","statePaused":"duraklatıldı","statePrinting":"yazdırılıyor","stateStandby":"bekleme","stateUnavailable":"henüz kullanılamıyor","stateUnknown":"bilinmiyor","stop":"Durdur","storageBar":"Depolama: {count} dosya · {size}","storageGroupTitle":"{name} · {count} dosya · {size}","storageMore":"{count} tane daha…","supportPlanned":"{type} desteği planlandı ancak henüz kullanılamıyor.","sure":"Onayla?","tlsCertificateChanged":"Yazıcı sertifikası değişti. Bağlantı engellendi.","tlsPermissionRequired":"OrcaSlicer’da yazıcı erişimine izin verin, ardından sertifika kontrolünü yeniden deneyin.","tlsProbeFailed":"Sertifika okunamadı. Yazıcıyı kontrol edip yeniden deneyin.","tlsTrustBusy":"Yazıcı kullanımda. İşlemin bitmesini bekleyin.","tlsTrustButton":"Sertifikalar…","tlsTrustConfirm":"Bu sertifikaya güven","tlsTrustCurrent":"Kaydedilen SHA-256","tlsTrustDetails":"Ayrıntılar","tlsTrustFtps":"Dosyalar (FTPS 990)","tlsTrustIntro":"Sertifikaları yalnızca güvendiğiniz bir ağda onaylayın. İlk bağlantı yazıcının kimliğini kanıtlamaz.","tlsTrustMqtt":"Durum ve komutlar (MQTT 8883)","tlsTrustNoPin":"Onaylanmadı","tlsTrustObserved":"Alınan SHA-256","tlsTrustProbe":"Oku ve güven","tlsTrustReplacement":"Sertifika kaydedilenden farklı. Yeni sertifikayı yalnızca yazıcıyı değiştirme veya sıfırlama gibi bu değişikliği beklediyseniz onaylayın.","tlsTrustRequired":"Bağlanmadan önce yazıcı sertifikasını onaylayın.","tlsTrustSaveFailed":"Sertifika onayı kaydedilemedi.","tlsTrustSaved":"Sertifika onaylandı.","tlsTrustStale":"Yazıcı ayarları değişti veya onayın süresi doldu. Sertifikayı tekrar okuyun.","tlsTrustTitle":"Bambu sertifikaları","tlsTrustWorking":"Sertifika okunuyor…","toolActive":"etkin araç","toolDetails":"{tool} · Geçerli: {current} · Hedef: {target} · {state}","toolInactive":"etkin olmayan araç","toolViewOnly":"Yalnızca görüntüleme; etkin aracı değiştirmez","unassignedDelete":"Sil","unassignedDeleteAll":"Tümünü sil","unassignedDeleteAllConfirm":"Yazıcıya bağlı olmayan {count} dosyanın tümü ({size}) Print Farm depolamasından silinsin mi? Yazıcılardaki kopyalar etkilenmez.","unassignedDeleteConfirm":"{name} ({size}) Print Farm depolamasından silinsin mi? Yazıcılardaki kopyalar etkilenmez.","unassignedHeading":"Yazıcıya bağlı olmayan dosyalar: {count} · {size}","unassignedNoPrinter":"Hazır yazıcı yok. Çevrimiçi ve boşta olmalı ve yüklemeleri kabul etmelidir.","unassignedSend":"Yazıcıya gönder…","unassignedUpload":"Yalnızca yükle","unassignedUploadStart":"Yükle ve başlat","unassignedWhy":"Paneldeki hiçbir yazıcı bu dosyadaki yazıcı profiliyle eşleşmiyor. Dosyayı seçtiğiniz bir yazıcıya bir kez gönderebilirsiniz; hiçbir bağlantı oluşturulmaz.","unavailableSuffix":"henüz kullanılamıyor","unmatchedQueued":"{count} sıraya alınmış dosya, kontrol panelindeki yazıcıyla eşleşmiyor","uploadShort":"Yükle","uploadToPrinterTitle":"Yazdırmayı başlatmadan dosyayı bu yazıcıya yükle","uploadToPrinters":"{name} dosyasını {count} yazıcıya yükle:","uploadUnverifiedHardware":"Yükleme kullanılamıyor: henüz donanımda doğrulanmadı","uploadedNotStarted":"yüklendi (başlatılmadı)","useAms":"AMS (Bambu) kullan","webuiAddress":"Web arayüzü adresi (isteğe bağlı)","webuiFallbackHelp":"Sayfa yüklenmeye devam ederse adresi tarayıcıya kopyalayın. Web portu Bağlantı bölümünde ayarlanır.","webuiHelp":"Sayfa yüklenmiyor mu?"},"uk":{"accessCode":"Код доступу","add":"Додати","addConfiguredTitle":"Додати принтер, налаштований у OrcaSlicer","addPrinter":"Додати принтер…","all":"усі","bambuError":"Помилка принтера {code}","bambuLayer":"шар {current}/{total}","bambuLeftHM":"Залишилось {hours} год {minutes} хв","bambuLeftM":"Залишилось {minutes} хв","bed":"Стіл","busy":"{printer}: принтер зайнятий ({state})","busyNotStarted":"{printer}: принтер зайнятий ({state}), друк не розпочато.","cameraButton":"Камера наживо","cameraCapturedAt":"Знято {time}","cameraClose":"Закрити камеру","cameraLoadFailed":"Зображення тут не завантажилося. Це вікно може блокувати картинки з локальної мережі.","cameraLoading":"Підключення до камери…","cameraMode":"Камера","cameraModeAuto":"Камера з налаштувань принтера","cameraModeU1":"Штатна камера Snapmaker U1","cameraNativeSession":"Сеанс камери відкрито","cameraNone":"На цьому принтері не налаштовано камеру.","cameraOpenWindow":"Відкрити камеру у вікні","cameraPermissionDenied":"Немає дозволу на фонову роботу. Надайте його та знову відкрийте камеру.","cameraReceivedAt":"Отримано {time}","cameraTitle":"Камера: {printer}","cameraUnavailable":"Камера недоступна.","cancel":"Скасувати","cfgAutoDelete":"Автоматично видаляти старі копії","cfgAutoDeleteAge":"Видаляти копії старші за","cfgAutoDeleteHint":"Типово вимкнено. Перевірка під час запуску й раз на добу; видаляються лише копії цього плагіна, файли в роботі не чіпаються.","cfgClearConfirm":"Очистити журнал друку? Дію не можна скасувати.","cfgClearDone":"Запит збережено. Журнал очиститься, коли панель наступного разу прочитає налаштування.","cfgClearHistory":"Очистити журнал друку","cfgDays":"{days} дн.","cfgJournalOrca":"Записувати надсилання та друк з Orca в журнал","cfgJournalOrcaHint":"Лише завдання, про які повідомляє сам OrcaSlicer.","cfgKeepAll":"Усі","cfgKeepCopies":"Зберігати копії нарізок","cfgKeepCopiesHint":"Дозволяє надіслати нарізку на принтер пізніше. Якщо вимкнено, копії не створюються.","cfgKeepHistory":"Зберігати журнал друку","cfgKeepHistoryHint":"Якщо вимкнено, нові записи не створюються; наявні залишаються.","cfgKeepLast":"Зберігати лише останні нарізки на принтер","cfgKeepLastHint":"Під час збереження нової нарізки старі невідправлені копії того самого принтера видаляються. Копії, пов’язані з журналом друку, залишаються.","cfgPauseHidden":"Не опитувати, поки панель не видно","cfgPauseHiddenHint":"Заощаджує мережеві запити, поки вкладка або вікно приховані.","cfgPollInterval":"Інтервал опитування принтерів","cfgProfileHint":"Підказка про невибраний плагін у профілі процесу","cfgProfileHintHint":"Показується в панелі, якщо нарізка не дійшла до цього плагіна.","cfgSeconds":"{seconds} с","close":"Закрити","comingLater":"буде пізніше","commandFailed":"{printer}: команда «{action}» не виконана — {error}","commandSent":"{printer}: команду «{action}» надіслано.","confirmTitle":"Запустити друк на кількох принтерах?","confirmUploadTitle":"Завантажити файл на вибрані принтери?","connectionOptions":"Підключення","connectionOptionsFailed":"Не вдалося зберегти. Перевірте адресу.","connectionOptionsHelp":"Використовуйте той самий хост і явно вкажіть порт.","connectionSave":"Зберегти","connectionTypeTitle":"Тип підключення. Доступні дії залежать від протоколу та стану принтера.","controlsUnverified":"Пауза й зупинка недоступні для цього підключення (не перевірено на обладнанні)","crealityWsPortPlaceholder":"Порт WS (9999)","crealityWsPortTitle":"Необовʼязково. Порт WebSocket статусу принтера. 9999 — непідтверджене типове значення; змініть, якщо ваш принтер використовує інший порт.","credentialLegacyWarning":"Ключі {count} принтерів ще збережено відкритим текстом. Перенеси їх до системного сховища. Старі резервні копії залишаться.","credentialMigrate":"Перенести ключі","credentialMigrationConfirm":"Перенести ключі до системного сховища? Старі резервні копії залишаться.","credentialMigrationDone":"Ключі перенесено до системного сховища.","credentialRetry":"Повторити доступ","credentialSaveFailed":"Не вдалося безпечно зберегти ключі. Принтер не збережено.","credentialUnavailable":"Системне сховище недоступне. Підключення заблоковано.","dashboardOpened":"Панель Print Farm відкрито.","duetPasswordPlaceholder":"Пароль принтера Duet","errorNeedsAccessCode":"потрібен код доступу до принтера","errorNeedsBambuCredentials":"потрібні IP принтера, код доступу та серійний номер","errorNoAddress":"відсутня адреса принтера","errorOutcomeUnknown":"принтер міг отримати запит, а міг і не отримати; перевірте принтер, перш ніж повторювати","errorPrintCommand":"не вдалося запустити друк: {error}","errorUnknownAction":"невідома команда принтера","errorUnknownSerial":"файл завантажено, але серійний номер принтера невідомий — запустіть друк на самому принтері","errorUnsupportedBackend":"цей тип підключення не підтримується","errorUpload":"не вдалося завантажити: {error}","errorUploadUnverified":"файл завантажено, але його розмір не вдалося перевірити на принтері, тому друк не запущено","errorUploadedNotStarted":"файл завантажено, але друк не запущено: {error}","feedbackButton":"Зворотний зв’язок","feedbackCopied":"Скопійовано","feedbackCopy":"Копіювати","feedbackHelp":"Скопіюйте адресу в браузер і натисніть кнопку зворотного зв’язку на сайті. Дані принтерів не надсилаються. “Beta Feedback”.","file3mfWarning":".3mf запускається лише на принтерах Bambu — інші очікують G-code.","fileOperationDone":"{printer}: {name} — {result}.","fileReadFailed":"Не вдалося надіслати: файл не читається.","fileTargetMismatch":"{printer}: файл у черзі не відповідає цьому принтеру; друк не розпочато.","flashforgeCheckCodePlaceholder":"Код перевірки (на екрані принтера)","flashforgeCheckCodeTitle":"Код перевірки з екрана принтера. На принтері має бути ввімкнено LAN-режим.","flashforgeErrAuth":"Неправильний серійний номер або код перевірки.","flashforgeErrCredentials":"Введіть серійний номер і код перевірки.","flashforgeErrIdentity":"Не вдалося підтвердити модель принтера.","flashforgeErrLanMode":"Увімкніть LAN-режим на принтері.","flashforgeErrUnsupportedModel":"Ця модель FlashForge не підтримується (лише Adventurer 5M, 5M Pro та AD5X).","flashforgeSerialPlaceholder":"Серійний номер","flashforgeSerialTitle":"Серійний номер принтера з його екрана (Налаштування > Про принтер або Мережа). Має бути ввімкнено LAN-режим.","fleetAttention":"Потребують уваги","fleetIdle":"Вільні","fleetPrinting":"Друкують","foundOnNetwork":"знайдено в мережі","genericError":"помилка","history":"Історія друку","historyCoverage":"Локальна зафіксована історія. Вона містить друки, запущені через Print Farm, і завдання, помічені, поки ця панель була відкрита; роботи, виконані, коли OrcaSlicer не був запущений, можуть бути відсутні.","historyDurationHoursMinutes":"{hours} год {minutes} хв","historyDurationMinutes":"{minutes} хв","historyEmpty":"Для цього принтера ще немає записів про друк.","historyFromOrca":"повідомлено OrcaSlicer","historyLoading":"Завантаження історії друку…","historyObserved":"виявлено Print Farm","historyProgress":"{progress}%","historyStartedHere":"запущено через Print Farm","historyStateCancelled":"скасовано","historyStateCompleted":"завершено","historyStateEnded":"зупинено","historyStateFailed":"збій","historyStatePaused":"на паузі","historyStatePrinting":"друк","historyStateSent":"надіслано","historyTitle":"Історія друку — {printer}","historyUnknownFile":"Невідомий файл","integrationUnavailable":"Інтеграція принтера ще недоступна","journalActiveCount":"Активних: {count}","journalAllCount":"Записів: {count}","journalBlockedByHold":"попередня операція для цього принтера не завершена; відкрийте журнал друку й зніміть блокування після перевірки принтера","journalButton":"Журнал друку","journalCompletedCount":"Завершено: {count}","journalEmptyAll":"Записів про друк поки немає.","journalFileDelete":"Видалити файл","journalFileUnsent":"Нарізка, не надіслана","journalHoldLocked":"Операція ще надсилається; зняти блокування поки не можна.","journalHoldReleased":"Блокування знято. Результат попередньої операції лишається непідтвердженим.","journalHoldState":"Стан: {state}","journalHoldUnavailable":"Не вдалося завантажити незавершені операції. Закрийте й знову відкрийте журнал друку.","journalHoldsHeading":"Операції без підтвердженого результату. Перед зняттям блокування перевірте принтер, завдання та пластину.","journalNoResults":"Збігів не знайдено.","journalPrinter":"Принтер","journalReleaseConfirm":"Принтер, завдання та пластину для «{target}» перевірено. Зняти блокування? Це лише дозволить нову спробу: попередній друк не вважається успішним, повторної відправки не буде.","journalReleaseHold":"Зняти блокування","journalResend":"Надіслати знову…","journalResultsCount":"Результатів: {count}","journalSearchLabel":"Пошук у журналі друку","journalSearchPlaceholder":"Пошук за файлом або принтером…","journalSendConfirm":"Завантажити {name} на {printer} без запуску друку?","journalStoreUnavailable":"Журнал друку недоступний. Перевірте локальне сховище плагіна.","journalTitle":"Журнал друку","legacyImportBlocked":"Дані збережені в попередньому сховищі. Автоматичне перенесення цього набору недоступне.","legacyImportButton":"Імпортувати старі дані","legacyImportConfirm":"Дані й локальні облікові дані буде скопійовано до локального сховища плагіна OrcaSlicer. Стару копію буде збережено. Продовжити?","legacyImportDetail":"Знайдено старі дані: принтерів — {printers}, записів історії — {history}, записів черги — {outbox}, файлів — {files}.","legacyImportDone":"Імпорт завершено.","legacyImportFailed":"Не вдалося імпортувати старі дані.","loading":"Завантаження…","massFailed":", помилок: {count}","massResult":"Надіслано на принтери: {count}{failed}.","namePlaceholder":"Назва","networkPermissionRequired":"Дозволь доступ до принтера в OrcaSlicer. Якщо вкладка доступна, відкрий Плагіни → Print Farm → Дозволи. Потім натисни «Оновити» на картці цього принтера.","noPrinters":"Принтери не знайдено. Налаштуйте хост друку в OrcaSlicer або додайте принтер вище.","notReachable":"{printer}: принтер недоступний","notReachableNotStarted":"{printer}: принтер недоступний, друк не розпочато.","nozzle":"Сопло","octoprintApiKeyPlaceholder":"API-ключ OctoPrint","open":"Веб-інтерфейс","operatorStartCheck":"Перевірено: нарізка й вибрана пластина підходять цьому принтеру, матеріали та інструменти правильні, стіл вільний.","other":"Інше","outboxCopiesOff":"Копії нарізок вимкнено в налаштуваннях плагіна.","outboxFallbackName":"нарізка {stamp}","outboxHintText":"У профілі процесу не вибрано плагін Printers Outbox — копії нарізок не зберігаються.","outboxHintWhere":"Виберіть його в розділі Процес → Інші → Плагін конвеєра нарізки.","outboxNotReady":"Файл G-code ще не готовий","outboxPrinterUsage":"Принтер: {name} · папка: {folder} · файлів: {count} · {size}. Переглядайте та видаляйте файли нижче.","outboxQueued":"Файл {name} поставлено в чергу для {target}","outboxRemoveFailed":"Не вдалося видалити збережений файл. Він залишився у списку, тож спробуйте ще раз.","outboxStorageCleanBlocked":"Залишки можна видалити, лише поки не триває завантаження чи друк і індекс файлів справний.","outboxStorageCleanButton":"Видалити залишки ({count} шт., {size})","outboxStorageCleanConfirm":"Видалити залишкові файли ({count} шт., {size}) зі сховища Print Farm? Файли в чергах принтерів не зачіпаються.","outboxStorageCleanDone":"Видалено залишкових файлів: {count} ({size}).","outboxStorageCleanFailed":"Не вдалося видалити файли ({count}): {paths}. Повторіть спробу.","outboxStorageEmpty":"Файлів черги та копій відновлення не знайдено.","outboxStorageEntry":"{label}: файлів — {count} · {size} · {path}","outboxStorageKindIncoming":"Підготовлені завантаження","outboxStorageKindIndex":"Індекс черги","outboxStorageKindIndexBackup":"Резервна копія індексу черги","outboxStorageKindLoose":"Окремі або осиротілі файли","outboxStorageKindRecovery":"Старі файли відновлення","outboxStorageKindUnassigned":"Непривʼязані файли","outboxStorageManualCleanup":"Залишкові файли (окремі файли, підготовлені завантаження, копії відновлення, резервні копії індексу) видаляються кнопкою нижче. Файли в чергах принтерів видаляються по одному.","outboxStorageScanFailed":"Не вдалося перевірити всі шляхи сховища: {paths}. Підсумки можуть бути неповними.","outboxStorageWarning":"Сховище зростає; видаліть із черг непотрібні файли.","outboxUnassigned":"Непривʼязані файли: {count} · {size}. Перегляньте та видаліть вручну нижче.","outboxWriteFailed":"Не вдалося зберегти файл G-code","outboxWrongStep":"Це не крок постобробки G-code","pause":"Пауза","plateLabel":"Пластина","preparedUploadDiscardFailed":"Не вдалося видалити тимчасову копію завантаження; перевірте сховище.","print":"Друк…","printShort":"Друк","printerBusy":"Принтер зайнятий","printerIpPlaceholder":"192.168.0.42 (IP принтера)","printerNotOnline":"Принтер не в мережі","prusalinkApiKeyPlaceholder":"API-ключ PrusaLink","queueLess":"Згорнути","queueMore":"Показати ще {count}","refresh":"Оновити","remove":"Вилучити","removeRetainedTitle":"Видалити збережену копію","repetierApiKeyPlaceholder":"API-ключ Repetier","repetierLoadFailed":"Не вдалося завантажити принтер Repetier. Перевір адресу, ключ і список.","repetierLoadPrinters":"Завантажити принтери","repetierModeUnsupported":"Запис для цієї версії сервера або підключення не перевірено. Лише статус.","repetierNotReady":"Сервер не підтвердив готовність принтера приймати команди.","repetierRequestAccepted":"Запит прийнято; завдання може чекати в черзі сервера. Друк підтвердить наступний статус.","repetierSelectPrinter":"Вибери принтер","resume":"Продовжити","select":"вибрати","selectAllTitle":"Вибрати або зняти виділення з усіх доступних принтерів","selfSigned":"самопідписаний","selfSignedTitle":"Увімкніть лише для принтера з HTTPS і самопідписаним сертифікатом. Принтерам із простим HTTP у локальній мережі це не потрібно.","send":"Надіслати","sendFailed":"{printer}: не вдалося надіслати — {error}","sendSelected":"Надіслати G-code на вибрані…","sendSelectedCount":"Надіслати G-code на вибрані: {count}…","sendToPrinterTitle":"Надіслати на цей принтер і почати друк","sendingFile":"Надсилання {name} на принтери: {count}…","sentToPrint":"надіслано на друк","serialAuto":"Серійний номер (авто)","serialTitle":"Серійний номер визначається автоматично. Введіть його лише для привʼязки конкретного принтера. Використовується порт MQTT 8883.","startApprovalExpired":"Підтвердження запуску застаріло або параметри змінилися; перевірте ще раз.","startBedClear":"Стіл вільний і готовий до нового друку.","startBlocked":"Запуск заблоковано для {printer}: {reason}","startCompatibilityUnknown":"Не вдалося підтвердити сумісність нарізки з цим принтером. Файл можна завантажити без запуску друку.","startConfirmMissing":"Запуск скасовано: підтвердьте, що стіл вільний і, де це потрібно, що файл підходить принтеру.","startFileCheck":"Перевірено: файл нарізано саме під цей принтер.","startImmediately":"Почати друк одразу після завантаження","startPrint":"Почати друк","startReasonFileKind":"Файл такого типу не можна запустити на цьому принтері.","startReasonNoStart":"Запуск друку з Print Farm для цього підключення поки недоступний. Файл можна завантажити.","startReasonPlate":"Вибрана пластина не відповідає цьому файлу.","startReasonProfileMatch":"Файл нарізано під профіль OrcaSlicer цього принтера.","startReasonProfileUnknown":"Print Farm не може визначити за файлом, під який принтер його нарізано.","startReasonProject":"Це ненарізаний файл проєкту. Спершу наріжте його.","startReasonSlicedOnly":"Цей принтер запускає лише нарізані 3MF, а не звичайний G-code.","startReasonUnsupported":"Цей тип підключення поки не підтримується.","startReviewTitle":"Підтвердьте кожен друк","startVerdictCompatible":"Сумісно","startVerdictIncompatible":"Несумісно","startVerdictUnknown":"Перевірте вручну","startWillStart":"Принтерів до запуску: {count}","stateAborted":"перервано","stateBusy":"зайнятий","stateChecking":"перевірка","stateComplete":"завершено","stateError":"помилка","stateFailed":"збій","stateIdle":"вільний","stateOffline":"не в мережі","stateOnline":"в мережі","statePaused":"на паузі","statePrinting":"друк","stateStandby":"очікування","stateUnavailable":"поки недоступно","stateUnknown":"невідомо","stop":"Стоп","storageBar":"Сховище: файлів — {count} · {size}","storageGroupTitle":"{name} · файлів — {count} · {size}","storageMore":"Ще {count}…","supportPlanned":"Підтримка {type} запланована, але поки недоступна.","sure":"Підтвердити?","tlsCertificateChanged":"Сертифікат принтера змінився. Підключення заблоковано.","tlsPermissionRequired":"Дозволь доступ до принтера у вікні OrcaSlicer і повтори перевірку сертифіката.","tlsProbeFailed":"Не вдалося прочитати сертифікат. Перевірте принтер і спробуйте ще раз.","tlsTrustBusy":"Принтер використовується. Дочекайтеся завершення операції.","tlsTrustButton":"Сертифікати…","tlsTrustConfirm":"Довіряти цьому сертифікату","tlsTrustCurrent":"Збережений SHA-256","tlsTrustDetails":"Докладніше","tlsTrustFtps":"Файли (FTPS 990)","tlsTrustIntro":"Підтверджуйте сертифікати лише в мережі, якій довіряєте. Перше з’єднання не підтверджує справжність принтера.","tlsTrustMqtt":"Стан і команди (MQTT 8883)","tlsTrustNoPin":"Не підтверджено","tlsTrustObserved":"Отриманий SHA-256","tlsTrustProbe":"Прочитати й довіряти","tlsTrustReplacement":"Сертифікат відрізняється від збереженого. Підтверджуйте новий сертифікат, лише якщо очікували змін, наприклад після заміни або скидання принтера.","tlsTrustRequired":"Підтвердьте сертифікат принтера перед підключенням.","tlsTrustSaveFailed":"Не вдалося зберегти підтвердження сертифіката.","tlsTrustSaved":"Сертифікат підтверджено.","tlsTrustStale":"Налаштування принтера змінилися або строк підтвердження минув. Прочитайте сертифікат ще раз.","tlsTrustTitle":"Сертифікати Bambu","tlsTrustWorking":"Читання сертифіката…","toolActive":"активний інструмент","toolDetails":"{tool} · Зараз: {current} · Ціль: {target} · {state}","toolInactive":"неактивна голова","toolViewOnly":"Лише перегляд; активна голова не змінюється","unassignedDelete":"Видалити","unassignedDeleteAll":"Видалити всі","unassignedDeleteAllConfirm":"Видалити всі файли без привʼязки до принтера ({count}, {size}) зі сховища Print Farm? Копії на принтерах не зачіпаються.","unassignedDeleteConfirm":"Видалити {name} ({size}) зі сховища Print Farm? Копії на принтерах не зачіпаються.","unassignedHeading":"Файли без привʼязки до принтера: {count} · {size}","unassignedNoPrinter":"Немає готового принтера: він має бути в мережі, вільний і приймати завантаження.","unassignedSend":"Надіслати на принтер…","unassignedUpload":"Лише завантажити","unassignedUploadStart":"Завантажити й почати","unassignedWhy":"Жоден принтер на панелі не збігається з профілем принтера в цьому файлі. Його можна один раз надіслати на обраний вами принтер; привʼязка не створюється.","unavailableSuffix":"поки недоступно","unmatchedQueued":"Файлів у черзі без відповідного принтера на панелі: {count}","uploadShort":"Завантажити","uploadToPrinterTitle":"Завантажити файл на цей принтер без запуску друку","uploadToPrinters":"Завантажити {name} на принтери ({count}):","uploadUnverifiedHardware":"Завантаження недоступне: ще не перевірено на обладнанні","uploadedNotStarted":"завантажено без запуску","useAms":"Використовувати AMS (Bambu)","webuiAddress":"Адреса вебінтерфейсу (необов’язково)","webuiFallbackHelp":"Якщо сторінка не завантажується, скопіюйте адресу в браузер. Окремий порт задається в налаштуваннях підключення.","webuiHelp":"Сторінка не завантажується?"},"vi":{"accessCode":"Mã truy cập","add":"Thêm","addConfiguredTitle":"Thêm máy in đã cấu hình trong OrcaSlicer","addPrinter":"Thêm máy in…","all":"tất cả","bambuError":"Lỗi máy in {code}","bambuLayer":"lớp {current}/{total}","bambuLeftHM":"Còn {hours} giờ {minutes} phút","bambuLeftM":"Còn {minutes} phút","bed":"Bàn in","busy":"{printer}: máy in đang bận ({state})","busyNotStarted":"{printer}: máy in đang bận ({state}) — chưa bắt đầu in.","cameraButton":"Camera trực tiếp","cameraCapturedAt":"Chụp {time}","cameraClose":"Đóng camera","cameraLoadFailed":"Hình ảnh không tải được ở đây. Cửa sổ này có thể chặn hình ảnh từ mạng cục bộ.","cameraLoading":"Đang kết nối với camera…","cameraMode":"Máy ảnh","cameraModeAuto":"Webcam đã cấu hình","cameraModeU1":"Máy ảnh gốc Snapmaker U1","cameraNativeSession":"Phiên máy ảnh đang mở","cameraNone":"Máy in này chưa được cấu hình camera.","cameraOpenWindow":"Mở camera trong cửa sổ","cameraPermissionDenied":"Quyền chạy nền bị từ chối. Cho phép rồi mở lại máy ảnh.","cameraReceivedAt":"Nhận {time}","cameraTitle":"Camera: {printer}","cameraUnavailable":"Không thể kết nối với camera.","cancel":"Hủy","cfgAutoDelete":"Tự động xóa bản sao cũ","cfgAutoDeleteAge":"Xóa bản sao cũ hơn","cfgAutoDeleteHint":"Mặc định tắt. Kiểm tra khi khởi động và mỗi ngày một lần; chỉ xóa bản sao của plugin này, không bao giờ xóa file đang dùng.","cfgClearConfirm":"Xóa nhật ký in? Không thể hoàn tác.","cfgClearDone":"Đã yêu cầu. Nhật ký sẽ được xóa vào lần tới bảng đọc cài đặt.","cfgClearHistory":"Xóa nhật ký in","cfgDays":"{days} ngày","cfgJournalOrca":"Ghi các lần gửi và in từ Orca vào nhật ký","cfgJournalOrcaHint":"Chỉ các tác vụ do chính OrcaSlicer báo cáo.","cfgKeepAll":"Tất cả","cfgKeepCopies":"Giữ bản sao các file đã slice","cfgKeepCopiesHint":"Cho phép gửi bản slice tới máy in sau. Khi tắt, không sao chép gì cả.","cfgKeepHistory":"Lưu nhật ký in","cfgKeepHistoryHint":"Khi tắt, không ghi mục mới; các mục hiện có vẫn giữ nguyên.","cfgKeepLast":"Chỉ giữ các bản cắt lớp mới nhất cho mỗi máy in","cfgKeepLastHint":"Khi lưu bản cắt lớp mới, các bản sao cũ chưa gửi của cùng máy in sẽ bị xóa. Các bản sao liên kết với nhật ký in được giữ lại.","cfgPauseHidden":"Không truy vấn khi bảng không hiển thị","cfgPauseHiddenHint":"Tiết kiệm yêu cầu mạng khi tab hoặc cửa sổ bị ẩn.","cfgPollInterval":"Chu kỳ truy vấn máy in","cfgProfileHint":"Gợi ý khi plugin chưa được chọn trong hồ sơ Process","cfgProfileHintHint":"Hiển thị trên bảng khi một bản slice không tới plugin này.","cfgSeconds":"{seconds} giây","close":"Đóng","comingLater":"sẽ có sau","commandFailed":"{printer}: lệnh “{action}” thất bại — {error}","commandSent":"{printer}: đã gửi lệnh “{action}”.","confirmTitle":"Bắt đầu in trên nhiều máy in?","confirmUploadTitle":"Tải file lên các máy in đã chọn?","connectionOptions":"Kết nối","connectionOptionsFailed":"Không thể lưu. Kiểm tra địa chỉ.","connectionOptionsHelp":"Dùng cùng máy chủ và ghi rõ cổng web.","connectionSave":"Lưu","connectionTypeTitle":"Loại kết nối. Các chức năng khả dụng phụ thuộc vào giao thức và trạng thái hiện tại của máy in.","controlsUnverified":"Tạm dừng và dừng không khả dụng cho kết nối này (chưa xác minh trên phần cứng)","crealityWsPortPlaceholder":"Cổng WS (9999)","crealityWsPortTitle":"Tùy chọn. Cổng WebSocket trạng thái của máy in. 9999 là mặc định chưa được xác nhận; hãy đổi nếu máy in dùng cổng khác.","credentialLegacyWarning":"Khóa của {count} máy in vẫn ở dạng văn bản thuần. Chuyển sang kho hệ thống. Bản sao lưu cũ vẫn được giữ.","credentialMigrate":"Chuyển khóa","credentialMigrationConfirm":"Chuyển khóa sang kho hệ thống? Bản sao lưu cũ vẫn được giữ.","credentialMigrationDone":"Đã chuyển khóa sang kho hệ thống.","credentialRetry":"Thử truy cập lại","credentialSaveFailed":"Không thể lưu khóa an toàn. Chưa lưu máy in.","credentialUnavailable":"Không thể truy cập kho hệ thống. Kết nối bị chặn.","dashboardOpened":"Bảng điều khiển Print Farm đã mở.","duetPasswordPlaceholder":"Mật khẩu máy Duet","errorNeedsAccessCode":"cần mã truy cập máy in","errorNeedsBambuCredentials":"yêu cầu địa chỉ IP máy in, mã truy cập và số sê-ri","errorNoAddress":"địa chỉ máy in bị thiếu","errorOutcomeUnknown":"máy in có thể đã nhận hoặc chưa nhận yêu cầu; hãy kiểm tra máy in trước khi thử lại","errorPrintCommand":"lệnh in thất bại: {error}","errorUnknownAction":"hành động máy in không xác định","errorUnknownSerial":"đã tải lên, nhưng vẫn chưa biết số sê-ri của máy in — hãy bắt đầu in từ máy in","errorUnsupportedBackend":"loại kết nối này không được hỗ trợ","errorUpload":"tải lên thất bại: {error}","errorUploadUnverified":"file đã được tải lên nhưng không xác minh được kích thước trên máy in nên chưa bắt đầu in","errorUploadedNotStarted":"file đã được tải lên nhưng chưa bắt đầu in: {error}","feedbackButton":"Phản hồi","feedbackCopied":"Đã sao chép","feedbackCopy":"Sao chép","feedbackHelp":"Sao chép địa chỉ vào trình duyệt rồi dùng nút phản hồi của trang. Không gửi dữ liệu máy in. “Beta Feedback”.","file3mfWarning":".3mf chỉ chạy được trên máy in Bambu — các máy khác cần G-code.","fileOperationDone":"{printer}: {name} — {result}.","fileReadFailed":"Gửi thất bại: không thể đọc file.","fileTargetMismatch":"{printer}: file trong hàng đợi không khớp với máy in này; chưa bắt đầu in.","flashforgeCheckCodePlaceholder":"Mã kiểm tra (trên màn hình máy in)","flashforgeCheckCodeTitle":"Mã kiểm tra trên màn hình máy in. Phải bật chế độ LAN trên máy in.","flashforgeErrAuth":"Số sê-ri hoặc mã kiểm tra không đúng.","flashforgeErrCredentials":"Nhập số sê-ri và mã kiểm tra.","flashforgeErrIdentity":"Không thể xác minh mẫu máy in.","flashforgeErrLanMode":"Hãy bật chế độ LAN trên máy in.","flashforgeErrUnsupportedModel":"Mẫu FlashForge này không được hỗ trợ (chỉ Adventurer 5M, 5M Pro và AD5X).","flashforgeSerialPlaceholder":"Số sê-ri","flashforgeSerialTitle":"Số sê-ri của máy in hiển thị trên màn hình máy in (Cài đặt > Giới thiệu hoặc Mạng). Phải bật chế độ LAN.","fleetAttention":"Cần chú ý","fleetIdle":"Đang rảnh","fleetPrinting":"Đang in","foundOnNetwork":"tìm thấy trên mạng","genericError":"lỗi","history":"Lịch sử in","historyCoverage":"Lịch sử in được ghi nhận cục bộ. Bao gồm các lần in do Print Farm bắt đầu và các công việc thấy được khi bảng điều khiển này đang mở; công việc diễn ra khi OrcaSlicer không chạy có thể bị thiếu.","historyDurationHoursMinutes":"{hours} giờ {minutes} phút","historyDurationMinutes":"{minutes} phút","historyEmpty":"Chưa ghi nhận lần in nào cho máy in này.","historyFromOrca":"do OrcaSlicer báo cáo","historyLoading":"Đang tải lịch sử in…","historyObserved":"do Print Farm ghi nhận","historyProgress":"{progress}%","historyStartedHere":"do Print Farm bắt đầu","historyStateCancelled":"đã hủy","historyStateCompleted":"hoàn tất","historyStateEnded":"đã kết thúc","historyStateFailed":"thất bại","historyStatePaused":"tạm dừng","historyStatePrinting":"đang in","historyStateSent":"đã gửi","historyTitle":"Lịch sử in — {printer}","historyUnknownFile":"File không xác định","integrationUnavailable":"Tích hợp máy in chưa khả dụng","journalActiveCount":"Đang hoạt động {count}","journalAllCount":"Đã ghi {count}","journalBlockedByHold":"một thao tác trước đó của máy in này chưa được giải quyết; hãy mở nhật ký in và gỡ khóa sau khi kiểm tra máy in","journalButton":"Nhật ký in","journalCompletedCount":"Đã hoàn tất {count}","journalEmptyAll":"Chưa có bản in nào được ghi lại.","journalFileDelete":"Xóa file","journalFileUnsent":"Bản slice, chưa gửi","journalHoldLocked":"Thao tác này vẫn đang được gửi nên chưa thể gỡ khóa.","journalHoldReleased":"Đã gỡ khóa. Kết quả của thao tác cũ vẫn chưa được xác minh.","journalHoldState":"Trạng thái: {state}","journalHoldUnavailable":"Không tải được chi tiết các thao tác chưa giải quyết. Hãy đóng và mở lại nhật ký in.","journalHoldsHeading":"Các thao tác chưa giải quyết — hãy kiểm tra máy in thực tế, công việc và plate trước khi gỡ khóa.","journalNoResults":"Không tìm thấy bản in phù hợp.","journalPrinter":"Máy in","journalReleaseConfirm":"Sau khi kiểm tra máy in thực tế, công việc và plate cho “{target}”, gỡ khóa này? Việc này chỉ mở khóa cho lần thử mới; không đánh dấu lần in cũ là thành công và không gửi lại.","journalReleaseHold":"Gỡ khóa","journalResend":"Gửi lại…","journalResultsCount":"{count} kết quả","journalSearchLabel":"Tìm trong nhật ký in","journalSearchPlaceholder":"Tìm file hoặc máy in…","journalSendConfirm":"Tải {name} lên {printer} mà không bắt đầu in?","journalStoreUnavailable":"Nhật ký in không khả dụng. Hãy kiểm tra bộ nhớ cục bộ của plugin.","journalTitle":"Nhật ký in","legacyImportBlocked":"Dữ liệu vẫn ở thư mục lưu trữ trước đó. Không thể nhập tự động bộ dữ liệu này.","legacyImportButton":"Nhập dữ liệu cũ","legacyImportConfirm":"Dữ liệu và thông tin xác thực cục bộ sẽ được sao chép vào bộ nhớ cục bộ của plugin OrcaSlicer. Bản cũ sẽ được giữ lại. Tiếp tục?","legacyImportDetail":"Tìm thấy dữ liệu cũ: {printers} máy in, {history} mục lịch sử, {outbox} mục hàng đợi và {files} file.","legacyImportDone":"Đã nhập xong.","legacyImportFailed":"Không thể nhập dữ liệu cũ.","loading":"Đang tải…","massFailed":", {count} lỗi","massResult":"Đã gửi đến {count} máy in{failed}.","namePlaceholder":"Tên","networkPermissionRequired":"Cho phép truy cập máy in trong OrcaSlicer. Nếu có mục này, hãy mở Plugin → Print Farm → Quyền. Sau đó, hãy nhấp vào “Làm mới” trên thẻ máy in này.","noPrinters":"Không tìm thấy máy in. Hãy cấu hình máy chủ in trong OrcaSlicer hoặc thêm máy in ở phía trên.","notReachable":"{printer}: máy in không thể truy cập được","notReachableNotStarted":"{printer}: không thể truy cập máy in — chưa bắt đầu in.","nozzle":"Đầu phun","octoprintApiKeyPlaceholder":"Khóa API OctoPrint","open":"Mở giao diện web","operatorStartCheck":"Tôi đã kiểm tra file đã slice và plate được chọn phù hợp với máy in này, vật liệu và công cụ đều đúng, và bàn in đang trống.","other":"Khác","outboxCopiesOff":"Bản sao các bản slice đang bị tắt trong cài đặt plugin.","outboxFallbackName":"slice {stamp}","outboxHintText":"Hồ sơ Process chưa chọn plugin Printers Outbox nên bản sao các lần slice không được lưu.","outboxHintWhere":"Hãy chọn trong Process → Khác → Plugin quy trình slice.","outboxNotReady":"File G-code chưa sẵn sàng","outboxPrinterUsage":"Máy in: {name} · thư mục: {folder} · {count} file · {size}. Xem hoặc xóa file bên dưới.","outboxQueued":"Đã đưa {name} vào hàng đợi cho {target}","outboxRemoveFailed":"Không thể xóa file đã lưu. File vẫn trong danh sách để bạn thử lại.","outboxStorageCleanBlocked":"Chỉ có thể xóa file còn sót khi không có tác vụ tải lên hoặc in nào đang chạy và chỉ mục file ở trạng thái tốt.","outboxStorageCleanButton":"Xóa file còn sót ({count} file, {size})","outboxStorageCleanConfirm":"Xóa {count} file còn sót ({size}) khỏi bộ nhớ Print Farm? Các file trong hàng đợi của máy in không bị ảnh hưởng.","outboxStorageCleanDone":"Đã xóa {count} file còn sót ({size}).","outboxStorageCleanFailed":"Không thể xóa {count} file: {paths}. Hãy thử lại.","outboxStorageEmpty":"Không tìm thấy file hàng đợi hoặc bản sao khôi phục.","outboxStorageEntry":"{label}: {count} file · {size} · {path}","outboxStorageKindIncoming":"File tải lên đã chuẩn bị","outboxStorageKindIndex":"Chỉ mục hàng đợi","outboxStorageKindIndexBackup":"Bản sao lưu chỉ mục hàng đợi","outboxStorageKindLoose":"File rời hoặc mồ côi","outboxStorageKindRecovery":"File khôi phục cũ","outboxStorageKindUnassigned":"File chưa liên kết với máy in","outboxStorageManualCleanup":"File còn sót (file rời, bản tải lên đã chuẩn bị, bản sao khôi phục, bản sao lưu chỉ mục) có thể xóa bằng nút bên dưới. File trong hàng đợi của máy in được xóa từng file một.","outboxStorageScanFailed":"Không thể quét mọi đường dẫn lưu trữ: {paths}. Tổng dung lượng có thể chưa đầy đủ.","outboxStorageWarning":"Dung lượng lưu trữ đang tăng; hãy xóa các file trong hàng đợi mà bạn không còn cần.","outboxUnassigned":"File chưa liên kết với máy in: {count} · {size}. Xem và xóa thủ công bên dưới.","outboxWriteFailed":"Không thể lưu giữ file G-code","outboxWrongStep":"Không phải bước hậu xử lý G-code","pause":"Tạm dừng","plateLabel":"Plate","preparedUploadDiscardFailed":"Không thể xóa bản sao tải lên tạm thời; hãy kiểm tra bộ nhớ.","print":"In…","printShort":"In","printerBusy":"Máy in đang bận","printerIpPlaceholder":"192.168.0.42 (IP máy in)","printerNotOnline":"Máy in không trực tuyến","prusalinkApiKeyPlaceholder":"Khóa API PrusaLink","queueLess":"Thu gọn","queueMore":"Hiển thị thêm {count}","refresh":"Làm mới","remove":"Xóa","removeRetainedTitle":"Xóa bản sao giữ lại","repetierApiKeyPlaceholder":"Khóa API Repetier","repetierLoadFailed":"Không thể tải máy in Repetier. Kiểm tra địa chỉ, khóa và danh sách.","repetierLoadPrinters":"Tải máy in","repetierModeUnsupported":"Chưa xác minh ghi cho phiên bản hoặc kết nối này. Chỉ hiển thị trạng thái.","repetierNotReady":"Máy chủ chưa xác nhận máy in có thể nhận lệnh.","repetierRequestAccepted":"Yêu cầu đã được chấp nhận; tác vụ có thể chờ trong hàng đợi máy chủ. Trạng thái tiếp theo sẽ xác nhận việc in.","repetierSelectPrinter":"Chọn máy in","resume":"Tiếp tục","select":"chọn","selectAllTitle":"Chọn hoặc bỏ chọn tất cả máy in có sẵn","selfSigned":"tự ký","selfSignedTitle":"Chỉ bật cho máy in dùng HTTPS với chứng chỉ tự ký. Máy in HTTP thường trong mạng LAN không cần mục này.","send":"Gửi","sendFailed":"{printer}: gửi thất bại — {error}","sendSelected":"Gửi G-code đến máy in đã chọn…","sendSelectedCount":"Gửi G-code đến {count} máy in đã chọn…","sendToPrinterTitle":"Gửi đến máy in này và bắt đầu in","sendingFile":"Đang gửi {name} đến {count} máy in…","sentToPrint":"đã gửi để in","serialAuto":"Số sê-ri (tự động)","serialTitle":"Số sê-ri được phát hiện tự động. Chỉ nhập khi muốn ghim một máy in cụ thể. Cổng MQTT 8883 được sử dụng.","startApprovalExpired":"Xác nhận bắt đầu đã hết hạn hoặc các thông số đã thay đổi; hãy kiểm tra lại.","startBedClear":"Bàn in đã trống và sẵn sàng cho lần in mới.","startBlocked":"Đã chặn việc bắt đầu cho {printer}: {reason}","startCompatibilityUnknown":"Không thể xác nhận file đã slice có tương thích với máy in này hay không. Bạn có thể tải file lên mà không bắt đầu in.","startConfirmMissing":"Đã hủy việc bắt đầu in: hãy xác nhận bàn in đã trống và, khi được hỏi, file phù hợp với máy in.","startFileCheck":"Tôi đã kiểm tra file này được slice đúng cho máy in này.","startImmediately":"Bắt đầu in ngay sau khi tải lên","startPrint":"Bắt đầu in","startReasonFileKind":"Không thể bắt đầu loại file này trên máy in này.","startReasonNoStart":"Chưa thể bắt đầu in từ Print Farm với kết nối này. Bạn có thể tải file lên.","startReasonPlate":"Plate đã chọn không khớp với file này.","startReasonProfileMatch":"File được slice theo hồ sơ OrcaSlicer của máy in này.","startReasonProfileUnknown":"Print Farm không thể xác định từ file này nó được slice cho máy in nào.","startReasonProject":"Đây là file dự án chưa slice. Hãy slice trước.","startReasonSlicedOnly":"Máy in này chỉ bắt đầu in file 3MF đã slice, không phải G-code thuần.","startReasonUnsupported":"Loại kết nối này chưa được hỗ trợ.","startReviewTitle":"Xác nhận từng lần in","startVerdictCompatible":"Tương thích","startVerdictIncompatible":"Không tương thích","startVerdictUnknown":"Kiểm tra thủ công","startWillStart":"Số máy in sẽ bắt đầu: {count}","stateAborted":"đã hủy bỏ","stateBusy":"bận","stateChecking":"đang kiểm tra","stateComplete":"hoàn tất","stateError":"lỗi","stateFailed":"thất bại","stateIdle":"rảnh","stateOffline":"ngoại tuyến","stateOnline":"trực tuyến","statePaused":"tạm dừng","statePrinting":"đang in","stateStandby":"chờ","stateUnavailable":"chưa khả dụng","stateUnknown":"không rõ","stop":"Dừng","storageBar":"Bộ nhớ: {count} file · {size}","storageGroupTitle":"{name} · {count} file · {size}","storageMore":"Thêm {count}…","supportPlanned":"Hỗ trợ {type} đã được lên kế hoạch nhưng chưa khả dụng.","sure":"Xác nhận?","tlsCertificateChanged":"Chứng chỉ máy in đã thay đổi. Kết nối bị chặn.","tlsPermissionRequired":"Cho phép truy cập máy in trong OrcaSlicer, rồi thử kiểm tra chứng chỉ lại.","tlsProbeFailed":"Không thể đọc chứng chỉ. Hãy kiểm tra máy in rồi thử lại.","tlsTrustBusy":"Máy in đang được sử dụng. Hãy đợi thao tác hoàn tất.","tlsTrustButton":"Chứng chỉ…","tlsTrustConfirm":"Tin cậy chứng chỉ này","tlsTrustCurrent":"SHA-256 đã lưu","tlsTrustDetails":"Chi tiết","tlsTrustFtps":"Tệp (FTPS 990)","tlsTrustIntro":"Chỉ xác nhận chứng chỉ trên mạng bạn tin cậy. Kết nối lần đầu không chứng minh danh tính máy in.","tlsTrustMqtt":"Trạng thái và lệnh (MQTT 8883)","tlsTrustNoPin":"Chưa xác nhận","tlsTrustObserved":"SHA-256 nhận được","tlsTrustProbe":"Đọc và tin cậy","tlsTrustReplacement":"Chứng chỉ khác với bản đã lưu. Chỉ xác nhận chứng chỉ thay thế nếu bạn dự kiến thay đổi này, chẳng hạn sau khi thay hoặc đặt lại máy in.","tlsTrustRequired":"Xác nhận chứng chỉ máy in trước khi kết nối.","tlsTrustSaveFailed":"Không thể lưu xác nhận chứng chỉ.","tlsTrustSaved":"Đã xác nhận chứng chỉ.","tlsTrustStale":"Cài đặt máy in đã thay đổi hoặc xác nhận đã hết hạn. Hãy đọc lại chứng chỉ.","tlsTrustTitle":"Chứng chỉ Bambu","tlsTrustWorking":"Đang đọc chứng chỉ…","toolActive":"công cụ đang dùng","toolDetails":"{tool} · Hiện tại: {current} · Mục tiêu: {target} · {state}","toolInactive":"đầu in không hoạt động","toolViewOnly":"Chỉ xem chi tiết; không thay đổi đầu in đang hoạt động","unassignedDelete":"Xóa","unassignedDeleteAll":"Xóa tất cả","unassignedDeleteAllConfirm":"Xóa tất cả {count} file chưa liên kết với máy in ({size}) khỏi bộ nhớ Print Farm? Các bản sao trên máy in không bị ảnh hưởng.","unassignedDeleteConfirm":"Xóa {name} ({size}) khỏi bộ nhớ Print Farm? Các bản sao trên máy in không bị ảnh hưởng.","unassignedHeading":"File chưa liên kết với máy in: {count} · {size}","unassignedNoPrinter":"Không có máy in sẵn sàng. Máy phải trực tuyến, rảnh và nhận tải lên.","unassignedSend":"Gửi đến máy in…","unassignedUpload":"Chỉ tải lên","unassignedUploadStart":"Tải lên và bắt đầu","unassignedWhy":"Không có máy in nào trong bảng khớp với hồ sơ máy in trong file này. Bạn có thể gửi file một lần đến máy in đã chọn; không có liên kết nào được tạo.","unavailableSuffix":"chưa khả dụng","unmatchedQueued":"{count} file trong hàng đợi không khớp máy in nào trên bảng điều khiển","uploadShort":"Tải lên","uploadToPrinterTitle":"Tải file lên máy in này mà không bắt đầu in","uploadToPrinters":"Tải {name} lên {count} máy in:","uploadUnverifiedHardware":"Không thể tải lên: chưa được xác minh trên phần cứng","uploadedNotStarted":"đã tải lên (chưa bắt đầu)","useAms":"Dùng AMS (Bambu)","webuiAddress":"Địa chỉ web (tùy chọn)","webuiFallbackHelp":"Nếu trang cứ tải, hãy sao chép địa chỉ vào trình duyệt. Cổng web được đặt trong Kết nối.","webuiHelp":"Trang không tải?"},"zh_CN":{"accessCode":"访问码","add":"添加","addConfiguredTitle":"添加 OrcaSlicer 中配置的打印机","addPrinter":"添加打印机…","all":"全部","bambuError":"打印机错误 {code}","bambuLayer":"层 {current}/{total}","bambuLeftHM":"剩余 {hours} 小时 {minutes} 分钟","bambuLeftM":"剩余 {minutes} 分钟","bed":"热床","busy":"{printer}：打印机正忙（{state}）","busyNotStarted":"{printer}：打印机正忙（{state}），未开始打印。","cameraButton":"实时摄像机","cameraCapturedAt":"拍摄于 {time}","cameraClose":"关闭摄像机","cameraLoadFailed":"此处无法加载画面。该窗口可能会拦截来自局域网的图片。","cameraLoading":"正在连接摄像机…","cameraMode":"摄像头","cameraModeAuto":"已配置的摄像头","cameraModeU1":"Snapmaker U1 原装摄像头","cameraNativeSession":"摄像头会话已开启","cameraNone":"此打印机未设置摄像机。","cameraOpenWindow":"在窗口中打开摄像机","cameraPermissionDenied":"后台运行权限被拒绝。允许后重新打开摄像头。","cameraReceivedAt":"接收于 {time}","cameraTitle":"摄像机：{printer}","cameraUnavailable":"无法连接到摄像机。","cancel":"取消","cfgAutoDelete":"自动删除旧副本","cfgAutoDeleteAge":"删除早于以下时间的副本","cfgAutoDeleteHint":"默认关闭。启动时及每天检查一次；只删除此插件保存的副本，不会删除正在使用的文件。","cfgClearConfirm":"清除打印日志？此操作无法撤销。","cfgClearDone":"已提交请求。面板下次读取设置时将清除日志。","cfgClearHistory":"清除打印日志","cfgDays":"{days} 天","cfgJournalOrca":"将从 Orca 发起的发送和打印记入日志","cfgJournalOrcaHint":"仅限 OrcaSlicer 自己报告的任务。","cfgKeepAll":"全部","cfgKeepCopies":"保留切片文件的副本","cfgKeepCopiesHint":"之后可将切片发送到打印机。关闭时不复制任何内容。","cfgKeepHistory":"保存打印日志","cfgKeepHistoryHint":"关闭后不再记录新条目，已有条目保留。","cfgKeepLast":"每台打印机仅保留最新的切片","cfgKeepLastHint":"保存新切片时，将删除同一台打印机较旧的未发送副本。与打印日志关联的副本会保留。","cfgPauseHidden":"面板不可见时不轮询","cfgPauseHiddenHint":"标签页或窗口隐藏时节省网络请求。","cfgPollInterval":"打印机轮询间隔","cfgProfileHint":"插件未在工艺预设中选中时给出提示","cfgProfileHintHint":"当切片未经过此插件时在面板中显示。","cfgSeconds":"{seconds} 秒","close":"关闭","comingLater":"即将支持","commandFailed":"{printer}：“{action}”命令失败 — {error}","commandSent":"{printer}：已发送“{action}”命令。","confirmTitle":"在多台打印机上开始打印？","confirmUploadTitle":"要将文件上传到所选打印机吗？","connectionOptions":"连接","connectionOptionsFailed":"无法保存，请检查地址。","connectionOptionsHelp":"使用相同主机并明确填写网页端口。","connectionSave":"保存","connectionTypeTitle":"连接类型。可用操作取决于打印机协议和当前状态。","controlsUnverified":"此连接不支持暂停和停止（尚未在真实设备上验证）","crealityWsPortPlaceholder":"WS 端口（9999）","crealityWsPortTitle":"可选。打印机状态 WebSocket 的端口。9999 是未经确认的默认值；如果打印机使用其他端口，请修改。","credentialLegacyWarning":"{count} 台打印机的旧密钥仍以明文保存。请移至系统凭据存储。旧备份不会删除。","credentialMigrate":"转移密钥","credentialMigrationConfirm":"将密钥移至系统凭据存储？旧备份会保留。","credentialMigrationDone":"密钥已移至系统凭据存储。","credentialRetry":"重试访问","credentialSaveFailed":"无法安全保存密钥，打印机未保存。","credentialUnavailable":"系统凭据存储不可用，已阻止打印机连接。","dashboardOpened":"Print Farm 面板已打开。","duetPasswordPlaceholder":"Duet 设备密码","errorNeedsAccessCode":"需要打印机访问码","errorNeedsBambuCredentials":"需要打印机 IP、访问码和序列号","errorNoAddress":"缺少打印机地址","errorOutcomeUnknown":"打印机可能收到了请求，也可能没有；请先检查打印机再重试","errorPrintCommand":"打印命令失败：{error}","errorUnknownAction":"未知的打印机操作","errorUnknownSerial":"文件已上传，但打印机序列号仍未知，请从打印机端启动","errorUnsupportedBackend":"不支持此打印机后端","errorUpload":"上传失败：{error}","errorUploadUnverified":"文件已上传，但无法在打印机上验证其大小，因此未开始打印","errorUploadedNotStarted":"文件已上传，但未开始打印：{error}","feedbackButton":"反馈","feedbackCopied":"已复制","feedbackCopy":"复制","feedbackHelp":"将地址复制到浏览器，然后点击网站的“Beta反馈”按钮。不会发送打印机数据。","file3mfWarning":".3mf 只能在 Bambu 打印机上启动，其他打印机需要 G-code。","fileOperationDone":"{printer}：{name} — {result}。","fileReadFailed":"发送失败：无法读取文件。","fileTargetMismatch":"{printer}：队列中的文件与此打印机不匹配，未开始打印。","flashforgeCheckCodePlaceholder":"校验码（见打印机屏幕）","flashforgeCheckCodeTitle":"打印机屏幕上显示的校验码。打印机上必须开启局域网模式。","flashforgeErrAuth":"序列号或校验码错误。","flashforgeErrCredentials":"请输入序列号和校验码。","flashforgeErrIdentity":"无法验证打印机型号。","flashforgeErrLanMode":"请在打印机上开启局域网模式。","flashforgeErrUnsupportedModel":"不支持此 FlashForge 型号（仅支持 Adventurer 5M、5M Pro 和 AD5X）。","flashforgeSerialPlaceholder":"序列号","flashforgeSerialTitle":"打印机屏幕上显示的序列号（设置 > 关于 或 网络）。必须开启局域网模式。","fleetAttention":"需要关注","fleetIdle":"空闲","fleetPrinting":"打印中","foundOnNetwork":"在网络中发现","genericError":"错误","history":"打印历史","historyCoverage":"本地记录的打印历史。包含由 Print Farm 启动的打印，以及此面板打开期间发现的任务；OrcaSlicer 未运行期间的任务可能缺失。","historyDurationHoursMinutes":"{hours} 小时 {minutes} 分钟","historyDurationMinutes":"{minutes} 分钟","historyEmpty":"此打印机暂无打印记录。","historyFromOrca":"由 OrcaSlicer 报告","historyLoading":"正在加载打印历史…","historyObserved":"由 Print Farm 发现","historyProgress":"{progress}%","historyStartedHere":"由 Print Farm 启动","historyStateCancelled":"已取消","historyStateCompleted":"已完成","historyStateEnded":"已结束","historyStateFailed":"失败","historyStatePaused":"已暂停","historyStatePrinting":"打印中","historyStateSent":"已发送","historyTitle":"打印历史 — {printer}","historyUnknownFile":"未知文件","integrationUnavailable":"此打印机集成暂不可用","journalActiveCount":"进行中 {count} 项","journalAllCount":"已记录 {count} 项","journalBlockedByHold":"此打印机之前的操作尚未处理；请检查打印机后，打开打印日志并解除锁定","journalButton":"打印日志","journalCompletedCount":"已完成 {count} 项","journalEmptyAll":"暂无打印记录。","journalFileDelete":"删除文件","journalFileUnsent":"已切片，未发送","journalHoldLocked":"操作仍在发送，暂时无法解除锁定。","journalHoldReleased":"锁定已解除。旧操作的结果仍未确认。","journalHoldState":"状态：{state}","journalHoldUnavailable":"无法读取未解决的操作。请关闭后重新打开打印日志。","journalHoldsHeading":"结果未确认的操作。解除锁定前，请检查实体打印机、任务和打印板。","journalNoResults":"没有匹配的打印记录。","journalPrinter":"打印机","journalReleaseConfirm":"你已检查“{target}”对应的实体打印机、任务和打印板。要解除此锁定吗？这只允许之后重新尝试；不会将旧打印标记为成功，也不会重试。","journalReleaseHold":"解除锁定","journalResend":"再次发送…","journalResultsCount":"{count} 条结果","journalSearchLabel":"搜索打印日志","journalSearchPlaceholder":"搜索文件或打印机…","journalSendConfirm":"将 {name} 上传到 {printer}，但不开始打印？","journalStoreUnavailable":"打印日志不可用。请检查插件本地存储。","journalTitle":"打印日志","legacyImportBlocked":"数据仍保存在原存储文件夹中。此数据集无法自动导入。","legacyImportButton":"导入旧数据","legacyImportConfirm":"数据和本地凭据将复制到 OrcaSlicer 插件的本地存储。旧副本会保留。继续吗？","legacyImportDetail":"发现旧数据：{printers} 台打印机、{history} 条历史记录、{outbox} 条队列记录、{files} 个文件。","legacyImportDone":"导入完成。","legacyImportFailed":"无法导入旧数据。","loading":"正在加载…","massFailed":"，失败 {count} 台","massResult":"已发送到 {count} 台打印机{failed}。","namePlaceholder":"名称","networkPermissionRequired":"请在 OrcaSlicer 中允许访问打印机。若有此选项，请打开插件 → Print Farm → 权限，然后点击此打印机卡片上的“刷新”。","noPrinters":"未找到打印机。请在 OrcaSlicer 中配置打印主机，或在上方添加打印机。","notReachable":"{printer}：打印机无法访问","notReachableNotStarted":"{printer}：打印机无法访问，未开始打印。","nozzle":"喷嘴","octoprintApiKeyPlaceholder":"OctoPrint API 密钥","open":"打开网页界面","operatorStartCheck":"我已确认切片文件和所选打印板适用于这台打印机，材料和工具正确，热床已清空。","other":"其他","outboxCopiesOff":"插件设置中已关闭切片副本。","outboxFallbackName":"切片 {stamp}","outboxHintText":"工艺预设中未选择 Printers Outbox 插件，切片副本不会被保存。","outboxHintWhere":"请在“工艺 → 其他 → 切片流水线插件”中选择。","outboxNotReady":"G-code 文件尚未就绪","outboxPrinterUsage":"打印机：{name} · 文件夹：{folder} · {count} 个文件 · {size}。可在下方查看或删除。","outboxQueued":"已将 {name} 加入 {target} 的队列","outboxRemoveFailed":"无法删除已保存文件。文件仍保留在列表中，可重试。","outboxStorageCleanBlocked":"只有在没有上传或打印进行、且文件索引正常时，才能删除残留文件。","outboxStorageCleanButton":"删除残留文件（{count} 个，{size}）","outboxStorageCleanConfirm":"要从 Print Farm 存储中删除 {count} 个残留文件（{size}）吗？打印机队列中的文件不受影响。","outboxStorageCleanDone":"已删除 {count} 个残留文件（{size}）。","outboxStorageCleanFailed":"无法删除 {count} 个文件：{paths}。请重试。","outboxStorageEmpty":"未找到队列文件或恢复副本。","outboxStorageEntry":"{label}：{count} 个文件 · {size} · {path}","outboxStorageKindIncoming":"已准备的上传文件","outboxStorageKindIndex":"队列索引","outboxStorageKindIndexBackup":"队列索引备份","outboxStorageKindLoose":"散落或孤立文件","outboxStorageKindRecovery":"旧数据恢复文件","outboxStorageKindUnassigned":"未分配文件","outboxStorageManualCleanup":"残留文件（零散文件、已准备的上传、恢复副本、索引备份）可用下方按钮删除。打印机队列中的文件需逐个移除。","outboxStorageScanFailed":"无法扫描所有存储路径：{paths}。统计可能不完整。","outboxStorageWarning":"存储空间在增长；请删除队列中不再需要的文件。","outboxUnassigned":"未分配文件：{count} · {size}。可在下方手动查看和删除。","outboxWriteFailed":"无法保留 G-code 文件","outboxWrongStep":"当前步骤不是 G-code 后处理步骤","pause":"暂停","plateLabel":"打印板","preparedUploadDiscardFailed":"无法删除上传的临时副本；请检查存储空间。","print":"打印…","printShort":"打印","printerBusy":"打印机正忙","printerIpPlaceholder":"192.168.0.42（打印机 IP）","printerNotOnline":"打印机不在线","prusalinkApiKeyPlaceholder":"PrusaLink API 密钥","queueLess":"收起","queueMore":"再显示 {count} 个","refresh":"刷新","remove":"移除","removeRetainedTitle":"移除保留的副本","repetierApiKeyPlaceholder":"Repetier API 密钥","repetierLoadFailed":"无法加载所选 Repetier 打印机。请检查地址、密钥和打印机列表。","repetierLoadPrinters":"加载打印机","repetierModeUnsupported":"此服务器版本或连接器的写入支持尚未验证。仅显示状态。","repetierNotReady":"服务器尚未确认此打印机可以接受命令。","repetierRequestAccepted":"请求已接受；任务可能在服务器队列中等待。下一次状态报告将确认打印。","repetierSelectPrinter":"选择打印机","resume":"继续","select":"选择","selectAllTitle":"选择或取消选择所有可用打印机","selfSigned":"自签名证书","selfSignedTitle":"仅当打印机通过带自签名证书的 HTTPS 提供服务时启用。普通局域网 HTTP 打印机无需启用。","send":"发送","sendFailed":"{printer}：发送失败 — {error}","sendSelected":"将 G-code 发送到所选打印机…","sendSelectedCount":"将 G-code 发送到 {count} 台所选打印机…","sendToPrinterTitle":"发送到此打印机并开始打印","sendingFile":"正在将 {name} 发送到 {count} 台打印机…","sentToPrint":"已发送打印","serialAuto":"序列号（自动）","serialTitle":"序列号会自动发现。仅在需要固定到特定打印机时填写。使用 MQTT 端口 8883。","startApprovalExpired":"启动确认已过期或参数已更改；请重新检查。","startBedClear":"热床已清空，可以开始新的打印。","startBlocked":"已阻止 {printer} 启动：{reason}","startCompatibilityUnknown":"无法确认切片文件与这台打印机兼容。可以只上传文件，不启动打印。","startConfirmMissing":"已取消启动：请确认热床已清空，并在被询问时确认文件适合该打印机。","startFileCheck":"我已确认此文件正是为这台打印机切片的。","startImmediately":"上传后立即开始打印","startPrint":"开始打印","startReasonFileKind":"此打印机无法启动这种类型的文件。","startReasonNoStart":"此连接暂不支持从 Print Farm 启动打印，但可以上传文件。","startReasonPlate":"所选打印板与此文件不匹配。","startReasonProfileMatch":"该文件已按此打印机的 OrcaSlicer 预设切片。","startReasonProfileUnknown":"Print Farm 无法从文件判断它是为哪台打印机切片的。","startReasonProject":"这是未切片的项目文件，请先切片。","startReasonSlicedOnly":"此打印机只能启动已切片的 3MF，不能启动纯 G-code。","startReasonUnsupported":"暂不支持此连接类型。","startReviewTitle":"逐一确认每次打印","startVerdictCompatible":"兼容","startVerdictIncompatible":"不兼容","startVerdictUnknown":"请手动检查","startWillStart":"将启动的打印机：{count}","stateAborted":"已中止","stateBusy":"忙碌","stateChecking":"检查中","stateComplete":"已完成","stateError":"错误","stateFailed":"失败","stateIdle":"空闲","stateOffline":"离线","stateOnline":"在线","statePaused":"已暂停","statePrinting":"打印中","stateStandby":"待机","stateUnavailable":"暂不可用","stateUnknown":"未知","stop":"停止","storageBar":"存储：{count} 个文件 · {size}","storageGroupTitle":"{name} · {count} 个文件 · {size}","storageMore":"另外 {count} 个…","supportPlanned":"已计划支持 {type}，但目前尚不可用。","sure":"确定？","tlsCertificateChanged":"打印机证书已更改。连接已阻止。","tlsPermissionRequired":"请在 OrcaSlicer 中允许访问打印机，然后重试证书检查。","tlsProbeFailed":"无法读取证书。请检查打印机后重试。","tlsTrustBusy":"打印机正在使用中。请等待操作完成。","tlsTrustButton":"证书…","tlsTrustConfirm":"信任此证书","tlsTrustCurrent":"已保存的 SHA-256","tlsTrustDetails":"详细信息","tlsTrustFtps":"文件（FTPS 990）","tlsTrustIntro":"仅在可信网络中确认证书。首次连接不能证明打印机的身份。","tlsTrustMqtt":"状态和命令（MQTT 8883）","tlsTrustNoPin":"未确认","tlsTrustObserved":"收到的 SHA-256","tlsTrustProbe":"读取并信任","tlsTrustReplacement":"证书与已保存的证书不同。只有在预期会发生此更改时才确认替换证书，例如更换或重置打印机后。","tlsTrustRequired":"连接前请确认打印机证书。","tlsTrustSaveFailed":"无法保存证书确认。","tlsTrustSaved":"证书已确认。","tlsTrustStale":"打印机设置已更改或确认已过期。请重新读取证书。","tlsTrustTitle":"Bambu 证书","tlsTrustWorking":"正在读取证书…","toolActive":"当前工具","toolDetails":"{tool} · 当前：{current} · 目标：{target} · {state}","toolInactive":"未启用工具","toolViewOnly":"仅查看详情，不会切换当前工具","unassignedDelete":"删除","unassignedDeleteAll":"全部删除","unassignedDeleteAllConfirm":"要从 Print Farm 存储中删除全部 {count} 个未关联打印机的文件（{size}）吗？打印机上的副本不受影响。","unassignedDeleteConfirm":"从 Print Farm 存储中删除 {name}（{size}）？打印机上的副本不受影响。","unassignedHeading":"未关联打印机的文件：{count} · {size}","unassignedNoPrinter":"没有就绪的打印机。打印机必须在线、空闲并接受上传。","unassignedSend":"发送到打印机…","unassignedUpload":"仅上传","unassignedUploadStart":"上传并开始","unassignedWhy":"面板中没有打印机与此文件中的打印机预设匹配。你可以将其一次性发送到所选打印机，不会创建任何关联。","unavailableSuffix":"暂不可用","unmatchedQueued":"有 {count} 个排队文件与面板中的打印机不匹配","uploadShort":"上传","uploadToPrinterTitle":"将文件上传到这台打印机，但不启动打印","uploadToPrinters":"将 {name} 上传到 {count} 台打印机：","uploadUnverifiedHardware":"无法上传：尚未在真实设备上验证","uploadedNotStarted":"已上传但未启动","useAms":"使用 AMS（Bambu）","webuiAddress":"Web UI 地址（可选）","webuiFallbackHelp":"如果页面一直加载，请将地址复制到浏览器。可在连接设置中指定网页端口。","webuiHelp":"页面无法加载？"},"zh_TW":{"accessCode":"存取代碼","add":"新增","addConfiguredTitle":"新增 OrcaSlicer 中已設定的列印裝置","addPrinter":"新增列印裝置…","all":"全部","bambuError":"列印裝置錯誤 {code}","bambuLayer":"第 {current}/{total} 層","bambuLeftHM":"剩餘 {hours} 小時 {minutes} 分鐘","bambuLeftM":"剩餘 {minutes} 分鐘","bed":"熱床","busy":"{printer}：列印裝置忙碌中（{state}）","busyNotStarted":"{printer}：列印裝置忙碌中（{state}），未開始列印。","cameraButton":"即時攝影機","cameraCapturedAt":"拍攝於 {time}","cameraClose":"關閉攝影機","cameraLoadFailed":"此處無法載入畫面。此視窗可能會封鎖來自區域網路的圖片。","cameraLoading":"正在連線到攝影機…","cameraMode":"攝影機","cameraModeAuto":"已設定的攝影機","cameraModeU1":"Snapmaker U1 原廠攝影機","cameraNativeSession":"攝影機工作階段已開啟","cameraNone":"此列印裝置未設定攝影機。","cameraOpenWindow":"在視窗中開啟攝影機","cameraPermissionDenied":"背景執行權限遭拒。允許後重新開啟攝影機。","cameraReceivedAt":"接收於 {time}","cameraTitle":"攝影機：{printer}","cameraUnavailable":"無法連線到攝影機。","cancel":"取消","cfgAutoDelete":"自動刪除舊副本","cfgAutoDeleteAge":"刪除早於以下時間的副本","cfgAutoDeleteHint":"預設關閉。啟動時及每天檢查一次；只刪除此外掛儲存的副本，不會刪除使用中的檔案。","cfgClearConfirm":"要清除列印記錄嗎？此操作無法復原。","cfgClearDone":"已送出請求。面板下次讀取設定時將清除記錄。","cfgClearHistory":"清除列印記錄","cfgDays":"{days} 天","cfgJournalOrca":"將從 Orca 發起的傳送與列印寫入列印記錄","cfgJournalOrcaHint":"僅限 OrcaSlicer 自己回報的工作。","cfgKeepAll":"全部","cfgKeepCopies":"保留切片檔案的副本","cfgKeepCopiesHint":"之後可將切片傳送到列印裝置。關閉時不會複製任何內容。","cfgKeepHistory":"儲存列印記錄","cfgKeepHistoryHint":"關閉後不再記錄新項目，既有項目會保留。","cfgKeepLast":"每台印表機僅保留最新的切片","cfgKeepLastHint":"儲存新切片時，會刪除同一台印表機較舊的未傳送副本。與列印日誌關聯的副本會保留。","cfgPauseHidden":"面板不可見時不輪詢","cfgPauseHiddenHint":"分頁或視窗隱藏時可節省網路請求。","cfgPollInterval":"列印裝置輪詢間隔","cfgProfileHint":"外掛未在列印參數設定檔中選取時顯示提示","cfgProfileHintHint":"當切片未經過此外掛時顯示於面板。","cfgSeconds":"{seconds} 秒","close":"關閉","comingLater":"即將支援","commandFailed":"{printer}：「{action}」指令失敗 — {error}","commandSent":"{printer}：已傳送「{action}」指令。","confirmTitle":"要在多台列印裝置上開始列印嗎？","confirmUploadTitle":"要將檔案上傳到所選列印裝置嗎？","connectionOptions":"連線","connectionOptionsFailed":"無法儲存，請檢查位址。","connectionOptionsHelp":"使用相同主機並明確填寫網頁連接埠。","connectionSave":"儲存","connectionTypeTitle":"連線類型。可用的功能取決於列印裝置的通訊協定與目前狀態。","controlsUnverified":"此連線不支援暫停與停止（尚未在實機上驗證）","crealityWsPortPlaceholder":"WS 連接埠（9999）","crealityWsPortTitle":"選填。列印裝置狀態 WebSocket 的連接埠。9999 是未經確認的預設值；若列印裝置使用其他連接埠，請自行修改。","credentialLegacyWarning":"{count} 台印表機的舊金鑰仍以明文儲存。請移至系統認證儲存區。舊備份不會刪除。","credentialMigrate":"移轉金鑰","credentialMigrationConfirm":"將金鑰移至系統認證儲存區？舊備份會保留。","credentialMigrationDone":"金鑰已移至系統認證儲存區。","credentialRetry":"重試存取","credentialSaveFailed":"無法安全儲存金鑰，印表機未儲存。","credentialUnavailable":"系統認證儲存區無法使用，已封鎖印表機連線。","dashboardOpened":"Print Farm 面板已開啟。","duetPasswordPlaceholder":"Duet 機器密碼","errorNeedsAccessCode":"需要列印裝置的存取代碼","errorNeedsBambuCredentials":"需要列印裝置 IP、存取代碼和序號","errorNoAddress":"缺少列印裝置位址","errorOutcomeUnknown":"列印裝置可能收到了請求，也可能沒有；請先檢查列印裝置再重試","errorPrintCommand":"列印指令失敗：{error}","errorUnknownAction":"未知的列印裝置操作","errorUnknownSerial":"檔案已上傳，但仍不知道列印裝置序號，請在列印裝置上開始列印","errorUnsupportedBackend":"不支援此連線類型","errorUpload":"上傳失敗：{error}","errorUploadUnverified":"檔案已上傳，但無法在列印裝置上驗證其大小，因此未開始列印","errorUploadedNotStarted":"檔案已上傳，但未開始列印：{error}","feedbackButton":"意見回饋","feedbackCopied":"已複製","feedbackCopy":"複製","feedbackHelp":"將位址複製到瀏覽器，再點選網站的「Beta反馈」按鈕。不會傳送印表機資料。","file3mfWarning":".3mf 只能在 Bambu 列印裝置上啟動，其他列印裝置需要 G-code。","fileOperationDone":"{printer}：{name} — {result}。","fileReadFailed":"傳送失敗：無法讀取檔案。","fileTargetMismatch":"{printer}：佇列中的檔案與此列印裝置不符，未開始列印。","flashforgeCheckCodePlaceholder":"驗證碼（見列印裝置螢幕）","flashforgeCheckCodeTitle":"列印裝置螢幕上顯示的驗證碼。列印裝置上必須開啟區域網路模式。","flashforgeErrAuth":"序號或驗證碼錯誤。","flashforgeErrCredentials":"請輸入序號和驗證碼。","flashforgeErrIdentity":"無法驗證列印裝置型號。","flashforgeErrLanMode":"請在列印裝置上開啟區域網路模式。","flashforgeErrUnsupportedModel":"不支援此 FlashForge 型號（僅支援 Adventurer 5M、5M Pro 和 AD5X）。","flashforgeSerialPlaceholder":"序號","flashforgeSerialTitle":"列印裝置螢幕上顯示的序號（設定 > 關於 或 網路）。必須開啟區域網路模式。","fleetAttention":"需要注意","fleetIdle":"閒置","fleetPrinting":"列印中","foundOnNetwork":"在網路上找到","genericError":"錯誤","history":"列印歷史","historyCoverage":"本機記錄的列印歷史。包含由 Print Farm 開始的列印，以及此面板開啟期間偵測到的工作；OrcaSlicer 未執行期間的工作可能缺漏。","historyDurationHoursMinutes":"{hours} 小時 {minutes} 分鐘","historyDurationMinutes":"{minutes} 分鐘","historyEmpty":"此列印裝置目前沒有列印記錄。","historyFromOrca":"由 OrcaSlicer 回報","historyLoading":"正在載入列印歷史…","historyObserved":"由 Print Farm 偵測到","historyProgress":"{progress}%","historyStartedHere":"由 Print Farm 開始","historyStateCancelled":"已取消","historyStateCompleted":"已完成","historyStateEnded":"已結束","historyStateFailed":"失敗","historyStatePaused":"已暫停","historyStatePrinting":"列印中","historyStateSent":"已傳送","historyTitle":"列印歷史 — {printer}","historyUnknownFile":"未知檔案","integrationUnavailable":"尚未支援此列印裝置的整合","journalActiveCount":"進行中 {count} 筆","journalAllCount":"已記錄 {count} 筆","journalBlockedByHold":"此列印裝置先前的操作尚未處理；請檢查列印裝置後，開啟列印記錄並解除鎖定","journalButton":"列印記錄","journalCompletedCount":"已完成 {count} 筆","journalEmptyAll":"目前沒有列印記錄。","journalFileDelete":"刪除檔案","journalFileUnsent":"已切片，未傳送","journalHoldLocked":"此操作仍在傳送中，暫時無法解除鎖定。","journalHoldReleased":"鎖定已解除。舊操作的結果仍未確認。","journalHoldState":"狀態：{state}","journalHoldUnavailable":"無法讀取未解決的操作。請關閉後重新開啟列印記錄。","journalHoldsHeading":"結果尚未確認的操作。解除鎖定前，請檢查實體列印裝置、工作與列印板。","journalNoResults":"找不到符合的列印記錄。","journalPrinter":"列印裝置","journalReleaseConfirm":"你已檢查「{target}」的實體列印裝置、工作與列印板。要解除此鎖定嗎？這只會允許之後重新嘗試；不會將舊的列印標記為成功，也不會重試。","journalReleaseHold":"解除鎖定","journalResend":"再次傳送…","journalResultsCount":"{count} 筆結果","journalSearchLabel":"搜尋列印記錄","journalSearchPlaceholder":"搜尋檔案或列印裝置…","journalSendConfirm":"要將 {name} 上傳到 {printer}，但不開始列印嗎？","journalStoreUnavailable":"列印記錄無法使用。請檢查外掛的本機儲存空間。","journalTitle":"列印記錄","legacyImportBlocked":"資料仍保存在原儲存資料夾中。此資料集無法自動匯入。","legacyImportButton":"匯入舊資料","legacyImportConfirm":"資料與本機憑證將複製到 OrcaSlicer 外掛的本機儲存空間。舊副本會保留。要繼續嗎？","legacyImportDetail":"找到舊資料：{printers} 台列印裝置、{history} 筆歷史記錄、{outbox} 筆佇列記錄、{files} 個檔案。","legacyImportDone":"匯入完成。","legacyImportFailed":"無法匯入舊資料。","loading":"載入中…","massFailed":"，失敗 {count} 台","massResult":"已傳送到 {count} 台列印裝置{failed}。","namePlaceholder":"名稱","networkPermissionRequired":"請在 OrcaSlicer 中允許存取印表機。若有此選項，請開啟外掛程式 → Print Farm → 權限，然後點擊此印表機卡片上的「重新整理」。","noPrinters":"找不到列印裝置。請在 OrcaSlicer 中設定列印主機，或在上方新增列印裝置。","notReachable":"{printer}：無法連線到列印裝置","notReachableNotStarted":"{printer}：無法連線到列印裝置，未開始列印。","nozzle":"噴嘴","octoprintApiKeyPlaceholder":"OctoPrint API 金鑰","open":"開啟網頁介面","operatorStartCheck":"我已確認切片檔案與所選列印板適用於這台列印裝置，耗材與工具正確，熱床已清空。","other":"其他","outboxCopiesOff":"外掛設定中已關閉切片副本。","outboxFallbackName":"切片 {stamp}","outboxHintText":"列印參數設定檔中未選擇 Printers Outbox 外掛，切片副本不會被儲存。","outboxHintWhere":"請在「列印參數 → 其他 → 切片管線外掛」中選擇。","outboxNotReady":"G-code 檔案尚未就緒","outboxPrinterUsage":"列印裝置：{name} · 資料夾：{folder} · {count} 個檔案 · {size}。可在下方檢視或移除檔案。","outboxQueued":"已將 {name} 加入 {target} 的佇列","outboxRemoveFailed":"無法移除已儲存的檔案。檔案仍保留在清單中，可重試。","outboxStorageCleanBlocked":"只有在沒有上傳或列印進行中，且檔案索引正常時，才能刪除殘留檔案。","outboxStorageCleanButton":"刪除殘留檔案（{count} 個，{size}）","outboxStorageCleanConfirm":"要從 Print Farm 儲存空間刪除 {count} 個殘留檔案（{size}）嗎？列印裝置佇列中的檔案不受影響。","outboxStorageCleanDone":"已刪除 {count} 個殘留檔案（{size}）。","outboxStorageCleanFailed":"無法刪除 {count} 個檔案：{paths}。請重試。","outboxStorageEmpty":"找不到佇列檔案或復原副本。","outboxStorageEntry":"{label}：{count} 個檔案 · {size} · {path}","outboxStorageKindIncoming":"已準備的上傳檔案","outboxStorageKindIndex":"佇列索引","outboxStorageKindIndexBackup":"佇列索引備份","outboxStorageKindLoose":"零散或孤立的檔案","outboxStorageKindRecovery":"舊資料復原檔案","outboxStorageKindUnassigned":"未指派的檔案","outboxStorageManualCleanup":"殘留檔案（零散檔案、已準備的上傳、復原副本、索引備份）可用下方按鈕刪除。列印裝置佇列中的檔案需逐一移除。","outboxStorageScanFailed":"無法掃描所有儲存路徑：{paths}。統計可能不完整。","outboxStorageWarning":"儲存空間持續增加；請移除佇列中不再需要的檔案。","outboxUnassigned":"未指派的檔案：{count} · {size}。可在下方手動檢視與移除。","outboxWriteFailed":"無法保留 G-code 檔案","outboxWrongStep":"目前步驟不是 G-code 後處理步驟","pause":"暫停","plateLabel":"列印板","preparedUploadDiscardFailed":"無法刪除上傳的暫存副本；請檢查儲存空間。","print":"列印…","printShort":"列印","printerBusy":"列印裝置忙碌中","printerIpPlaceholder":"192.168.0.42（列印裝置 IP）","printerNotOnline":"列印裝置不在線","prusalinkApiKeyPlaceholder":"PrusaLink API 金鑰","queueLess":"收合","queueMore":"再顯示 {count} 個","refresh":"重新整理","remove":"移除","removeRetainedTitle":"移除保留的副本","repetierApiKeyPlaceholder":"Repetier API 金鑰","repetierLoadFailed":"無法載入所選 Repetier 印表機。請檢查位址、金鑰和印表機清單。","repetierLoadPrinters":"載入印表機","repetierModeUnsupported":"此伺服器版本或連接器的寫入支援尚未驗證。僅顯示狀態。","repetierNotReady":"伺服器尚未確認此印表機可以接受命令。","repetierRequestAccepted":"請求已接受；工作可能在伺服器佇列中等待。下次狀態報告將確認列印。","repetierSelectPrinter":"選擇印表機","resume":"繼續","select":"選取","selectAllTitle":"選取或取消選取所有可用的列印裝置","selfSigned":"自簽憑證","selfSignedTitle":"僅當列印裝置透過使用自簽憑證的 HTTPS 提供服務時啟用。一般區域網路 HTTP 列印裝置無需啟用。","send":"傳送","sendFailed":"{printer}：傳送失敗 — {error}","sendSelected":"將 G-code 傳送到所選列印裝置…","sendSelectedCount":"將 G-code 傳送到 {count} 台所選列印裝置…","sendToPrinterTitle":"傳送到此列印裝置並開始列印","sendingFile":"正在將 {name} 傳送到 {count} 台列印裝置…","sentToPrint":"已傳送列印","serialAuto":"序號（自動）","serialTitle":"序號會自動偵測。僅在需要固定到特定列印裝置時填寫。使用 MQTT 連接埠 8883。","startApprovalExpired":"開始列印的確認已過期或設定已變更；請重新檢查。","startBedClear":"熱床已清空，可以開始新的列印。","startBlocked":"已阻止 {printer} 開始列印：{reason}","startCompatibilityUnknown":"無法確認切片檔案與這台列印裝置相容。可以只上傳檔案，不開始列印。","startConfirmMissing":"已取消開始列印：請確認熱床已清空，並在被詢問時確認檔案適合該列印裝置。","startFileCheck":"我已確認此檔案正是為這台列印裝置切片的。","startImmediately":"上傳後立即開始列印","startPrint":"開始列印","startReasonFileKind":"此列印裝置無法開始這種類型的檔案。","startReasonNoStart":"此連線目前尚不支援從 Print Farm 開始列印，但可以上傳檔案。","startReasonPlate":"所選的列印板與此檔案不符。","startReasonProfileMatch":"此檔案已依這台列印裝置的 OrcaSlicer 設定檔切片。","startReasonProfileUnknown":"Print Farm 無法從檔案判斷它是為哪台列印裝置切片的。","startReasonProject":"這是尚未切片的專案檔案，請先切片。","startReasonSlicedOnly":"此列印裝置只能開始已切片的 3MF，無法開始純 G-code。","startReasonUnsupported":"目前尚不支援此連線類型。","startReviewTitle":"逐一確認每次列印","startVerdictCompatible":"相容","startVerdictIncompatible":"不相容","startVerdictUnknown":"請手動檢查","startWillStart":"將開始列印的列印裝置：{count}","stateAborted":"已中止","stateBusy":"忙碌","stateChecking":"檢查中","stateComplete":"已完成","stateError":"錯誤","stateFailed":"失敗","stateIdle":"閒置","stateOffline":"離線","stateOnline":"在線","statePaused":"已暫停","statePrinting":"列印中","stateStandby":"待機","stateUnavailable":"暫時無法使用","stateUnknown":"未知","stop":"停止","storageBar":"儲存空間：{count} 個檔案 · {size}","storageGroupTitle":"{name} · {count} 個檔案 · {size}","storageMore":"另外 {count} 個…","supportPlanned":"已規劃支援 {type}，但目前尚無法使用。","sure":"確認？","tlsCertificateChanged":"印表機憑證已變更。連線已封鎖。","tlsPermissionRequired":"請在 OrcaSlicer 中允許存取印表機，然後重試憑證檢查。","tlsProbeFailed":"無法讀取憑證。請檢查印表機後再試一次。","tlsTrustBusy":"印表機正在使用中。請等待操作完成。","tlsTrustButton":"憑證…","tlsTrustConfirm":"信任此憑證","tlsTrustCurrent":"已儲存的 SHA-256","tlsTrustDetails":"詳細資訊","tlsTrustFtps":"檔案（FTPS 990）","tlsTrustIntro":"只在您信任的網路上確認憑證。首次連線無法證明印表機的身分。","tlsTrustMqtt":"狀態與命令（MQTT 8883）","tlsTrustNoPin":"尚未確認","tlsTrustObserved":"收到的 SHA-256","tlsTrustProbe":"讀取並信任","tlsTrustReplacement":"憑證與已儲存的不同。只有在預期會發生此變更時才確認替換憑證，例如更換或重設印表機後。","tlsTrustRequired":"連線前請確認印表機憑證。","tlsTrustSaveFailed":"無法儲存憑證確認。","tlsTrustSaved":"憑證已確認。","tlsTrustStale":"印表機設定已變更或確認已過期。請重新讀取憑證。","tlsTrustTitle":"Bambu 憑證","tlsTrustWorking":"正在讀取憑證…","toolActive":"使用中的工具","toolDetails":"{tool} · 目前：{current} · 目標：{target} · {state}","toolInactive":"非作用中工具","toolViewOnly":"僅查看詳細資料，不會切換目前工具","unassignedDelete":"刪除","unassignedDeleteAll":"全部刪除","unassignedDeleteAllConfirm":"要從 Print Farm 儲存空間刪除全部 {count} 個未關聯列印裝置的檔案（{size}）嗎？列印裝置上的副本不受影響。","unassignedDeleteConfirm":"要從 Print Farm 儲存空間刪除 {name}（{size}）嗎？列印裝置上的副本不受影響。","unassignedHeading":"未關聯列印裝置的檔案：{count} · {size}","unassignedNoPrinter":"沒有就緒的列印裝置。列印裝置必須在線、閒置並接受上傳。","unassignedSend":"傳送到列印裝置…","unassignedUpload":"僅上傳","unassignedUploadStart":"上傳並開始","unassignedWhy":"面板上沒有任何列印裝置與此檔案中的列印裝置設定檔相符。你可以將檔案一次性傳送到所選列印裝置，不會建立任何關聯。","unavailableSuffix":"暫時無法使用","unmatchedQueued":"有 {count} 個佇列中的檔案在面板上找不到相符的列印裝置","uploadShort":"上傳","uploadToPrinterTitle":"將檔案上傳到這台列印裝置，但不開始列印","uploadToPrinters":"將 {name} 上傳到 {count} 台列印裝置：","uploadUnverifiedHardware":"無法上傳：尚未在實機上驗證","uploadedNotStarted":"已上傳但未開始列印","useAms":"使用 AMS（Bambu）","webuiAddress":"Web UI 位址（選填）","webuiFallbackHelp":"如果頁面持續載入，請將位址複製到瀏覽器。可在連線設定指定網頁連接埠。","webuiHelp":"頁面無法載入？"}}
 _LOCALE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "printers_locales",
@@ -1814,10 +6368,11 @@ def dashboard_printers():
 _PUBLIC_PRINTER_FIELDS = frozenset({
     "id", "target_uuid", "owner_scope_uuid", "server_uuid", "target_selector",
     "binding_revision", "name", "url", "type", "serial", "source", "discovery_ref", "repetier_slug",
-    "status", "queued", "outbox_count", "outbox_bytes", "webui_url", "camera_mode",
+    "status", "queued", "outbox_count", "outbox_bytes", "webui_url", "camera_mode", "camera_url", "camera_external", "camera_wall_snapshot", "camera_rotate_180",
 })
 _PUBLIC_STATUS_FIELDS = frozenset({
     "supported", "online", "state", "backend", "job_state", "error",
+    "uploaded_files",
     "thumbnail", "filename", "nozzle", "target_nozzle", "bed",
     "target_bed", "progress", "transport_online", "device_health",
     "device_state", "authorization", "freshness", "observed_at",
@@ -1993,6 +6548,7 @@ def public_printer_record(printer):
         key: value for key, value in record.items()
         if key in _PUBLIC_PRINTER_FIELDS and key not in {"status", "queued"}
     }
+    public["bambu_lan_camera"] = bambu_lan_camera_supported(record)
     status = record.get("status")
     if isinstance(status, dict):
         public["status"] = public_status(status)
@@ -2568,10 +7124,321 @@ def _verified_bambu_serial(printer):
             and printer.get("serial_binding_revision") == printer.get("binding_revision"))
 
 
+def bambu_lan_camera_supported(printer):
+    if backend_for_type(printer.get("type")) != "bambu":
+        return False
+    model = _card_model_code(printer)
+    if model:
+        return model in {"C11", "N1", "N2S"}
+    return bool(re.search(r"\b(?:p1p|a1)(?:\b|(?=mini))", str(printer.get("name") or ""), re.I))
+
+
+class BambuLanCamera:
+    """Read the Bambu LAN JPEG stream after verifying the printer certificate."""
+
+    def __init__(self, printer, is_current, publish):
+        self.printer = printer
+        self.is_current = is_current
+        self.publish = publish
+        self.id = uuid.uuid4().hex
+        self.stop = threading.Event()
+        self.ready = threading.Event()
+        self.socket = None
+        self.sequence = 0
+
+    def acknowledge(self, sequence):
+        if type(sequence) is int and sequence == self.sequence:
+            self.ready.set()
+            return True
+        return False
+
+    def cancel(self):
+        self.stop.set()
+        self.ready.set()
+        sock = self.socket
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _read(self, sock, length):
+        data = bytearray()
+        deadline = time.monotonic() + 8
+        while len(data) < length:
+            if self.stop.is_set() or time.monotonic() >= deadline:
+                raise OSError("Camera read expired")
+            chunk = sock.recv(min(length - len(data), 65536))
+            if not chunk:
+                raise OSError("Camera disconnected")
+            data.extend(chunk)
+        return bytes(data)
+
+    def run(self):
+        host = urllib.parse.urlsplit(normalize_url(self.printer.get("url"))).hostname
+        code = (self.printer.get("access_code") or self.printer.get("apikey") or "").encode("ascii")
+        if not host or not 1 <= len(code) <= 32 or not self.printer.get("serial"):
+            raise ValueError("Camera credentials unavailable")
+        if self.stop.is_set() or not self.is_current():
+            return
+        with _connect_tcp(host, 6000, 6) as raw:
+            with _wrap_bambu_socket(_SSL_BAMBU_CA, raw, host) as sock:
+                self.socket = sock
+                _bambu_certificate_serial(self.printer, sock)
+                if self.stop.is_set() or not self.is_current():
+                    return
+                sock.sendall(struct.pack("<IIII32s32s", 64, 0x3000, 0, 0, b"bblp", code))
+                while not self.stop.is_set() and self.is_current():
+                    size, = struct.unpack_from("<I", self._read(sock, 16))
+                    if not 4 <= size <= 2 * 1024 * 1024:
+                        raise ValueError("Invalid camera frame size")
+                    image = self._read(sock, size)
+                    if not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+                        raise ValueError("Invalid camera frame")
+                    self.ready.clear()
+                    self.sequence += 1
+                    self.publish({"sessionId": self.id, "sequence": self.sequence,
+                                  "received_at": time.time(),
+                                  "image": "data:image/jpeg;base64," + base64.b64encode(image).decode("ascii")})
+                    if not self.ready.wait(5):
+                        raise OSError("Camera frame not acknowledged")
+
+
 def _copy_bambu_observations(source, target):
     for key in ("serial", "_seen_verified_serial", "_seen_model_code"):
         if key in source:
             target[key] = source[key]
+
+
+_BAMBU_ARCHIVE_LIMIT = 128 * 1024 * 1024
+_BAMBU_PNG_LIMIT = 1024 * 1024
+_BAMBU_PREVIEW_TIMEOUT = 180
+_BAMBU_PREVIEW_LOCK = threading.Lock()
+_BAMBU_PREVIEW_ACTIVE = set()
+_BAMBU_PREVIEW_CACHE = {}
+
+
+def _bambu_preview_source(info):
+    """Resolve the archive names and the selected plate from a LAN report."""
+    names = []
+    plate = None
+    for field in ("gcode_file", "subtask_name"):
+        value = info.get(field)
+        if not isinstance(value, str) or not value or len(value) > 512:
+            continue
+        if any(unicodedata.category(char) == "Cc" for char in value):
+            continue
+        name = value.replace("\\", "/").rsplit("/", 1)[-1]
+        if not name or name in (".", ".."):
+            continue
+        match = re.fullmatch(r"plate_([1-9][0-9]{0,5})\.gcode", name, re.I)
+        if field == "gcode_file":
+            if match:
+                plate = int(match.group(1))
+                continue
+            match = re.search(r"_plate_([1-9][0-9]{0,5})\.gcode$", name, re.I)
+            if match:
+                plate = int(match.group(1))
+                stem = name[:match.start()]
+                names.extend((stem + ".3mf", stem + ".gcode.3mf"))
+        if name.lower().endswith(".3mf"):
+            names.append(name)
+            if name.lower().endswith(".gcode.3mf"):
+                names.append(name[:-10] + ".3mf")
+        else:
+            stem = name[:-6] if name.lower().endswith(".gcode") else name
+            names.extend((stem + ".gcode.3mf", stem + ".3mf"))
+    return tuple(dict.fromkeys(names)), plate
+
+
+def _bambu_archive_preview(stream, plate):
+    import zipfile
+
+    with zipfile.ZipFile(stream) as archive:
+        if plate is None:
+            plates = {int(match.group(1)) for name in archive.namelist()
+                      if (match := re.fullmatch(r"Metadata/plate_([1-9][0-9]{0,5})\.gcode", name))}
+            if not plates:
+                plates = {int(match.group(1)) for name in archive.namelist()
+                          if (match := re.fullmatch(
+                              r"Metadata/plate_([1-9][0-9]{0,5})(?:_small)?\.png", name))}
+            if len(plates) != 1:
+                return ""
+            plate = plates.pop()
+        for suffix in ("_small.png", ".png"):
+            try:
+                member = archive.getinfo(f"Metadata/plate_{plate}{suffix}")
+            except KeyError:
+                continue
+            if not 8 <= member.file_size <= _BAMBU_PNG_LIMIT:
+                continue
+            with archive.open(member) as image:
+                data = image.read(_BAMBU_PNG_LIMIT + 1)
+            if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) <= _BAMBU_PNG_LIMIT:
+                return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    return ""
+
+
+def _bambu_fetch_preview(printer, names, plate):
+    import ftplib
+    import tempfile
+    import zipfile
+
+    host = urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname
+    code = printer.get("access_code") or printer.get("apikey")
+    if not host or not code:
+        return ""
+    deadline = time.monotonic() + _BAMBU_PREVIEW_TIMEOUT
+    context = _bambu_tls_context(printer, "ftps")
+    with _implicit_ftps_class()(context=context) as ftp:
+        ftp._bambu_printer = printer
+        ftp.connect(host, 990, timeout=2)
+        ftp.login("bblp", code)
+        ftp.prot_p()
+        for folder in ("/cache/", "/", "/model/", "/data/"):
+            for name in names:
+                if time.monotonic() >= deadline:
+                    return ""
+                with tempfile.TemporaryFile() as stream:
+                    def write_chunk(chunk):
+                        if (stream.tell() + len(chunk) > _BAMBU_ARCHIVE_LIMIT
+                                or time.monotonic() >= deadline):
+                            raise OSError("Bambu preview transfer limit exceeded")
+                        stream.write(chunk)
+
+                    try:
+                        ftp.retrbinary("RETR " + folder + name, write_chunk, 64 * 1024)
+                    except ftplib.error_perm as exc:
+                        if str(exc).startswith("550"):
+                            continue
+                        raise
+                    try:
+                        stream.seek(0)
+                        preview = _bambu_archive_preview(stream, plate)
+                    except (zipfile.BadZipFile, RuntimeError, EOFError, NotImplementedError):
+                        continue
+                    if preview:
+                        return preview
+    return ""
+
+
+_BAMBU_PREVIEW_DISK_MAX_AGE = 7 * 24 * 60 * 60
+_BAMBU_PREVIEW_DATA_PREFIX = "data:image/png;base64,"
+
+
+def _bambu_preview_disk_path(identity):
+    if _STORAGE_DENIED or not PLUGIN_STORAGE_DIR or not all(identity[:2]):
+        return ""
+    digest = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+    return os.path.join(PLUGIN_STORAGE_DIR, "bambu-previews", digest + ".json")
+
+
+def _matching_finished_bambu_preview(saved, current):
+    """Allow fields omitted by the FINISH report while rejecting conflicting jobs."""
+    try:
+        names, plate, ids, total = saved
+        current_names, current_plate, current_ids, current_total = current
+        return (bool(set(names).intersection(current_names))
+                and (plate is None or current_plate is None or plate == current_plate)
+                and (total is None or current_total is None or total == current_total)
+                and not any(value != dict(ids)[field] for field, value in current_ids if field in dict(ids)))
+    except (TypeError, ValueError, KeyError):
+        return False
+
+
+def _read_bambu_preview(path, job_digest, layer, finished_key=None):
+    if not path:
+        return ""
+    try:
+        with open(path, "rb") as stream:
+            record = json.loads(stream.read((_BAMBU_PNG_LIMIT * 4 // 3) + 1024))
+        if not isinstance(record, dict):
+            return ""
+        if record.get("job") != job_digest and (
+                finished_key is None or not _matching_finished_bambu_preview(record.get("match"), finished_key)):
+            return ""
+        saved_at = record.get("saved_at")
+        if type(saved_at) not in (int, float) or not (
+                0 <= time.time() - saved_at <= _BAMBU_PREVIEW_DISK_MAX_AGE):
+            return ""
+        saved_layer = record.get("layer")
+        if type(saved_layer) is int and type(layer) is int and layer < saved_layer:
+            return ""
+        preview = record.get("preview")
+        if isinstance(preview, str) and preview.startswith(_BAMBU_PREVIEW_DATA_PREFIX):
+            encoded = preview[len(_BAMBU_PREVIEW_DATA_PREFIX):]
+            data = base64.b64decode(encoded, validate=True)
+            if len(data) <= _BAMBU_PNG_LIMIT and data.startswith(b"\x89PNG\r\n\x1a\n"):
+                return preview
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _bambu_preview_worker(printer, endpoint, key, names, plate,
+                          disk_path, job_digest, layer):
+    preview = ""
+    try:
+        preview = _bambu_fetch_preview(printer, names, plate)
+        if preview and disk_path:
+            record = {"job": job_digest, "saved_at": time.time(),
+                      "layer": layer, "preview": preview, "match": key[2:]}
+            write_bytes_atomic(disk_path, json.dumps(record).encode("ascii"))
+    except Exception:
+        # Optional preview failures must not affect MQTT print status.
+        pass
+    finally:
+        with _BAMBU_PREVIEW_LOCK:
+            _BAMBU_PREVIEW_ACTIVE.discard(endpoint)
+            _BAMBU_PREVIEW_CACHE[key] = (preview, time.monotonic() + _THUMB_RETRY_SECONDS)
+            if len(_BAMBU_PREVIEW_CACHE) > 32:
+                del _BAMBU_PREVIEW_CACHE[next(iter(_BAMBU_PREVIEW_CACHE))]
+
+
+def _populate_bambu_preview(printer, status):
+    source = status.pop("_bambu_preview", None)
+    if not source:
+        return
+    names, plate, task_ids = source
+    if not names:
+        return
+    endpoint = _endpoint_key(printer.get("url"))
+    identity = _bambu_tls_identity(printer)
+    key = (identity, printer.get("serial"), names, plate, task_ids, status.get("total_layers"))
+    layer = status.get("layer")
+    finished = status.get("job_state") in ("finish", "finished", "complete", "completed")
+    disk_path = _bambu_preview_disk_path(identity)
+    job_digest = hashlib.sha256(json.dumps(key).encode("utf-8")).hexdigest()
+    with _BAMBU_PREVIEW_LOCK:
+        preview, retry_at = _BAMBU_PREVIEW_CACHE.get(key, ("", 0))
+        if preview:
+            status["thumbnail"] = preview
+            return
+        if finished:
+            matches = {value for cached, (value, _) in _BAMBU_PREVIEW_CACHE.items()
+                       if value and cached[:2] == key[:2]
+                       and _matching_finished_bambu_preview(cached[2:], key[2:])}
+            if len(matches) == 1:
+                status["thumbnail"] = matches.pop()
+                return
+        preview = _read_bambu_preview(disk_path, job_digest, layer, key[2:] if finished else None)
+        if preview:
+            _BAMBU_PREVIEW_CACHE[key] = (preview, 0)
+            if len(_BAMBU_PREVIEW_CACHE) > 32:
+                del _BAMBU_PREVIEW_CACHE[next(iter(_BAMBU_PREVIEW_CACHE))]
+            status["thumbnail"] = preview
+            return
+        if time.monotonic() < retry_at or endpoint in _BAMBU_PREVIEW_ACTIVE or len(_BAMBU_PREVIEW_ACTIVE) >= 4:
+            return
+        _BAMBU_PREVIEW_ACTIVE.add(endpoint)
+        try:
+            threading.Thread(target=_bambu_preview_worker,
+                             args=(dict(printer), endpoint, key, names, plate,
+                                   disk_path, job_digest, layer),
+                             name="printers-bambu-thumbnail", daemon=True).start()
+        except (PermissionError, RuntimeError):
+            _BAMBU_PREVIEW_ACTIVE.discard(endpoint)
+            _BAMBU_PREVIEW_CACHE[key] = ("", time.monotonic() + _THUMB_RETRY_SECONDS)
 
 
 def poll_bambu(printer, timeout=8):
@@ -2584,6 +7451,7 @@ def poll_bambu(printer, timeout=8):
     with _bambu_target_lock(printer):
         result = _poll_bambu_connection(hydrated, timeout)
         _copy_bambu_observations(hydrated, printer)
+        _populate_bambu_preview(hydrated, result)
         return result
 
 
@@ -2681,15 +7549,26 @@ def _poll_bambu_connection(printer, timeout):
             gstate = info.get("gcode_state", "")
             pct = info.get("mc_percent")
             job_state = _BAMBU_STATES.get(gstate, (gstate or "unknown").lower())
+            preview = None
+            if job_state in ("printing", "paused", "finish", "finished", "complete", "completed"):
+                names, plate = _bambu_preview_source(info)
+                ids = tuple((field, str(info[field])[:64]) for field in
+                            ("task_id", "subtask_id", "gcode_start_time")
+                            if type(info.get(field)) in (str, int))
+                preview = names, plate, ids
+            stats = _bambu_stats(info, job_state)
+            if preview and job_state in ("finish", "finished", "complete", "completed"):
+                stats["total_layers"] = _bambu_int(info.get("total_layer_num"), 1, _BAMBU_MAX_LAYERS)
             return {
                 "online": True,
                 "state": job_state,
                 "job_state": job_state,
-                **_bambu_stats(info, job_state),
+                **stats,
                 "nozzle": info.get("nozzle_temper"), "target_nozzle": info.get("nozzle_target_temper"),
                 "bed": info.get("bed_temper"), "target_bed": info.get("bed_target_temper"),
                 "progress": pct if pct is not None else None,
                 "filename": info.get("subtask_name") or info.get("gcode_file") or "",
+                "_bambu_preview": preview,
                 "thumbnail": "",
             }
         return {"online": True, "state": "connected", "nozzle": None, "target_nozzle": None,
@@ -5051,13 +9930,57 @@ def _new_history_record(printer, filename, now, source, elapsed_seconds=None):
     }
 
 
+_PRODUCTION_PREVIEW_LIMIT = 160 * 1024
+
+
+def _production_preview(value):
+    if not isinstance(value, str) or len(value) > _PRODUCTION_PREVIEW_LIMIT:
+        return ""
+    return value if re.fullmatch(r"data:image/png;base64,iVBORw0KGg[A-Za-z0-9+/]*={0,2}", value) else ""
+
+
+def _production_group_name(value):
+    return value.strip()[:100] if isinstance(value, str) else ""
+
+
+def _production_parts(value):
+    return value if type(value) is int and 0 <= value <= 1000000 else None
+
+
+def production_groups(records):
+    groups = {}
+    for record in records:
+        name = _production_group_name(record.get("production_group"))
+        if not name:
+            continue
+        group = groups.setdefault(name, {"name": name, "count": 0, "missing": 0, "preview": "", "manual_parts": 0})
+        manual = _production_parts(record.get("production_manual_parts")) or 0
+        group["manual_parts"] = max(group["manual_parts"], manual)
+        if record.get("state") == "completed":
+            parts = _production_parts(record.get("production_parts"))
+            if parts is None:
+                group["missing"] += 1
+            else:
+                group["count"] += parts
+        if not group["preview"]:
+            group["preview"] = _production_preview(record.get("production_preview"))
+    for group in groups.values():
+        group["count"] += group["manual_parts"]
+    return list(groups.values())
+
+
 def _update_history_record(record, status, state, now):
     changed = False
+    preview = _production_preview((status or {}).get("thumbnail"))
+    filename = _history_filename((status or {}).get("filename"))
+    if (preview and (not filename or not record.get("filename") or filename == record["filename"])
+            and not record.get("production_preview")):
+        record["production_preview"] = preview
+        changed = True
     already_finished = (
         record.get("state") in _HISTORY_TERMINAL_STATES
         and record.get("finished_at") is not None
     )
-    filename = _history_filename((status or {}).get("filename"))
     if filename and not record.get("filename"):
         record["filename"] = filename
         changed = True
@@ -5113,7 +10036,186 @@ def _history_digest(value):
     return None
 
 
-def record_print_started(printer, filename, now=None, sha256=None):
+def _pending_upload(records, key, filename):
+    path = str(filename or "").strip()
+    pending = [record for record in records if record.get("printer_key") == key
+               and record.get("state") == "sent" and record.get("uploaded_path")]
+    exact = next((record for record in pending if record["uploaded_path"] == path), None)
+    if exact is not None or not path:
+        return exact
+    matches = [record for record in pending
+               if backend_for_type(record.get("backend")) == "bambu"
+               and _bambu_upload_name(record["uploaded_path"]) == _bambu_upload_name(path)]
+    paths = {record["uploaded_path"] for record in matches}
+    return matches[0] if len(paths) == 1 else None
+
+
+def _start_pending_upload(record, now, elapsed=None):
+    record.update(state="printing", started_at=now - (elapsed or 0), updated_at=now,
+                  finished_at=None, duration_seconds=elapsed or 0, progress=None)
+    return record
+
+
+def _moonraker_uploaded_files(printer):
+    printer = hydrate_credentials(printer)
+    base = normalize_url(printer.get("url"))
+    response = _get_bounded_json(base + "/server/files/list?root=gcodes", ssl_ctx_for(printer),
+                                 moonraker_headers(printer), timeout=2, max_bytes=2 * 1024 * 1024)
+    files = response.get("result")
+    if not isinstance(files, list):
+        raise ValueError("Invalid Moonraker file list")
+    candidates = {}
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        modified = _history_int(item.get("modified"))
+        if isinstance(path, str) and 0 < len(path) <= 500 and path.lower().endswith(".gcode") and modified:
+            candidates[path] = modified
+    return candidates
+
+
+def _bambu_uploaded_files(printer):
+    import ftplib
+
+    printer = hydrate_credentials(printer)
+    host = urllib.parse.urlsplit(normalize_url(printer.get("url"))).hostname
+    context = _bambu_tls_context(printer, "ftps")
+    candidates = {}
+    listed = False
+    with _implicit_ftps_class()(context=context) as ftp:
+        ftp._bambu_printer = printer
+        ftp.connect(host, 990, timeout=2)
+        ftp.login("bblp", printer.get("access_code") or printer.get("apikey") or "")
+        ftp.prot_p()
+        for folder in ("/cache", "/"):
+            try:
+                entries = list(ftp.mlsd(folder))
+            except ftplib.error_perm:
+                try:
+                    entries = [(name, {}) for name in ftp.nlst(folder)]
+                except ftplib.error_perm:
+                    continue
+            listed = True
+            for name, facts in entries:
+                name = name.rsplit("/", 1)[-1]
+                if not _uploaded_path_valid(name) or not name.lower().endswith(".3mf"):
+                    continue
+                if name.startswith("pf-") or facts.get("type", "file") != "file":
+                    continue
+                path = folder.strip("/") + "/" + name if folder != "/" else name
+                candidates[path] = "%s:%s" % (facts.get("modify", ""), facts.get("size", ""))
+    if not listed:
+        raise OSError("Bambu file listing unavailable")
+    return candidates
+
+
+def _inspect_bambu_upload(printer, path):
+    import tempfile
+    import zipfile
+
+    host = urllib.parse.urlsplit(normalize_url(printer.get("url"))).hostname
+    code = printer.get("access_code") or printer.get("apikey") or ""
+    deadline = time.monotonic() + _BAMBU_PREVIEW_TIMEOUT
+    digest = hashlib.sha256()
+    with tempfile.TemporaryFile() as stream:
+        with _implicit_ftps_class()(context=_bambu_tls_context(printer, "ftps")) as ftp:
+            ftp._bambu_printer = printer
+            ftp.connect(host, 990, timeout=4)
+            ftp.login("bblp", code)
+            ftp.prot_p()
+
+            def receive(chunk):
+                if stream.tell() + len(chunk) > _BAMBU_ARCHIVE_LIMIT or time.monotonic() >= deadline:
+                    raise OSError("Archive inspection limit exceeded")
+                digest.update(chunk)
+                stream.write(chunk)
+
+            ftp.retrbinary("RETR /" + path, receive, 64 * 1024)
+        with zipfile.ZipFile(stream) as archive:
+            plates = [name for name in archive.namelist()
+                      if re.fullmatch(r"Metadata/plate_[1-9][0-9]{0,5}\.gcode", name)]
+        if not plates or len(plates) > 100 or len(plates) != len(set(plates)):
+            raise ValueError("No unambiguous sliced plates")
+        plates.sort(key=lambda name: int(name[15:-6]))
+        preview = _production_preview(_bambu_archive_preview(
+            stream, int(plates[0][15:-6])))
+        return plates, preview, digest.hexdigest()
+
+
+def _uploaded_path_valid(path):
+    return (isinstance(path, str) and 0 < len(path) <= 500
+            and "\\" not in path
+            and all(ord(c) >= 32 and ord(c) != 127 for c in path)
+            and all(part and part not in (".", "..") for part in path.split("/"))
+    )
+
+
+def _bambu_upload_name(path):
+    return urllib.parse.unquote(path).rsplit("/", 1)[-1].casefold().removesuffix(".3mf").removesuffix(".gcode")
+
+
+def scan_moonraker_uploads(printer, status):
+    """Import printer-resident files and return display rows for pending jobs."""
+    if not history_recording_enabled():
+        return [], False
+    return _import_printer_uploads(printer, status, _moonraker_uploaded_files(printer))
+
+
+def _import_printer_uploads(printer, status, candidates, bambu_baseline=None):
+    if not history_recording_enabled():
+        return [], False
+    bambu = status.get("backend") == "bambu"
+    now = int(time.time())
+    key = printer_history_key(printer)
+    current = str(status.get("filename") or "").strip()
+    current_state = _history_state(status)
+    with _HISTORY_LOCK:
+        records = load_print_history()
+        if _HISTORY_STORE_DAMAGED:
+            return [], False
+        known = {(r.get("uploaded_path"), r.get("uploaded_modified")) for r in records
+                 if r.get("printer_key") == key}
+        changed = False
+        for path, version in sorted(candidates.items(), key=lambda item: item[1], reverse=True):
+            modified = now if bambu else version
+            if not _uploaded_path_valid(path) or (path, version) in known:
+                continue
+            if not bambu and modified < now - 86400:
+                continue
+            same_job = _bambu_upload_name(path) == _bambu_upload_name(current) if bambu else path == current
+            if same_job and current_state in (_HISTORY_ACTIVE_STATES | {"completed"}):
+                continue
+            matching = [r for r in records if r.get("printer_key") == key and
+                        (_bambu_upload_name(r.get("filename", "")) == _bambu_upload_name(path)
+                         if bambu else r.get("filename") == _history_filename(path)) and
+                        r.get("started_at", 0) >= modified - (120 if bambu else 5)
+                        and not r.get("uploaded_path")]
+            if bambu and (bambu_baseline is None or bambu_baseline.get(path) == version):
+                if not any(r.get("source") == "orca" and r.get("state") == "sent" for r in matching):
+                    continue
+            if any(r.get("state") != "sent" for r in matching):
+                continue
+            record = next(iter(matching), None)
+            if record is None:
+                record = _new_history_record(printer, path, min(now, modified), "observed")
+                record.update(state="sent", finished_at=min(now, modified))
+                records.insert(0, record)
+            for old in records:
+                if old is not record and old.get("printer_key") == key and old.get("state") == "sent" and old.get("uploaded_path") == path:
+                    old.pop("uploaded_path", None)
+            record.update(uploaded_path=path, uploaded_modified=version)
+            changed = True
+        if changed and not save_print_history(records):
+            return [], False
+        pending = sorted((r for r in records if r.get("printer_key") == key
+                          and r.get("state") == "sent" and r.get("uploaded_path") in candidates
+                          and candidates[r["uploaded_path"]] == r.get("uploaded_modified")),
+                         key=lambda r: r["started_at"], reverse=True)
+        return [{"path": r["uploaded_path"], "id": r["id"]} for r in pending], changed
+
+
+def record_print_started(printer, filename, now=None, sha256=None, remote_operation=None):
     """Persist a job immediately after a backend accepts a start request.
 
     ``sha256`` is the digest of the exact file Print Farm sent. It lets the
@@ -5124,15 +10226,29 @@ def record_print_started(printer, filename, now=None, sha256=None):
     key = printer_history_key(printer)
     with _HISTORY_LOCK:
         records = load_print_history()
+        record = _pending_upload(records, key, filename)
         for item in records:
             if item.get("printer_key") == key and item.get("state") in _HISTORY_ACTIVE_STATES:
+                if remote_operation and item.get("uploaded_path") == filename:
+                    record = item
+                    continue
+                if remote_operation and item.get("filename") == _history_filename(filename) and record:
+                    records.remove(item)
+                    break
                 _update_history_record(item, {"filename": filename}, "ended", now)
-        record = _new_history_record(printer, filename, now, "print_farm")
+        if record is None:
+            record = _new_history_record(printer, filename, now, "print_farm")
+            records.insert(0, record)
+        else:
+            if record.get("state") == "sent":
+                _start_pending_upload(record, now)
+            record["source"] = "print_farm"
         if _history_digest(sha256):
             record["sha256"] = sha256
-        records.insert(0, record)
+        if remote_operation:
+            record["remote_operation"] = remote_operation
         save_print_history(records)
-    return records[0]
+    return record
 
 
 def record_file_sent(printer, filename, now=None, sha256=None):
@@ -5169,12 +10285,28 @@ def record_print_observation(printer, status, now=None):
         ), None)
         changed = False
         if state in _HISTORY_ACTIVE_STATES:
+            pending = _pending_upload(records, key, (status or {}).get("filename"))
+            if pending is not None and active is not None and active.get("filename") != filename:
+                _update_history_record(active, {}, "ended", now)
+                active = None
             if active is None:
-                active = _new_history_record(printer, filename, now, "observed", elapsed)
-                records.insert(0, active)
+                active = pending
+                if active is None:
+                    active = _new_history_record(printer, filename, now, "observed", elapsed)
+                    records.insert(0, active)
+                else:
+                    _start_pending_upload(active, now, elapsed)
                 changed = True
             changed = _update_history_record(active, status, state, now) or changed
         elif active is not None:
+            if active.get("remote_operation") and state in {"idle", "completed"}:
+                uploaded_path = active.get("uploaded_path") or ""
+                observed_path = str((status or {}).get("filename") or "")
+                same_file = uploaded_path == observed_path
+                if backend_for_type(active.get("backend")) == "bambu" and observed_path:
+                    same_file = _bambu_upload_name(uploaded_path) == _bambu_upload_name(observed_path)
+                if not same_file:
+                    return False
             if (
                 state in {"idle", "completed"}
                 and active.get("source") == "print_farm"
@@ -5224,6 +10356,14 @@ def _public_history_record(record, printer_name=None, stored_file=None):
     source = record if isinstance(record, dict) else {}
     name = printer_name if printer_name is not None else source.get("printer_name")
     public = _public_history_fields(source, name)
+    public["id"] = str(source.get("id") or "")[:80]
+    public["production_group"] = _production_group_name(source.get("production_group"))
+    public["production_parts"] = _production_parts(source.get("production_parts"))
+    public["uploaded"] = source.get("state") == "sent" and bool(source.get("uploaded_path"))
+    public["preview"] = _production_preview(source.get("production_preview"))
+    if public["uploaded"]:
+        public["uploadTarget"] = str(source.get("target_uuid") or "")[:80]
+        public["uploadOwner"] = str(source.get("owner_scope_uuid") or "")[:80]
     if isinstance(stored_file, str) and stored_file:
         public["file"] = stored_file
     return public
@@ -5643,7 +10783,11 @@ PAGE = r"""<!DOCTYPE html>
          border-bottom:1px solid var(--orca-border,#3c3c4c); }
   .bar-main, .manual-form { display:flex; align-items:center; gap:7px; min-width:0; }
   .bar-main { width:100%; flex-wrap:wrap; }
-  #fleet-summary { display:inline-flex; align-items:center; flex-wrap:wrap; gap:4px; }
+  .fleet-header { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+  .fleet-actions { display:flex; gap:6px; margin-left:auto; }
+  #fleet-summary { display:inline-flex; align-items:center; flex-wrap:wrap; gap:6px; }
+  #fleet-summary button { padding:6px 10px; border-radius:7px; }
+  #fleet-summary button strong { font-size:15px; margin-right:5px; }
   #fleet-summary[hidden], .tile[hidden] { display:none; }
   #fleet-summary button { white-space:nowrap; }
   #fleet-summary button[aria-pressed="true"] {
@@ -5696,12 +10840,18 @@ PAGE = r"""<!DOCTYPE html>
   .tile { width:100%; max-width:400px; box-sizing:border-box;
           border:1px solid var(--orca-border,#3c3c4c); border-radius:8px; padding:12px;
           display:flex; flex-direction:column; gap:8px; }
+  .tile[data-fleet-status="completed"] { border-color:#26956f; }
   .tile .top { display:flex; align-items:center; gap:8px; }
+  .print-metrics { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:3px 10px; }
+  .print-metrics strong { font-size:20px; font-weight:650; line-height:1.2; }
+  .print-metrics .print-percent { color:var(--orca-accent,#009688); margin-left:auto; }
+  .tile[data-fleet-status="completed"] .print-metrics { color:var(--orca-fg,#e0e0e0); }
+  .tile[data-fleet-status="completed"] .print-metrics strong { color:#26956f; }
+  .tile[data-fleet-status="completed"] .bar > i { background:#26956f; }
   .dot { width:9px; height:9px; border-radius:50%; background:#888; flex:0 0 auto; }
   .dot.on { background:#3fbf6f; } .dot.off { background:#c0504d; }
   .name-wrap { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:4px; }
-  .tile .name { min-width:0; overflow:hidden; text-overflow:ellipsis;
-                white-space:nowrap; font-weight:600; }
+  .tile .name { min-width:0; overflow-wrap:anywhere; font-weight:600; }
   .tile .remove { flex:0 0 auto; width:26px; height:26px; padding:5px;
                   color:var(--orca-muted,#a0a0a0); border-color:transparent; }
   .tile .remove:hover, .tile .remove:focus-visible {
@@ -5711,8 +10861,10 @@ PAGE = r"""<!DOCTYPE html>
                         color:#c0504d; border-color:#c0504d; }
   .src { font-size:10px; padding:1px 5px; border-radius:3px; border:1px solid var(--orca-border,#3c3c4c);
          color:var(--orca-muted,#a0a0a0); }
-  .tile .state { max-width:120px; font-size:11px; color:var(--orca-muted,#a0a0a0);
-                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tile .status-labels { display:flex; flex-wrap:wrap; align-items:center;
+                         gap:4px 8px; margin-right:auto; min-width:0; }
+  .tile .state { font-size:11px; color:var(--orca-muted,#a0a0a0);
+                 min-width:0; overflow-wrap:anywhere; }
   .body { display:flex; gap:10px; }
   .thumb { width:64px; height:64px; flex:0 0 auto; border:1px solid var(--orca-border,#3c3c4c);
            border-radius:6px; object-fit:contain; background:rgba(255,255,255,.04); display:none; }
@@ -5819,6 +10971,26 @@ PAGE = r"""<!DOCTYPE html>
     color:var(--orca-accent,#009688); border-color:var(--orca-accent,#009688); }
   .history-meta { color:var(--orca-muted,#a0a0a0); font-size:11px; display:flex;
                    flex-wrap:wrap; gap:5px 14px; }
+  #production-groups { flex:0 0 auto; min-width:0; padding:8px 12px;
+                       border-top:1px solid var(--orca-border,#3c3c4c); }
+  #production-groups h2 { margin:0 0 6px; font-size:13px; }
+  #production-group-list { display:flex; gap:8px; overflow-x:auto; padding-bottom:3px; }
+  #production-groups[hidden], .production-tools[hidden] { display:none; }
+  .production-group { display:flex; align-items:center; gap:8px; flex:0 0 auto;
+                      max-width:340px; padding:6px 11px; border-radius:7px; text-align:left;
+                      border:1px solid var(--orca-border,#555565); }
+  .production-group img { width:56px; height:56px; object-fit:contain; flex:none; }
+  .production-group-entry { display:flex; flex:none; align-items:center; gap:5px; }
+  #production-adjust { color:var(--orca-fg,#e0e0e0); background:var(--orca-bg,#1e1e2e);
+                       border:1px solid var(--orca-border,#555565); border-radius:8px; padding:16px; }
+  #production-adjust::backdrop { background:rgba(0,0,0,.5); }
+  #production-adjust form { display:grid; gap:10px; max-width:320px; }
+  .production-adjust-actions { display:flex; justify-content:flex-end; gap:6px; }
+  .production-group:hover { border-color:var(--orca-accent,#009688); }
+  .production-group span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .production-group strong { flex:none; }
+  .production-tools { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .history-group-select { display:flex; align-items:center; gap:6px; margin-top:6px; }
   .history-toolbar { display:flex; flex-direction:column; gap:10px; padding:0 18px 14px; }
   .history-summary { display:flex; flex-wrap:wrap; gap:8px; }
   .history-stat { display:flex; align-items:baseline; gap:6px; min-width:0; }
@@ -5860,10 +11032,23 @@ PAGE = r"""<!DOCTYPE html>
 <body>
   <div id="credential-notice" class="history-note" style="display:none" role="status"></div>
   <div id="bar">
+    <div class="fleet-header">
+      <div id="fleet-summary" aria-label="Printer status filters" hidden>
+        <button class="ghost" type="button" data-fleet-filter="all" aria-pressed="true"></button>
+        <button class="ghost" type="button" data-fleet-filter="printing" aria-pressed="false"></button>
+        <button class="ghost" type="button" data-fleet-filter="completed" aria-pressed="false"></button>
+        <button class="ghost" type="button" data-fleet-filter="idle" aria-pressed="false"></button>
+        <button class="ghost" type="button" data-fleet-filter="offline" aria-pressed="false"></button>
+        <button class="ghost" type="button" data-fleet-filter="attention" aria-pressed="false" hidden></button>
+      </div>
+      <div class="fleet-actions">
+        <button id="camera-wall-open" class="ghost" type="button">Cameras</button>
+        <button id="journal-open" class="ghost" type="button"></button>
+      </div>
+    </div>
     <div class="bar-main">
       <label id="sel-all-l" title="Select or deselect every printer"><input id="sel-all" type="checkbox"> <span id="sel-all-text">all</span></label>
       <button id="send" class="ghost" disabled>Send G-code to selected…</button>
-      <button id="journal-open" class="ghost" type="button"></button>
       <span id="storage-warn" class="storage-warn" style="display:none"></span>
       <button id="unassigned-link" class="linklike" type="button" style="display:none"></button>
       <span id="status"></span>
@@ -5873,11 +11058,6 @@ PAGE = r"""<!DOCTYPE html>
           <path d="M1 1.5 6 6.5 11 1.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
         </svg>
       </span>
-      <div id="fleet-summary" hidden>
-        <button class="ghost" type="button" data-fleet-filter="printing" aria-pressed="false"></button>
-        <button class="ghost" type="button" data-fleet-filter="idle" aria-pressed="false"></button>
-        <button class="ghost" type="button" data-fleet-filter="attention" aria-pressed="false"></button>
-      </div>
       <button id="manual-toggle" class="ghost" type="button" aria-expanded="false">
         <span id="manual-toggle-text">Add</span>
         <svg class="disclosure-icon" viewBox="0 0 12 8" aria-hidden="true" focusable="false">
@@ -5990,8 +11170,19 @@ __TYPE_OPTIONS__
           <div class="history-stat"><span id="journal-completed-label"></span></div>
           <div class="history-stat"><span id="journal-active-label"></span></div>
         </div>
+        <button id="journal-clear" class="ghost" type="button" hidden disabled></button>
         <label id="journal-search-label" for="journal-search"></label>
         <input id="journal-search" class="history-search" type="search" autocomplete="off">
+        <div id="production-tools" class="production-tools" hidden>
+          <input id="production-name" list="production-names" maxlength="100" autocomplete="off"
+                 placeholder="Production group" aria-label="Production group">
+          <datalist id="production-names"></datalist>
+          <input id="production-parts" type="number" min="0" max="1000000" step="1"
+                 placeholder="Parts per print" aria-label="Parts per print" style="width:10em">
+          <button id="production-save" class="ghost" type="button">Assign selected</button>
+          <button id="production-unassign" class="ghost" type="button">Remove from group</button>
+          <span id="production-message" role="status"></span>
+        </div>
         <div id="history-results" class="history-results" aria-live="polite"></div>
       </div>
       <div id="history-list" class="history-list"><div class="empty">Loading…</div></div>
@@ -6007,11 +11198,33 @@ __TYPE_OPTIONS__
       <div id="cam-note" class="history-note" role="status" aria-live="polite"></div>
       <label id="cam-mode-wrap" style="display:none;align-items:center;gap:8px"><span id="cam-mode-label"></span>
         <select id="cam-mode"><option value="auto"></option><option value="snapmaker_u1"></option></select>
+        <input id="cam-address" type="text" aria-label="Camera URL" placeholder="Camera URL (optional)" maxlength="2048">
         <button id="cam-mode-save" class="ghost" type="button"></button></label>
-      <div class="cam-actions"><button id="cam-window" class="ghost" type="button" style="display:none"></button></div>
+      <label id="cam-external-wrap" style="margin:4px 14px"><input id="cam-external" type="checkbox"> Open saved camera URL in browser</label>
+      <label style="margin:4px 14px"><input id="cam-wall-snapshot" type="checkbox"> Snapshot every 5 seconds in camera grid</label>
+    <label style="margin:4px 14px"><input id="cam-rotate" type="checkbox"> Rotate image 180°</label>
+    <div class="cam-actions"><button id="cam-window" class="ghost" type="button" style="display:none"></button></div>
     </section>
   </div>
   <div id="grid"><div class="empty">Loading…</div></div>
+  <section id="production-groups" hidden aria-labelledby="production-groups-title">
+    <h2 id="production-groups-title">Production groups</h2>
+    <div id="production-group-list"></div>
+  </section>
+  <dialog id="production-adjust" aria-labelledby="production-adjust-title">
+    <form id="production-adjust-form">
+      <strong id="production-adjust-title"></strong>
+      <label for="production-adjust-count">Manual completed parts</label>
+      <input id="production-adjust-count" type="number" min="0" max="1000000" step="1"
+             aria-describedby="production-adjust-help" required>
+      <small id="production-adjust-help">Parts already made outside this group. This number is added to the completed prints tracked here.</small>
+      <span id="production-adjust-status" role="status"></span>
+      <div class="production-adjust-actions">
+        <button type="button" class="ghost" id="production-adjust-cancel">Cancel</button>
+        <button type="submit" class="ghost" id="production-adjust-save">Save</button>
+      </div>
+    </form>
+  </dialog>
   <footer id="feedback-corner">
     <!-- Lucide Bug icon, ISC License.
     Copyright (c) for portions of Lucide are held by Cole Bemis 2013-2023 as part
@@ -6063,7 +11276,6 @@ var hostLanguage = '__HOST_UI_LANGUAGE__';
 var ACTIVE_TYPES = __ACTIVE_TYPES__;
 var ADAPTER_TYPES = __ADAPTER_TYPES__;
 var CREDENTIAL_TYPES = __CREDENTIAL_TYPES__;
-var CAMERA_TYPES = __CAMERA_TYPES__;
 function normalizeUiLocale(value) {
   var token = String(value || '').replace(/-/g, '_');
   var lowered = token.toLowerCase();
@@ -6146,16 +11358,31 @@ function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c
 function temp(v){ return v == null ? '—' : Math.round(v) + '°'; }
 // <bambu-stats>
 var count = function(v, max){ return typeof v === 'number' && isFinite(v) && v >= 0 && v <= max && Math.floor(v) === v; };
-// Time-left / layer line shared by every backend; exists only when data was sent.
-function jobStatsHtml(s){
-  var parts = [];
-  if (count(s.remaining_minutes, 100000))
-    parts.push(esc(s.remaining_minutes >= 60
-      ? t('bambuLeftHM', {hours:Math.floor(s.remaining_minutes / 60), minutes:s.remaining_minutes % 60})
-      : t('bambuLeftM', {minutes:s.remaining_minutes})));
+// Prominent job timing and a secondary layer line, shared by every backend.
+function printMetricsHtml(s, status){
+  var progress = count(s.progress, 100) ? s.progress : null;
+  var detail = '';
+  if (status === 'completed') {
+    detail = 'Ready to unload';
+    progress = 100;
+  } else if (['printing','paused'].indexOf(stateKind(s)) >= 0) {
+    if (count(s.remaining_minutes, 100000)) {
+      var hours = Math.floor(s.remaining_minutes / 60);
+      var minutes = s.remaining_minutes % 60;
+      detail = (hours ? hours + 'h ' : '') + minutes + 'm left';
+    }
+  } else if (status === 'idle') detail = 'Ready to print';
+  else if (status === 'offline') detail = 'Offline';
+
+  if (!detail && progress === null) return '';
+  return '<div class="print-metrics">' +
+    (detail ? '<strong>' + esc(detail) + '</strong>' : '') +
+    (progress === null ? '' : '<strong class="print-percent">' + progress + '%</strong>') + '</div>';
+}
+function layerHtml(s){
   if (count(s.layer, 100000) && count(s.total_layers, 100000) && s.total_layers > 0 && s.layer <= s.total_layers)
-    parts.push(esc(t('bambuLayer', {current:s.layer, total:s.total_layers})));
-  return parts.length ? '<div class="fname">' + parts.join(' · ') + '</div>' : '';
+    return '<span>Layer ' + s.layer + ' / ' + s.total_layers + '</span>';
+  return '';
 }
 // Extra rows of a Bambu card; every row exists only when the printer sent it.
 function bambuStatsHtml(s){
@@ -6430,6 +11657,85 @@ function journalPicker(stored){
 }
 // Buttons of a row that has a stored copy. Every send still goes through the
 // same approval, bed and file-check confirmations on the Python side.
+var uploadedExpanded = new Map();
+function uploadedPrintButton(p, entry) {
+  var button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'ghost';
+  button.textContent = 'Print…';
+  button.dataset.uploadedRecord = entry.id;
+  button.disabled = !uploadedPrinterReady(p) ||
+    !((p.status || {}).uploaded_files || []).some(function(file){ return file.id === entry.id; });
+  button.addEventListener('click', function(){
+    var identity = targetIdentity(p);
+    identity.type = 'uploaded-prepare';
+    identity.recordId = entry.id;
+    orca.postMessage(identity);
+  });
+  return button;
+}
+function uploadedPrinterReady(p) {
+  if (!p || !p.status || p.status.online !== true || printerBusy(p)) return false;
+  var state = String(p.status.state || '').toLowerCase();
+  return p.status.backend === 'bambu' ? ['idle','finished'].includes(state)
+    : ['standby','complete','completed','cancelled','canceled'].includes(state);
+}
+function openUploadedReview(reply) {
+  var dialog = document.createElement('dialog');
+  var title = document.createElement('p');
+  title.textContent = reply.name + ' · ' + reply.printer;
+  dialog.appendChild(title);
+  var plate = document.createElement('select');
+  if (reply.plates.length) {
+    plate.setAttribute('aria-label', 'Plate');
+    if (reply.plates.length > 1) {
+      var placeholder = new Option('Select plate…', '');
+      placeholder.disabled = true;
+      plate.add(placeholder);
+    }
+    reply.plates.forEach(function(entry){
+      plate.add(new Option('Plate ' + entry.match(/plate_(\d+)/)[1], entry));
+    });
+    if (reply.plates.length > 1) plate.selectedIndex = 0;
+    dialog.appendChild(plate);
+  }
+  var ams = document.createElement('input');
+  if (reply.bambu) {
+    ams.type = 'checkbox';
+    ams.checked = true;
+    var amsLabel = document.createElement('label');
+    amsLabel.append(ams, document.createTextNode(' Use AMS'));
+    dialog.appendChild(amsLabel);
+  }
+  var check = document.createElement('input');
+  check.type = 'checkbox';
+  var label = document.createElement('label');
+  label.style.display = 'block';
+  label.style.margin = '12px 0';
+  label.append(check, document.createTextNode(' ' + t('operatorStartCheck')));
+  dialog.appendChild(label);
+  var cancel = document.createElement('button');
+  cancel.textContent = t('cancel');
+  cancel.addEventListener('click', function(){ dialog.close(); });
+  var start = document.createElement('button');
+  start.textContent = t('startPrint');
+  var update = function(){ start.disabled = !check.checked || (reply.plates.length > 0 && !plate.value); };
+  check.addEventListener('change', update);
+  plate.addEventListener('change', update);
+  update();
+  start.addEventListener('click', function(){
+    if (start.disabled) return;
+    var msg = Object.assign({}, reply.target, {type:'uploaded-start', token:reply.token,
+      recordId:reply.recordId, plate:plate.value, useAms:ams.checked, confirmed:true});
+    dialog.close();
+    orca.postMessage(msg);
+  });
+  dialog.append(cancel, start);
+  dialog.addEventListener('close', function(){ dialog.remove(); });
+  document.body.appendChild(dialog);
+  dialog.showModal();
+  cancel.focus();
+}
 function journalFileActions(row){
   var stored = row.stored; if (!stored) return null;
   var linked = !!row.item, printer = stored.printer;
@@ -6628,23 +11934,20 @@ function buildQueue(p, selectable, printDisabledReason){
   }
   return q;
 }
-// Card actions. With Pause/Stop on the card, History shares their row and the
-// other actions get a row of their own (only if there are any). Without them
-// everything is one wrapping row in DOM and Tab order: Select on the left, then
-// History, Print..., camera, Open. Empty parts and empty rows are never drawn.
+// History shares its row with print controls when they are available.
+// Status labels sit at the left of the last row, across from device actions.
 function cardActionsHtml(parts){
   var inner;
   if (parts.ctl) {
-    var rest = (parts.select || '') + (parts.print || '') +
-      (parts.cam || '') + (parts.open || '');
+    var rest = (parts.select || '') + (parts.print || '');
     inner = '<div class="ctl-row">' + parts.history + (parts.tls || '') + parts.ctl + '</div>' +
       (rest ? '<div class="row">' + rest + '</div>' : '');
   } else {
     inner = '<div class="row">' + (parts.select || '') + parts.history + (parts.print || '') +
-      (parts.tls || '') +
-      (parts.cam || '') + (parts.open || '') + '</div>';
+      (parts.tls || '') + '</div>';
   }
-  return '<div class="tile-actions">' + inner + '</div>';
+  var footer = '<div class="row">' + parts.status + (parts.cam || '') + (parts.open || '') + '</div>';
+  return '<div class="tile-actions">' + inner + footer + '</div>';
 }
 
 function renderCredentialNotice(printers){
@@ -6728,36 +12031,41 @@ function fleetStatus(p){
   var s = p.status || {};
   var state = String(s.job_state || s.state || '').trim().toLowerCase();
   var kind = stateKind({state:state});
-  if (tlsIssueProtocol(p, s) || s.online === false || s.authorization === 'rejected' ||
+  if (tlsIssueProtocol(p, s) || s.authorization === 'rejected' ||
       s.error_code === 'network_permission_denied' || s.device_health === 'error' ||
-      s.device_health === 'disconnected' || Number(s.print_error) ||
-      /^(offline|error|failed|aborted|halted|shutdown|cancelled)$/.test(state) ||
+      Number(s.print_error) ||
+      /^(error|failed|aborted|halted|shutdown|cancelled)$/.test(state) ||
       kind === 'paused') return 'attention';
+  if (s.online === false || s.device_health === 'disconnected' || state === 'offline') return 'offline';
   if (s.online !== true) return '';
   if (kind === 'printing') return 'printing';
-  return /^(idle|standby|operational|ready|complete|completed|finished)$/.test(state) ? 'idle' : '';
+  if (/^(complete|completed|finished)$/.test(state)) return 'completed';
+  return /^(idle|standby|operational|ready)$/.test(state) ? 'idle' : '';
 }
 
 var fleetSummary = document.getElementById('fleet-summary');
 var fleetFilter = '';
 function applyFleetFilter(){
-  var counts = {printing:0, idle:0, attention:0};
+  var counts = {all:0, printing:0, completed:0, idle:0, offline:0, attention:0};
   Array.prototype.forEach.call(grid.querySelectorAll('.tile'), function(tile){
     var status = tile.dataset.fleetStatus;
+    counts.all++;
     if (status) counts[status]++;
     tile.hidden = !!fleetFilter && fleetFilter !== status;
   });
-  var labels = {printing:'fleetPrinting', idle:'fleetIdle', attention:'fleetAttention'};
+  var labels = {all:'All', printing:'Printing', completed:'Completed', idle:'Idle', offline:'Offline', attention:'Needs attention'};
   Array.prototype.forEach.call(fleetSummary.querySelectorAll('button'), function(button){
     var filter = button.dataset.fleetFilter;
-    button.textContent = t(labels[filter]) + ' ' + counts[filter];
-    button.setAttribute('aria-pressed', String(filter === fleetFilter));
+    button.innerHTML = '<strong>' + counts[filter] + '</strong>' + labels[filter];
+    if (filter === 'attention') button.hidden = !counts.attention && fleetFilter !== filter;
+    button.setAttribute('aria-pressed', String(filter === (fleetFilter || 'all')));
   });
 }
 fleetSummary.addEventListener('click', function(event){
-  var filter = event.target.dataset.fleetFilter;
-  if (!filter) return;
-  fleetFilter = fleetFilter === filter ? '' : filter;
+  var button = event.target.closest('button[data-fleet-filter]');
+  if (!button) return;
+  var filter = button.dataset.fleetFilter;
+  fleetFilter = filter === 'all' || fleetFilter === filter ? '' : filter;
   applyFleetFilter();
 });
 
@@ -6810,7 +12118,8 @@ function render(printers){
       }).join('') + '</div>';
     }
     var nozzleCell = multiTool ? '' : '<span>' + esc(t('nozzle')) + ' <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>';
-    var prog = (s.progress == null) ? '' : '<div class="bar"><i style="width:' + s.progress + '%"></i></div>';
+    var progress = tile.dataset.fleetStatus === 'completed' ? 100 : s.progress;
+    var prog = count(progress, 100) ? '<div class="bar"><i style="width:' + progress + '%"></i></div>' : '';
     var thumb = s.thumbnail ? '<img class="thumb show" src="' + s.thumbnail + '">' : '<div class="thumb"></div>';
     var fname = s.filename ? '<div class="fname" title="' + esc(s.filename) + '">' + esc(s.filename) + '</div>' : '';
     if (supported && String(s.backend || '').toLowerCase() === 'flashforge') {
@@ -6831,20 +12140,17 @@ function render(printers){
       fname += '<div class="ctl-note" role="status">' + esc(s.error) + '</div>';
     if (supported && s.backend === 'repetier' && (s.upload_reason || s.control_reason))
       fname += '<div class="ctl-note">' + esc(t(s.upload_reason || s.control_reason)) + '</div>';
-    var jobKind = stateKind(s);
-    if (supported && (jobKind === 'printing' || jobKind === 'paused')) fname += jobStatsHtml(s);
-    if (supported && String(s.backend || '').toLowerCase() === 'bambu') fname += bambuStatsHtml(s);
+    var details = supported && String(s.backend || '').toLowerCase() === 'bambu' ? bambuStatsHtml(s) : '';
     tile.innerHTML =
       '<div class="top"><span class="dot ' + dotClass + '"></span>' +
       '<span class="name-wrap"><span class="name" title="' + esc(p.name || p.url) + '">' + esc(p.name || p.url) + '</span>' +
       '<button class="remove ghost" title="' + esc(t('remove')) + '" aria-label="' + esc(t('remove')) + '">' +
-      '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 4h10M6 4V2.5h4V4m-6 0 .6 9h6.8l.6-9M6.5 6.5v4M9.5 6.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button></span>' +
-      '<span class="src">' + esc(typeLabel(p.type, s)) + '</span>' +
-      '<span class="state" title="' + esc(s.error || stateText) + '">' + esc(stateText) + '</span></div>' +
-      '<div class="body">' + thumb + '<div class="meta">' +
+      '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 4h10M6 4V2.5h4V4m-6 0 .6 9h6.8l.6-9M6.5 6.5v4M9.5 6.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button></span></div>' +
+      '<div class="body">' + thumb + '<div class="meta">' + fname +
+      printMetricsHtml(s, tile.dataset.fleetStatus) + prog +
       '<div class="temps">' + nozzleCell +
-      '<span>' + esc(t('bed')) + ' <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
-      toolRow + fname + prog + '</div></div>';
+      '<span>' + esc(t('bed')) + ' <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span>' +
+      (supported ? layerHtml(s) : '') + '</div>' + toolRow + details + '</div></div>';
     var kind = stateKind(s);
     var busy = supported && s.online === true && (kind === 'printing' || kind === 'paused');
     var selectable = printerSelectable(p);
@@ -6870,13 +12176,9 @@ function render(printers){
     // While a job runs or is paused, selecting and Print... cannot apply, so they
     // are left out rather than shown disabled. Other reasons keep their explanation.
     var hideSend = printerBusy(p);
-    var klipperCamera = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(p.type || '').toLowerCase()) >= 0;
-    var camHtml = CAMERA_TYPES.indexOf(String(p.type || '').toLowerCase()) >= 0 &&
-      (!noCamera[p.target_uuid] || klipperCamera)
-      ? '<button class="cam ghost" type="button" data-uuid="' + esc(p.target_uuid) + '" title="' +
+    var camHtml = '<button class="cam ghost" type="button" data-uuid="' + esc(p.target_uuid) + '" title="' +
         esc(t('cameraButton')) + '" aria-label="' + esc(t('cameraButton')) + '">' +
-        '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 5h2.2l1-1.5h5.6L11.8 5H14v7.5H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><circle cx="8" cy="8.6" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>'
-      : '';
+        '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 5h2.2l1-1.5h5.6L11.8 5H14v7.5H2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><circle cx="8" cy="8.6" r="2" fill="none" stroke="currentColor" stroke-width="1.3"/></svg></button>';
     // Bambu has no LAN web page to open; its full UI lives in OrcaSlicer's Device tab.
     var openHtml = p.type === 'bambu' ? ''
       : '<button class="open ghost">' + esc(t('open')) + '</button>';
@@ -6892,8 +12194,35 @@ function render(printers){
     var historyHtml = '<button class="history ghost">' + esc(t('history')) + '</button>';
     var tlsHtml = tlsProtocol
       ? '<button class="tls-trust primary" type="button">' + esc(t('tlsTrustButton')) + '</button>' : '';
+    var statusHtml = '<div class="status-labels"><span class="src">' +
+      esc(typeLabel(p.type, s)) + '</span><span class="state" title="' +
+      esc(s.error_code ? (s.error || stateText) + ' · ' + s.error_code : (s.error || stateText)) +
+      '">' + esc(stateText) + '</span></div>';
     tile.innerHTML += cardActionsHtml({select:selectHtml, history:historyHtml, print:printHtml,
-      tls:tlsHtml, cam:camHtml, open:openHtml, ctl:ctl});
+      tls:tlsHtml, cam:camHtml, open:openHtml, ctl:ctl, status:statusHtml});
+    var uploaded = s.uploaded_files || [];
+    if (uploaded.length) {
+      var ready = document.createElement('details');
+      var uploadKey = targetKey(p);
+      ready.open = uploadedExpanded.has(uploadKey) ? uploadedExpanded.get(uploadKey) : uploaded.length <= 3;
+      ready.addEventListener('toggle', function(){
+        if (ready.isConnected) uploadedExpanded.set(uploadKey, ready.open);
+      });
+      var summary = document.createElement('summary');
+      summary.textContent = 'Uploaded (' + uploaded.length + ')';
+      ready.appendChild(summary);
+      uploaded.forEach(function(entry){
+        var line = document.createElement('div');
+        line.style.cssText = 'display:flex;gap:8px;align-items:center;justify-content:space-between';
+        var name = document.createElement('span');
+        name.className = 'fname';
+        name.title = entry.path;
+        name.textContent = entry.path;
+        line.append(name, uploadedPrintButton(p, entry));
+        ready.appendChild(line);
+      });
+      tile.appendChild(ready);
+    }
     if (multiTool && s.backend === 'moonraker') bindToolDetails(tile, p, s.tools);
     var selBox = tile.querySelector('.sel');
     if (selBox) selBox.addEventListener('change', function(e){
@@ -6933,11 +12262,22 @@ function render(printers){
       tile.appendChild(q);
     }
     var camBtn = tile.querySelector('.cam');
-    if (camBtn) camBtn.addEventListener('click', function(){ openCamera(p, camBtn); });
+    if (camBtn) {
+      camBtn.title += ' · Shift+click: ' + t('cameraMode');
+      camBtn.addEventListener('click', function(event){ openCamera(p, camBtn, event.shiftKey); });
+    }
     var openBtn = tile.querySelector('.open');
-    if (openBtn && !openBtn.disabled) openBtn.addEventListener('click', function(){
-      var identity = targetIdentity(p); identity.type = 'open'; identity.name = p.name || p.url;
-      orca.postMessage(identity); });
+    if (openBtn && !openBtn.disabled) {
+      openBtn.title = 'Shift+click · ' + t('connectionOptions');
+      openBtn.addEventListener('click', function(event){
+        if (event.shiftKey) {
+          openConnectionOptions(p, 'webui');
+          return;
+        }
+        var identity = targetIdentity(p); identity.type = 'open';
+        orca.postMessage(identity);
+      });
+    }
     var removeBtn = tile.querySelector('.remove');
     var removeIdleMarkup = removeBtn.innerHTML;
     function resetRemove(){
@@ -7015,7 +12355,117 @@ function historyDuration(seconds){
     ? t('historyDurationHoursMinutes', {hours:hours, minutes:minutes})
     : t('historyDurationMinutes', {minutes:minutes});
 }
+var productionSelection = new Set();
+var productionPending = false;
+
+function renderProductionGroups(groups){
+  var section = document.getElementById('production-groups');
+  var names = document.getElementById('production-names');
+  var list = document.getElementById('production-group-list');
+  var scroll = list.scrollLeft;
+  names.replaceChildren();
+  list.replaceChildren();
+  section.hidden = groups.length === 0;
+  groups.forEach(function(group){
+    var option = document.createElement('option');
+    option.value = group.name;
+    names.appendChild(option);
+    var card = document.createElement('button');
+    card.type = 'button'; card.className = 'production-group ghost';
+    card.addEventListener('click', function(){ openAllPrintHistory.call(card, group.name); });
+    var total = group.count + (group.count === 1 ? ' part' : ' parts');
+    var missing = group.missing ? ' · ' + group.missing + ' missing qty' : '';
+    card.title = group.name + ' · ' + total + missing +
+      (group.manual_parts ? ' · includes ' + group.manual_parts + ' manual' : '');
+    if (group.preview) {
+      var image = document.createElement('img');
+      image.src = group.preview;
+      image.alt = '';
+      card.appendChild(image);
+    }
+    var name = document.createElement('span');
+    name.textContent = group.name;
+    var count = document.createElement('strong');
+    count.textContent = group.missing ? (group.count ? '×' + total + ' + ?' : 'Qty needed') : '×' + total;
+    count.setAttribute('aria-label', total + missing);
+    card.append(name, count);
+    var entry = document.createElement('div');
+    entry.className = 'production-group-entry';
+    var adjust = document.createElement('button');
+    adjust.type = 'button'; adjust.className = 'ghost'; adjust.textContent = 'Adjust';
+    adjust.setAttribute('aria-label', 'Adjust completed parts for ' + group.name);
+    adjust.addEventListener('click', function(){ openProductionAdjust(group); });
+    entry.append(card, adjust);
+    list.appendChild(entry);
+  });
+  list.scrollLeft = scroll;
+}
+
+var productionAdjustDialog = document.getElementById('production-adjust');
+var productionAdjustGroup = '';
+var productionAdjustPending = false;
+function openProductionAdjust(group){
+  productionAdjustGroup = group.name;
+  document.getElementById('production-adjust-title').textContent = 'Adjust · ' + group.name;
+  document.getElementById('production-adjust-count').value = group.manual_parts || 0;
+  document.getElementById('production-adjust-status').textContent = '';
+  document.getElementById('production-adjust-save').disabled = productionAdjustPending;
+  productionAdjustDialog.showModal();
+}
+document.getElementById('production-adjust-cancel').addEventListener('click', function(){
+  productionAdjustDialog.close();
+});
+document.getElementById('production-adjust-form').addEventListener('submit', function(event){
+  event.preventDefault();
+  var input = document.getElementById('production-adjust-count');
+  if (productionAdjustPending || !input.checkValidity() || !productionAdjustGroup) return;
+  productionAdjustPending = true;
+  document.getElementById('production-adjust-save').disabled = true;
+  orca.postMessage({type:'production-adjust', name:productionAdjustGroup, parts:input.valueAsNumber});
+});
+
+function assignProduction(remove){
+  var name = document.getElementById('production-name').value.trim();
+  if (!productionSelection.size || productionPending || (!remove && !name)) return;
+  var input = document.getElementById('production-parts');
+  var parts = input.valueAsNumber;
+  var message = document.getElementById('production-message');
+  if (!remove && (!Number.isInteger(parts) || !input.validity.valid)) {
+    message.textContent = 'Enter the number of parts per selected print';
+    input.focus();
+    return;
+  }
+  productionPending = true;
+  message.textContent = '';
+  orca.postMessage({type:'production-assign', name:remove ? '' : name,
+    parts:remove ? null : parts, ids:Array.from(productionSelection)});
+}
+document.getElementById('production-save').addEventListener('click', function(){ assignProduction(false); });
+document.getElementById('production-unassign').addEventListener('click', function(){ assignProduction(true); });
+
+var journalClearScope = '';
+var journalClearPending = false;
+var journalClear = document.getElementById('journal-clear');
+journalClear.addEventListener('click', function(){
+  var scope = journalClearScope;
+  if (journalClear.disabled || !scope) return;
+  askConfirm(t('cfgClearConfirm'), t('cfgClearHistory'), function(){
+    if (journalClearPending || journalClearScope !== scope ||
+        !historyExpected || historyExpected.mode !== 'all') return;
+    journalClearPending = true;
+    journalClear.disabled = true;
+    orca.postMessage({type:'journal-clear-history', scope:scope});
+  });
+});
+
 function beginHistoryView(mode, opener){
+  journalClearScope = '';
+  journalClear.hidden = mode !== 'all';
+  journalClear.disabled = true;
+  journalClear.textContent = t('cfgClearHistory');
+  productionSelection.clear();
+  document.getElementById('production-tools').hidden = mode !== 'all';
+  document.getElementById('production-message').textContent = '';
   historyMode = mode;
   historyOpener = opener || document.activeElement;
   historyRequestSequence += 1;
@@ -7054,8 +12504,12 @@ function openPrintHistory(printer){
   document.getElementById('journal-active-label').parentNode.style.display = 'none';
   identity.type = 'print-history'; identity.requestId = requestId; orca.postMessage(identity);
 }
-function openAllPrintHistory(){
+function openAllPrintHistory(group){
   var requestId = beginHistoryView('all', this);
+  if (typeof group === 'string') {
+    historyExpected.productionGroup = group;
+    document.getElementById('journal-search').value = group;
+  }
   document.getElementById('history-title').textContent = t('journalTitle');
   document.getElementById('journal-all-label').parentNode.style.display = '';
   document.getElementById('journal-completed-label').parentNode.style.display = '';
@@ -7111,6 +12565,8 @@ function renderPrintHistory(payload){
   if (historyExpected.mode === 'all') {
     if (payload.mode !== 'all' || payload.requestId !== historyExpected.requestId) return;
     historyCounts = payload.counts || {};
+    journalClearScope = payload.clearScope || '';
+    journalClear.disabled = journalClearPending || !journalClearScope || !historyCounts.all;
     historyStoreUnavailable = payload.available === false;
     historyHoldsUnavailable = payload.holds_available === false;
     renderJournalHolds(payload.holds || []);
@@ -7142,7 +12598,8 @@ function historyRowHaystack(row){
     t('journalFileUnsent')].join(' ').toLocaleLowerCase();
   var item = row.item;
   var started = item.started_at ? new Date(item.started_at * 1000).toLocaleString() : '';
-  return [item.filename, item.printer_name, item.state, historyStateLabel(item.state), started]
+  return [item.filename, item.printer_name, item.production_group, item.state,
+    item.uploaded ? "Uploaded" : historyStateLabel(item.state), started]
     .join(' ').toLocaleLowerCase();
 }
 function renderHistoryItems(){
@@ -7163,7 +12620,11 @@ function renderHistoryItems(){
     document.getElementById('journal-completed-label').textContent = t('journalCompletedCount', {count:historyCounts.completed || 0});
     document.getElementById('journal-active-label').textContent = t('journalActiveCount', {count:historyCounts.active || 0});
   }
-  var rows = all.filter(function(row){ return !query || historyRowHaystack(row).indexOf(query) >= 0; });
+  var rows = all.filter(function(row){
+    if (historyExpected.productionGroup)
+      return row.item && row.item.production_group === historyExpected.productionGroup;
+    return !query || historyRowHaystack(row).indexOf(query) >= 0;
+  });
   if (!all.length) {
     document.getElementById('history-results').textContent = t('journalResultsCount', {count:0});
     list.innerHTML = '<div class="empty">' + esc(historyMode === 'all' ? t('journalEmptyAll') : t('historyEmpty')) + '</div>';
@@ -7196,12 +12657,41 @@ function renderHistoryItems(){
       var progress = item.progress == null ? '' : t('historyProgress', {progress:item.progress});
       row.innerHTML = '<div class="history-item-top"><span class="history-file" title="' +
         esc(item.filename || t('historyUnknownFile')) + '">' + esc(item.filename || t('historyUnknownFile')) +
-        '</span><span class="history-state" data-state="' + esc(item.state) + '">' + esc(historyStateLabel(item.state)) + '</span></div>' +
+        '</span><span class="history-state" data-state="' + esc(item.state) + '">' + esc(item.uploaded ? "Uploaded" : historyStateLabel(item.state)) + '</span></div>' +
         (historyMode === 'all' ? '<div class="history-printer">' + esc(item.printer_name || t('journalPrinter')) + '</div>' : '') +
         '<div class="history-meta"><span>' + esc(started) + '</span><span>' +
         esc(historyDuration(item.duration_seconds)) + '</span><span>' + esc(source) + '</span>' +
         (progress ? '<span>' + esc(progress) + '</span>' : '') +
         (stored ? '<span>' + esc(formatBytes(stored.size)) + '</span>' : '') + '</div>';
+    }
+    if (item && item.id && historyMode === 'all' && (/^(printing|paused|completed)$/.test(item.state) || item.uploaded)) {
+      var groupLabel = document.createElement('label');
+      groupLabel.className = 'history-group-select';
+      var check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = productionSelection.has(item.id);
+      check.addEventListener('change', function(){
+        if (check.checked) productionSelection.add(item.id);
+        else productionSelection.delete(item.id);
+      });
+      var quantity = item.production_parts == null ? 'Qty needed' : item.production_parts + ' parts';
+      groupLabel.append(check, document.createTextNode(item.production_group
+        ? item.production_group + ' · ' + quantity : 'Select for production group'));
+      row.appendChild(groupLabel);
+    }
+    if (item && item.preview) {
+      var preview = document.createElement('img');
+      preview.src = item.preview;
+      preview.alt = '';
+      preview.loading = 'lazy';
+      preview.style.cssText = 'width:46px;height:46px;object-fit:contain;flex:0 0 46px';
+      row.querySelector('.history-item-top').prepend(preview);
+    }
+    if (item && item.uploaded) {
+      var target = current.find(function(p){
+        return p.target_uuid === item.uploadTarget && p.owner_scope_uuid === item.uploadOwner;
+      });
+      if (target) row.appendChild(uploadedPrintButton(target, item));
     }
     var actions = journalFileActions(entry);
     if (actions) row.appendChild(actions);
@@ -7218,8 +12708,14 @@ function renderHistoryItems(){
 }
 document.getElementById('history-close').addEventListener('click', closePrintHistory);
 document.getElementById('journal-open').addEventListener('click', openAllPrintHistory);
+document.getElementById('camera-wall-open').addEventListener('click', function(){
+  orca.postMessage({type:'camera-wall', width:screen.availWidth, height:screen.availHeight});
+});
 document.getElementById('unassigned-link').addEventListener('click', openAllPrintHistory);
-document.getElementById('journal-search').addEventListener('input', renderHistoryItems);
+document.getElementById('journal-search').addEventListener('input', function(){
+  if (historyExpected) delete historyExpected.productionGroup;
+  renderHistoryItems();
+});
 document.getElementById('history-modal').addEventListener('click', function(event){
   if (event.target === this) closePrintHistory();
 });
@@ -7289,7 +12785,6 @@ document.getElementById('feedback').addEventListener('click', function(){ orca.p
 // and every card cost no camera traffic. The address (checked by Python to be
 // on the printer's own host) reaches the page only as img.src.
 var camState = null, camSeq = 0;
-var noCamera = {};  // target uuid -> true once a lookup found no camera; page memory only
 var CAM_LOOKUP_MS = 12000, CAM_FRAME_MS = 6000, CAM_REFRESH_MS = 2000;
 function camEl(id){ return document.getElementById(id); }
 function camSafeUrl(value){
@@ -7379,7 +12874,7 @@ function camStart(mode){
   camNote(t('cameraLoading'), false);
   load();
 }
-function openCamera(printer, opener){
+function openCamera(printer, opener, settingsOnly){
   if (camState) closeCamera(false);  // one stream at a time
   camEl('cam-mode-save').disabled = false;
   var identity = targetIdentity(printer);
@@ -7387,8 +12882,17 @@ function openCamera(printer, opener){
     identity:targetIdentity(printer), info:null, mode:'', frames:0, errors:0};
   camEl('cam-title').textContent = t('cameraTitle', {printer:printer.name || printer.url});
   var klipper = ['moonraker','klipper','mainsail','fluidd'].indexOf(String(printer.type || '').toLowerCase()) >= 0;
+  state.directWindow = !settingsOnly;
   var modeWrap = camEl('cam-mode-wrap');
-  modeWrap.style.display = klipper ? 'flex' : 'none';
+  modeWrap.style.display = 'flex';
+  camEl('cam-address').value = printer.camera_url || '';
+  camEl('cam-external').checked = printer.camera_external === true;
+  camEl('cam-wall-snapshot').checked = printer.camera_wall_snapshot === true;
+  camEl('cam-rotate').checked = printer.camera_rotate_180 === true;
+  camEl('cam-img').style.transform = printer.camera_rotate_180 === true ? 'rotate(180deg)' : '';
+  camEl('cam-mode').style.display = klipper ? '' : 'none';
+  camEl('cam-mode-label').style.display = klipper ? '' : 'none';
+  camEl('cam-mode-save').textContent = t('connectionSave');
   if (klipper) {
     camEl('cam-mode-label').textContent = t('cameraMode');
     var modeSelect = camEl('cam-mode');
@@ -7408,7 +12912,9 @@ function openCamera(printer, opener){
   state.lookupTimer = setTimeout(function(){
     if (camState === state && !state.info) camFail('cameraUnavailable', false);
   }, CAM_LOOKUP_MS);
-  state.mode = printer.camera_mode === 'snapmaker_u1' ? 'native' : '';
+  if (settingsOnly) { camNote('', false); clearTimeout(state.lookupTimer); return; }
+  state.mode = !printer.camera_url &&
+    (printer.camera_mode === 'snapmaker_u1' || printer.bambu_lan_camera === true) ? 'native' : '';
   identity.type = state.mode === 'native' ? 'camera-native-open' : 'camera-info'; identity.requestId = state.requestId;
   orca.postMessage(identity);
 }
@@ -7455,34 +12961,33 @@ function onCameraNativeFrame(data){
     {time:new Date((hasCaptured ? captured : received)*1000).toLocaleTimeString()}), false);
   state.expiryTimer = setTimeout(function(){ if (camState === state) camFail('cameraUnavailable', false); }, 10000);
 }
-function camMarkNone(state){
-  noCamera[state.uuid] = true;
-  // Keep Klipper's icon available so its camera mode can still be changed.
-  if (state.type && ['moonraker','klipper','mainsail','fluidd'].indexOf(String(state.type).toLowerCase()) >= 0) return;
-  // Ordinary printers without a camera can drop the icon until reload.
-  if (typeof grid === 'undefined' || !grid.querySelectorAll) return;
-  Array.prototype.forEach.call(grid.querySelectorAll('.cam'), function(button){
-    if (button.dataset && button.dataset.uuid === state.uuid && button.remove) button.remove(); });
-}
 function onCameraInfo(data){
   var state = camState;
   if (!state || state.info || data.requestId !== state.requestId || data.targetUuid !== state.uuid) return;
   clearTimeout(state.lookupTimer);
   if (data.ok !== true) {
-    if (data.code === 'no_camera') camMarkNone(state);
     camFail(data.code === 'no_camera' ? 'cameraNone' : 'cameraUnavailable', false); return; }
-  state.info = {stream:camSafeUrl(data.stream), snapshot:camSafeUrl(data.snapshot)};
-  if (!state.info.stream && !state.info.snapshot) { camMarkNone(state); camFail('cameraNone', false); return; }
+  state.info = {stream:camSafeUrl(data.stream), snapshot:camSafeUrl(data.snapshot),
+    windowAvailable:data.windowAvailable === true};
+  if (state.directWindow && data.openInWindow === true && state.info.windowAvailable) {
+    openCameraWindow(state);
+    return;
+  }
+  if (!state.info.stream && !state.info.snapshot && state.info.windowAvailable) {
+    camNote(t('cameraOpenWindow'), true);
+    return;
+  }
+  if (!state.info.stream && !state.info.snapshot) { camFail('cameraNone', false); return; }
   camStart(state.info.stream ? 'stream' : 'snapshot');
 }
 camEl('cam-close').addEventListener('click', function(){ closeCamera(true); });
-camEl('cam-window').addEventListener('click', function(){
-  var state = camState;
+function openCameraWindow(state){
   if (!state || !state.info) return;
-  var request = state.identity; request.type = 'camera-open';
+  var request = Object.assign({}, state.identity, {type:'camera-open'});
   closeCamera(true);
   orca.postMessage(request);
-});
+}
+camEl('cam-window').addEventListener('click', function(){ openCameraWindow(camState); });
 camEl('cam-mode-save').addEventListener('click', function(){
   var state = camState;
   if (!state || state.modeSavePending) return;
@@ -7491,7 +12996,11 @@ camEl('cam-mode-save').addEventListener('click', function(){
   connectionOptionsScope = 'camera-overlay';
   this.disabled = true;
   orca.postMessage(Object.assign({}, connectionOptionsTarget, {type:'connection-options-save',
-    camera_mode:camEl('cam-mode').value}));
+    camera_url:camEl('cam-address').value.trim(),
+    camera_external:camEl('cam-external').checked,
+    camera_wall_snapshot:camEl('cam-wall-snapshot').checked,
+    camera_rotate_180:camEl('cam-rotate').checked,
+    camera_mode:camEl('cam-mode').style.display === 'none' ? 'auto' : camEl('cam-mode').value}));
 });
 camEl('cam-modal').addEventListener('click', function(event){
   if (event.target === camEl('cam-modal')) closeCamera(true);
@@ -7502,7 +13011,8 @@ document.addEventListener('keydown', function(event){
   if (event.key === 'Tab') {
     var focusable = [camEl('cam-close')];
     if (camEl('cam-mode-wrap').style.display !== 'none')
-      focusable.push(camEl('cam-mode'), camEl('cam-mode-save'));
+      focusable.push.apply(focusable, (camEl('cam-mode').style.display === 'none' ? [] : [camEl('cam-mode')]).concat([camEl('cam-address'), camEl('cam-mode-save')]));
+    focusable.push(camEl('cam-external'), camEl('cam-wall-snapshot'), camEl('cam-rotate'));
     if (camEl('cam-window').style.display !== 'none') focusable.push(camEl('cam-window'));
     var index = focusable.indexOf(document.activeElement);
     event.stopImmediatePropagation();
@@ -8014,6 +13524,13 @@ orca.onMessage(function(data){
       orca.postMessage({type:'print-history-all', requestId:historyRequestSequence});
     }
   }
+  if (data.journalPreview && historyExpected) {
+    historyItems.forEach(function(item){
+      if (item.id === data.journalPreview.id) item.preview = data.journalPreview.preview;
+    });
+    renderHistoryItems();
+  }
+  if (data.uploadedReview) openUploadedReview(data.uploadedReview);
   if (data.printerStatus) {
     current.forEach(function(p){
       if (p.target_uuid === data.printerStatus.targetUuid &&
@@ -8025,6 +13542,13 @@ orca.onMessage(function(data){
         p.status = data.printerStatus.status;
     });
     render(current);
+    if (historyExpected) document.querySelectorAll('[data-uploaded-record]').forEach(function(button){
+      var recordId = button.dataset.uploadedRecord;
+      var printer = current.find(function(p){
+        return ((p.status || {}).uploaded_files || []).some(function(file){ return file.id === recordId; });
+      });
+      button.disabled = !uploadedPrinterReady(printer);
+    });
   }
   if (data.available) { lastAvailable = data.available; renderAvailable(); }
   if (data.discovered) { lastDiscovered = data.discovered; renderAvailable(); }
@@ -8062,7 +13586,43 @@ orca.onMessage(function(data){
     renderAvailable();
   }
   if (data.settings) applyPollSettings(data.settings);
+  if (Array.isArray(data.productionGroups)) renderProductionGroups(data.productionGroups);
+  if (typeof data.productionAdjust === 'boolean') {
+    productionAdjustPending = false;
+    document.getElementById('production-adjust-save').disabled = false;
+    if (data.productionAdjust) productionAdjustDialog.close();
+    else document.getElementById('production-adjust-status').textContent = 'Could not save the adjustment';
+  }
+  if (typeof data.journalCleared === 'boolean') {
+    journalClearPending = false;
+    if (historyExpected && historyExpected.mode === 'all') {
+      if (data.journalCleared) {
+        productionSelection.clear();
+        historyRequestSequence += 1; historyExpected.requestId = historyRequestSequence;
+        orca.postMessage({type:'print-history-all', requestId:historyRequestSequence});
+      } else {
+        journalClear.disabled = !journalClearScope || !historyCounts.all;
+        document.getElementById('history-note').textContent = t('journalStoreUnavailable');
+      }
+    }
+  }
+  if (typeof data.productionAssign === 'boolean') {
+    productionPending = false;
+    document.getElementById('production-message').textContent = data.productionAssign ? 'Saved' : 'Could not save group';
+    if (data.productionAssign) {
+      productionSelection.clear();
+      if (historyExpected && historyExpected.mode === 'all') {
+        historyRequestSequence += 1; historyExpected.requestId = historyRequestSequence;
+        orca.postMessage({type:'print-history-all', requestId:historyRequestSequence});
+      }
+    }
+  }
   if (data.printHistory) renderPrintHistory(data.printHistory);
+  if (data.historyChanged && historyExpected && historyExpected.mode === 'all') {
+    historyRequestSequence += 1;
+    historyExpected.requestId = historyRequestSequence;
+    orca.postMessage({type:'print-history-all', requestId:historyRequestSequence});
+  }
   if (typeof data.outboxHint === 'boolean') {
     document.getElementById('outbox-hint-text').textContent = data.outboxHint ? t('outboxHintText') : '';
     document.getElementById('outbox-hint-where').textContent = data.outboxHint ? t('outboxHintWhere') : '';
@@ -8082,7 +13642,6 @@ orca.onMessage(function(data){
       data.connectionOptionsResult.targetUuid === connectionOptionsTarget.targetUuid) {
     document.getElementById('connection-options-save').disabled = false;
     if (data.connectionOptionsResult.ok) {
-      noCamera = {};
       if (connectionOptionsScope === 'camera-overlay') {
         var state = camState;
         if (state) state.modeSavePending = false;
@@ -8169,8 +13728,6 @@ def render_page():
         "__ADAPTER_TYPES__", json.dumps(sorted(_ADAPTER_BACKENDS)),
     ).replace(
         "__CREDENTIAL_TYPES__", json.dumps(sorted(_CREDENTIAL_TYPES)),
-    ).replace(
-        "__CAMERA_TYPES__", json.dumps(sorted(_CAMERA_TYPES)),
     )
 
 
@@ -8184,7 +13741,7 @@ header{padding:5px;display:flex;align-items:center;gap:6px}input{width:min(48ch,
 #note{font-size:11px}details{padding:0 6px 5px}summary{cursor:pointer}p{margin:5px 0}iframe{border:0;width:100%;flex:1;min-height:0;display:block}</style>
 </head><body><header><input id="url" readonly aria-label="URL" value="__URL__"><button id="copy" type="button">__COPY__</button><button id="edit" type="button" __EDIT_ATTR__>__EDIT__</button><span id="note" role="status"></span></header>
 <details id="help"><summary>__HELP_LABEL__</summary><p>__HELP__</p></details>
-<iframe src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
+<iframe style="__ROTATION__" src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
 <script>var u=document.getElementById('url'),n=document.getElementById('note');function failed(){document.getElementById('help').open=true;u.focus();u.select();}
 document.getElementById('copy').addEventListener('click',function(){u.focus();u.select();var ok=false;try{ok=document.execCommand('copy');}catch(e){}if(ok){n.textContent=__COPIED__;return;}if(navigator.clipboard){navigator.clipboard.writeText(u.value).then(function(){n.textContent=__COPIED__;},failed);}else failed();});
 document.getElementById('edit').addEventListener('click',function(){orca.postMessage({type:'viewer-edit-address'});});</script></body></html>"""
@@ -8233,7 +13790,7 @@ def validated_printer_web_url(value):
     ))
 
 
-def render_viewer_page(url, show_edit=True):
+def render_viewer_page(url, show_edit=True, *, rotate=False):
     safe_url = validated_printer_web_url(url)
     if not safe_url:
         return ""
@@ -8253,6 +13810,7 @@ def render_viewer_page(url, show_edit=True):
         "__COPY__": html.escape(ui_text("feedbackCopy")),
         "__EDIT__": html.escape(ui_text("connectionOptions")),
         "__EDIT_ATTR__": "" if show_edit else "hidden",
+        "__ROTATION__": "transform:rotate(180deg)" if rotate else "",
         "__COPIED__": json.dumps(ui_text("feedbackCopied"), ensure_ascii=True).replace("<", "\\u003c"),
         "__HELP_LABEL__": html.escape(ui_text("webuiHelp")),
     }
@@ -8302,7 +13860,6 @@ def render_feedback_page():
 # is accepted only when it points at the printer's own host.
 # --------------------------------------------------------------------------- #
 CAMERA_TIMEOUT = 5
-_CAMERA_TYPES = _MOONRAKER_COMPATIBLE | _OCTOPRINT_COMPATIBLE
 _CAMERA_CODES = frozenset({"no_camera", "unavailable"})
 _CAMERA_URL_MAX = 2048
 # Moonraker services an <img> can show; WebRTC/HLS/iframe streams cannot.
@@ -8338,15 +13895,16 @@ def validated_camera_url(value, printer_url, webui_url=None):
     return safe if same_host else ""
 
 
-def _camera_result(stream="", snapshot="", code=None):
+def _camera_result(stream="", snapshot="", code=None, *, viewer=""):
     if code:
         return {"ok": False, "code": code, "stream": "", "snapshot": ""}
-    if not (stream or snapshot):
+    viewer = viewer or stream or snapshot
+    if not viewer:
         return {"ok": False, "code": "no_camera", "stream": "", "snapshot": ""}
-    return {"ok": True, "code": "", "stream": stream, "snapshot": snapshot}
+    return {"ok": True, "code": "", "stream": stream, "snapshot": snapshot, "viewer": viewer}
 
 
-def _moonraker_camera(printer, base):
+def _moonraker_camera(printer, base, *, snapshots_only=False):
     try:
         data = _get_json(base + "/server/webcams/list", ssl_ctx_for(printer),
                          dict(moonraker_headers(printer), Accept="application/json"),
@@ -8355,16 +13913,25 @@ def _moonraker_camera(printer, base):
         return _camera_result(code="no_camera" if exc.code == 404 else "unavailable")
     result = data.get("result") if isinstance(data, dict) else None
     cams = result.get("webcams") if isinstance(result, dict) else None
+    camera_base = printer.get("webui_url")
+    if snapshots_only:
+        saved_camera = validated_camera_url(printer.get("camera_url"), base, camera_base)
+        if saved_camera:
+            parsed = urllib.parse.urlsplit(saved_camera)
+            camera_base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
     for cam in cams if isinstance(cams, list) else []:
         if not isinstance(cam, dict) or cam.get("enabled") is False:
             continue
         service = cam.get("service")
         service = service.strip().lower() if isinstance(service, str) else ""
-        stream = (validated_camera_url(cam.get("stream_url"), base, printer.get("webui_url"))
-                  if service in _MOONRAKER_MJPEG_SERVICES else "")
-        snapshot = validated_camera_url(cam.get("snapshot_url"), base, printer.get("webui_url"))
-        if stream or snapshot:
-            return _camera_result(stream, snapshot)
+        viewer = validated_camera_url(cam.get("stream_url"), base, printer.get("webui_url"))
+        stream = viewer if service in _MOONRAKER_MJPEG_SERVICES else ""
+        snapshot = validated_camera_url(cam.get("snapshot_url"), base, camera_base)
+        if snapshots_only:
+            if snapshot:
+                return _camera_result(snapshot=snapshot)
+        elif viewer or snapshot:
+            return _camera_result(stream, snapshot, viewer=viewer)
     return _camera_result()
 
 
@@ -8403,6 +13970,9 @@ def camera_lookup(printer):
         backend = backend_for_type((printer or {}).get("type"))
         if not base or not validated_printer_web_url(base):
             return _camera_result(code="unavailable")
+        manual = validated_camera_url(printer.get("camera_url"), base, printer.get("webui_url"))
+        if manual:
+            return _camera_result(viewer=manual)
         if backend == "moonraker":
             return _moonraker_camera(printer, base)
         if backend == "octoprint":
@@ -8425,6 +13995,10 @@ def public_camera_info(result, request_id, printer):
         "code": "" if ok else (code if code in _CAMERA_CODES else "unavailable"),
         "stream": result.get("stream") if ok and isinstance(result.get("stream"), str) else "",
         "snapshot": result.get("snapshot") if ok and isinstance(result.get("snapshot"), str) else "",
+        "windowAvailable": ok and bool(result.get("viewer")),
+        "openInWindow": ok and bool(result.get("viewer")) and (
+            bool((printer or {}).get("camera_url")) or
+            (not result.get("stream") and bool(urllib.parse.urlsplit(result["viewer"]).path.endswith(".html")))),
     }
 
 
@@ -8447,11 +14021,130 @@ class _PageWindowProxy:
         self._page.post_message(payload)
 
 
+_CAMERA_WALL_PAGE = """<!doctype html><meta charset="utf-8"><title>Cameras</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src __FRAMES__; img-src data: __FRAMES__; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<style>
+html,body{height:100%;margin:0;overflow:hidden}
+body{box-sizing:border-box;padding:10px;background:#16191d;color:#eee;font:14px sans-serif}
+#tiles{height:100%;display:grid;gap:8px}
+article{display:grid;grid-template-rows:29px minmax(0,1fr);min-width:0;min-height:0;
+background:#23272b;border:1px solid #394047;border-radius:8px;overflow:hidden}
+button{width:100%;text-align:left;padding:4px 8px;color:inherit;background:#23272b;border:0;
+cursor:pointer;font:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.view{min-width:0;min-height:0;display:grid;place-items:center;background:#101215;overflow:hidden}
+img,iframe{width:100%;height:100%;min-height:0;box-sizing:border-box;border:0;object-fit:contain}
+.view.rotated > img,.view.rotated > iframe{transform:rotate(180deg)}
+#tiles.focused article{display:none}
+#tiles.focused article.active{display:grid;grid-area:1 / 1 / -1 / -1}
+</style>
+<div id="tiles"></div>
+<script>
+const tiles=document.getElementById('tiles'), cards=[];
+const cameraBridge = orca;
+function fitTiles(){
+  let best=0, columns=1, rows=cards.length;
+  for (let c=1;c<=cards.length;c++) {
+    const r=Math.ceil(cards.length/c);
+    const width=(tiles.clientWidth-(c-1)*8)/c;
+    const height=(tiles.clientHeight-(r-1)*8)/r-31;
+    const score=Math.min(width,height*16/9);
+    if (score>best) { best=score; columns=c; rows=r; }
+  }
+  tiles.style.gridTemplateColumns='repeat('+columns+',minmax(0,1fr))';
+  tiles.style.gridTemplateRows='repeat('+Math.max(1,rows)+',minmax(0,1fr))';
+}
+__NAMES__.forEach(({name,rotate},index)=>{
+  const card=document.createElement('article'), button=document.createElement('button'), view=document.createElement('div');
+  button.textContent=name; button.title=name; button.type='button'; view.className=rotate ? 'view rotated' : 'view'; view.textContent=__LOADING__;
+  button.onclick=()=>{
+    const expand=!card.classList.contains('active');
+    cards.forEach(item=>item.card.classList.remove('active'));
+    card.classList.toggle('active',expand);
+    tiles.classList.toggle('focused',expand);
+  };
+  card.append(button,view);tiles.appendChild(card);cards.push({card,view});
+});
+fitTiles();
+window.addEventListener('resize',fitTiles);
+cameraBridge.onMessage(function(data){
+  const item=cards[data.index];
+  if (!item) return;
+  if (data.snapshotUrl) {
+    const url=new URL(data.snapshotUrl);
+    const page=['.html','.htm'].some(ext=>url.pathname.toLowerCase().endsWith(ext));
+    const media=document.createElement(page ? 'iframe' : 'img');
+    if (page) {
+      media.setAttribute('sandbox','allow-same-origin allow-scripts');
+      media.setAttribute('scrolling','no');
+    } else media.alt='';
+    media.referrerPolicy='no-referrer';
+    item.view.replaceChildren(media);
+    function refreshSnapshot(){
+      if (!media.isConnected) return;
+      if (!page) url.searchParams.set('_pf',Date.now());
+      media.src=url.href;
+    }
+    refreshSnapshot();
+    const timer=setInterval(()=>{
+      if (media.isConnected) refreshSnapshot();
+      else clearInterval(timer);
+    },5000);
+  } else if (data.imageUrl) {
+    const image=document.createElement('img');
+    image.alt=''; image.referrerPolicy='no-referrer';
+    image.onerror=()=>cameraBridge.postMessage({type:'image-fallback',index:data.index});
+    image.src=data.imageUrl; item.view.replaceChildren(image);
+  } else if (data.url) {
+    const frame=document.createElement('iframe');
+    frame.setAttribute('sandbox','allow-same-origin allow-scripts allow-forms');
+    frame.allow='autoplay; fullscreen';frame.referrerPolicy='no-referrer';
+    frame.setAttribute('scrolling','no');
+    frame.src=data.url;item.view.replaceChildren(frame);
+  } else if (data.image) {
+    const image=item.image || document.createElement('img');
+    if (!item.image) { item.image=image; image.alt=''; item.view.replaceChildren(image); }
+    image.onload=()=>{
+      image.onload=null;
+      setTimeout(()=>cameraBridge.postMessage({type:'ack',index:data.index,session:data.sessionId,
+        sequence:data.sequence}), item.card.classList.contains('active') ? 0 : 850);
+    };
+    image.src=data.image;
+  } else if (data.error) {
+    item.image=null;item.view.textContent=data.error;
+  }
+});
+cameraBridge.postMessage({type:'ready'});
+</script>"""
+
+
+def render_camera_wall(printers):
+    origins = set()
+    for printer in printers:
+        safe = validated_printer_web_url(printer.get("url"))
+        if safe:
+            host = urllib.parse.urlsplit(safe).hostname
+            if ":" in host:
+                host = "[" + host + "]"
+            origins.update(f"{scheme}://{host}:*" for scheme in ("http", "https"))
+    def js(value):
+        return json.dumps(value, ensure_ascii=True).replace("<", "\\u003c")
+    return (_CAMERA_WALL_PAGE.replace("__FRAMES__", " ".join(sorted(origins)) or "'none'")
+            .replace("__LOADING__", js(ui_text("cameraLoading")))
+            .replace("__NAMES__", js([{"name": p.get("name") or p.get("url"),
+                                       "rotate": p.get("camera_rotate_180") is True}
+                                      for p in printers])))
+
+
 class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE):
 
     def __init__(self):
         super().__init__()
         self._status_cache = {}
+        self._upload_scan_at = {}
+        self._bambu_upload_baselines = {}
+        self._uploaded_reviews = {}
+        self._uploaded_preview_inflight = set()
+        self._uploaded_preview_retry = {}
         self._status_lock = threading.Lock()
         self._poll_host_locks = weakref.WeakValueDictionary()
         self._permission_pending_hosts = set()
@@ -8460,6 +14153,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         self._poll_token = None
         self._discovered_printers = {}
         self._viewers = []
+        self._camera_wall = None
         self._camera_urls = {}  # target uuid -> last validated camera address
         self._u1_camera_lock = threading.RLock()
         self._u1_camera = None
@@ -8539,6 +14233,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         return orca.ExecutionResult.success(ui_text("dashboardOpened"))
 
     def on_close(self):
+        self._close_camera_wall()
         self._cancel_u1_camera()
         self._invalidate_tls_challenges(reset_pending=True)
         self._reset_dashboard_poll()
@@ -8555,6 +14250,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         super().on_load()
 
     def _close_owned_windows(self):
+        self._close_camera_wall()
         self._invalidate_tls_challenges()
         self._reset_dashboard_poll()
         self._cancel_artifact_transfer()
@@ -9317,6 +15013,15 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         elif kind == "print-history-all":
             self._submit_ui_work(self._post_print_history_all, msg,
                                  on_rejected=lambda: self._post_rejected_history(msg, "all"))
+        elif kind == "journal-clear-history":
+            self._submit_ui_work(self._clear_journal_history, msg,
+                                 on_rejected=lambda: self._post({"journalCleared": False}))
+        elif kind == "production-adjust":
+            self._submit_ui_work(self._adjust_production_group, msg,
+                                 on_rejected=lambda: self._post({"productionAdjust": False}))
+        elif kind == "production-assign":
+            self._submit_ui_work(self._assign_production_group, msg,
+                                 on_rejected=lambda: self._post({"productionAssign": False}))
         elif kind == "journal-resolve-hold":
             self._submit_ui_work(self._resolve_journal_hold, msg,
                                  on_rejected=lambda: self._post_action_rejected(msg))
@@ -9324,6 +15029,9 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             confirmation = msg.get("confirmation")
             if isinstance(confirmation, str) and confirmation:
                 self._submit_ui_work(self._import_legacy_and_refresh, confirmation)
+        elif kind in {"uploaded-prepare", "uploaded-start"}:
+            action = self._prepare_uploaded_print if kind == "uploaded-prepare" else self._start_uploaded_print
+            self._submit_target_action(action, msg, "start" if kind == "uploaded-start" else "upload")
         elif kind == "outbox-send":
             self._submit_target_action(self._do_outbox_send, msg, "upload")
         elif kind == "outbox-start-prepare":
@@ -9469,7 +15177,14 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             printer = resolve_printer_target(dashboard_printers(), msg)
             url = printer_webui_url(printer) if printer else ""
             if url:
-                self._open_viewer(url, msg.get("name") or printer.get("name") or url, printer)
+                startfile = getattr(os, "startfile", None)
+                if callable(startfile):
+                    try:
+                        startfile(url)
+                        return
+                    except (OSError, RuntimeError):
+                        pass
+                self._open_viewer(url, printer.get("name") or url, printer)
         elif kind == "feedback":
             try:
                 win = orca.host.ui.create_window(title=ui_text("feedbackButton"), html=render_feedback_page(),
@@ -9489,6 +15204,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             self._ack_u1_camera(msg)
         elif kind == "camera-native-close":
             self._cancel_u1_camera(msg)
+        elif kind == "camera-wall":
+            self._open_camera_wall(msg)
         elif kind == "camera-info":
             self._submit_ui_work(self._post_camera_info, msg,
                                  on_rejected=lambda: self._post({"cameraInfo":
@@ -9501,8 +15218,11 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             cached = self._camera_urls.get(printer.get("target_uuid")) if printer else None
             url = validated_camera_url(cached, printer.get("url")) if cached else ""
             if url:
+                if printer.get("camera_external") and self._open_camera_browser(url):
+                    return
                 self._open_viewer(url, "%s — %s" % (
-                    printer.get("name") or printer.get("url"), ui_text("cameraButton")))
+                    printer.get("name") or printer.get("url"), ui_text("cameraButton")),
+                    rotate=printer.get("camera_rotate_180") is True)
         elif kind == "mass-print":
             self._submit_mass_print(msg)
         elif kind == "mass-start-prepare":
@@ -9527,7 +15247,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
     def _post_camera_info(self, msg):
         request_id = _history_int(msg.get("requestId"), minimum=0, maximum=2**31)
         printer = resolve_printer_target(dashboard_printers(), msg)
-        if printer is not None and backend_for_type(printer.get("type")) in ("moonraker", "octoprint"):
+        if printer is not None:
             result = camera_lookup(printer)
         else:
             result = _camera_result(code="no_camera" if printer else "unavailable")
@@ -9535,10 +15255,10 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 or printer is not None and resolve_printer_target(dashboard_printers(), msg) is None):
             return
         if printer is not None and result.get("ok"):
-            # The window fallback reuses exactly the address the page was given.
+            # A full camera page can use streams the inline image cannot display.
             if len(self._camera_urls) >= 32:
                 self._camera_urls.pop(next(iter(self._camera_urls)))
-            self._camera_urls[printer.get("target_uuid")] = result["stream"] or result["snapshot"]
+            self._camera_urls[printer.get("target_uuid")] = result["viewer"]
         self._post({"cameraInfo": public_camera_info(result, request_id, printer)})
 
     def _connection_options_result(self, msg, ok):
@@ -9566,8 +15286,34 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if raw and not webui:
                 self._connection_options_result(msg, False)
                 return
-            if webui != card.get("webui_url", "") or mode != card.get("camera_mode", "auto"):
+            raw_camera = msg.get("camera_url", card.get("camera_url", ""))
+            if not isinstance(raw_camera, str) or len(raw_camera) > _CAMERA_URL_MAX:
+                self._connection_options_result(msg, False)
+                return
+            camera_url = validated_camera_url(raw_camera, card.get("url"), webui) if raw_camera else ""
+            if raw_camera and not camera_url:
+                self._connection_options_result(msg, False)
+                return
+            external = msg.get("camera_external", card.get("camera_external", False))
+            if type(external) is not bool:
+                self._connection_options_result(msg, False)
+                return
+            external = external and bool(camera_url)
+            wall_snapshot = msg.get("camera_wall_snapshot", card.get("camera_wall_snapshot", False))
+            rotate = msg.get("camera_rotate_180", card.get("camera_rotate_180", False))
+            if type(wall_snapshot) is not bool or type(rotate) is not bool:
+                self._connection_options_result(msg, False)
+                return
+            if (webui != card.get("webui_url", "") or mode != card.get("camera_mode", "auto")
+                    or camera_url != card.get("camera_url", "")
+                    or external != card.get("camera_external", False)
+                    or wall_snapshot != card.get("camera_wall_snapshot", False)
+                    or rotate != card.get("camera_rotate_180", False)):
                 card["webui_url"], card["camera_mode"] = webui, mode
+                card["camera_url"] = camera_url
+                card["camera_external"] = external
+                card["camera_wall_snapshot"] = wall_snapshot
+                card["camera_rotate_180"] = rotate
                 card["binding_revision"] += 1
                 if not save_manual_printers(cards):
                     self._connection_options_result(msg, False)
@@ -9660,8 +15406,10 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         global _U1_CAMERA_OWNER
         printer = resolve_printer_target(dashboard_printers(), msg)
         request_id = msg.get("requestId")
-        if (printer is None or printer.get("camera_mode") != "snapmaker_u1"
-                or backend_for_type(printer.get("type")) != "moonraker"
+        backend = backend_for_type(printer.get("type")) if printer else ""
+        bambu_camera = printer is not None and bambu_lan_camera_supported(printer)
+        u1 = backend == "moonraker" and printer.get("camera_mode") == "snapmaker_u1"
+        if (not (bambu_camera or u1) or printer.get("camera_url")
                 or type(request_id) is not int or not 0 < request_id < 2**31):
             self._post({"cameraNativeFrame": {"ok": False, "requestId": request_id,
                 "targetUuid": msg.get("targetUuid"), "code": "unavailable"}})
@@ -9686,8 +15434,11 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 if not guard():
                     return
                 current = hydrate_credentials(printer)
-                client = _pf_u1_camera.Session(normalize_url(current.get("url")), current.get("apikey", ""),
-                    ssl_ctx_for(current), _pf_creality, guard, publish)
+                if bambu_camera:
+                    client = BambuLanCamera(current, guard, publish)
+                else:
+                    client = _pf_u1_camera.Session(normalize_url(current.get("url")), current.get("apikey", ""),
+                        ssl_ctx_for(current), _pf_creality, guard, publish)
                 with _U1_CAMERA_CLIENTS_LOCK:
                     _U1_CAMERA_CLIENTS.add(client)
                 with self._u1_camera_lock:
@@ -9734,10 +15485,161 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             self._post({"cameraNativeFrame": {"ok": False, "requestId": request_id,
                 "targetUuid": printer["target_uuid"], "code": "thread_denied"}})
 
-    def _open_viewer(self, url, name, printer=None):
+    @staticmethod
+    def _open_camera_browser(url):
+        startfile = getattr(os, "startfile", None)
+        if callable(startfile):
+            try:
+                startfile(url)
+                return True
+            except (OSError, RuntimeError):
+                pass
+        return False
+
+    def _open_camera_wall(self, message):
+        if self._camera_wall is not None:
+            window, _ = self._camera_wall
+            if window is not None and window.is_open():
+                return
+        printers = dashboard_printers()
+        if not printers:
+            self._post_status(ui_text("noPrinters"))
+            return
+        self._cancel_u1_camera()
+        stopped = threading.Event()
+        lock = threading.Lock()
+        clients = {}
+        image_fallbacks = {}
+        state = {"window": None, "started": False, "ready": False}
+        epoch, runtime, root = self._credential_page_epoch, _PLUGIN_RUNTIME_EPOCH, PLUGIN_STORAGE_DIR
+
+        def active():
+            return (not stopped.is_set() and self._accept_actions
+                    and epoch == self._credential_page_epoch
+                    and runtime == _PLUGIN_RUNTIME_EPOCH and root == PLUGIN_STORAGE_DIR)
+
+        def close():
+            stopped.set()
+            with lock:
+                for client in clients.values():
+                    client.cancel()
+            if self._camera_wall and self._camera_wall[0] is state["window"]:
+                self._camera_wall = None
+
+        def send(index, **data):
+            if active():
+                return post_window(state["window"], {"index": index, **data})
+            return False
+
+        def run(index, printer):
+            client = None
+            try:
+                if not active():
+                    return
+                if printer.get("camera_wall_snapshot"):
+                    if backend_for_type(printer.get("type")) == "moonraker":
+                        current = hydrate_credentials(printer)
+                        result = _moonraker_camera(current, normalize_url(current.get("url")),
+                                                   snapshots_only=True)
+                    else:
+                        result = camera_lookup(printer)
+                    snapshot = result.get("snapshot")
+                    if snapshot:
+                        send(index, snapshotUrl=snapshot)
+                    else:
+                        send(index, error="No snapshot URL configured for this camera")
+                    return
+                manual = printer.get("camera_url")
+                if not manual and bambu_lan_camera_supported(printer):
+                    client = BambuLanCamera(hydrate_credentials(printer), active,
+                                            lambda frame: send(index, **frame))
+                elif (not manual and printer.get("camera_mode") == "snapmaker_u1"
+                      and backend_for_type(printer.get("type")) == "moonraker"):
+                    current = hydrate_credentials(printer)
+                    client = _pf_u1_camera.Session(normalize_url(current.get("url")),
+                        current.get("apikey", ""), ssl_ctx_for(current), _pf_creality,
+                        active, lambda frame: send(index, **frame))
+                else:
+                    result = camera_lookup(printer)
+                    if result.get("ok"):
+                        if result.get("stream"):
+                            with lock:
+                                image_fallbacks[index] = result["viewer"]
+                            send(index, imageUrl=result["stream"])
+                        else:
+                            send(index, url=result["viewer"])
+                    else:
+                        send(index, error=ui_text("cameraNone") if result.get("code") == "no_camera"
+                             else ui_text("cameraUnavailable"))
+                    return
+                with lock:
+                    if not active():
+                        return
+                    clients[index] = client
+                client.run()
+            except Exception:
+                send(index, error=ui_text("cameraUnavailable"))
+            finally:
+                if client is not None:
+                    client.cancel()
+                    with lock:
+                        clients.pop(index, None)
+
+        def start():
+            if state["started"] or not state["ready"] or state["window"] is None or not active():
+                return
+            state["started"] = True
+            for index, printer in enumerate(printers):
+                if not start_thread_if_allowed(threading.Thread(target=_run_credential_work,
+                        args=(active, run, index, printer), name="print-farm-camera-tile", daemon=True)):
+                    send(index, error=ui_text("cameraPermissionDenied"))
+
+        def on_message(message):
+            if not isinstance(message, dict) or not active():
+                return
+            if message.get("type") == "ready":
+                state["ready"] = True
+                start()
+            elif message.get("type") == "image-fallback" and type(message.get("index")) is int:
+                index = message["index"]
+                with lock:
+                    url = image_fallbacks.pop(index, None)
+                if url:
+                    send(index, url=url)
+            elif message.get("type") == "ack" and type(message.get("index")) is int:
+                with lock:
+                    client = clients.get(message["index"])
+                    if client and message.get("session") == client.id:
+                        client.acknowledge(message.get("sequence"))
+
+        columns = max(1, math.ceil(math.sqrt(len(printers))))
+        rows = math.ceil(len(printers) / columns)
+        screen_width = _history_int(message.get("width"), 1366, minimum=320, maximum=10000)
+        screen_height = _history_int(message.get("height"), 768, minimum=240, maximum=10000)
+        width = min(screen_width - 40, max(540, 24 + columns * 338))
+        height = min(screen_height - 80, max(360, 24 + rows * 222))
+        try:
+            window = orca.host.ui.create_window(title="Cameras",
+                html=render_camera_wall(printers), width=width, height=height,
+                on_message=on_message, on_close=close)
+            state["window"] = window
+            self._camera_wall = (window, close)
+            start()
+        except Exception:
+            close()
+            self._post_status(ui_text("cameraUnavailable"))
+
+    def _close_camera_wall(self):
+        if self._camera_wall:
+            window, cancel = self._camera_wall
+            cancel()
+            if window is not None:
+                window.close()
+
+    def _open_viewer(self, url, name, printer=None, *, rotate=False):
         # Printer web UI in its own host window — inside Orca, no external browser
         # and without hijacking the dashboard tab. Keep a reference so it lives on.
-        page = render_viewer_page(url, show_edit=printer is not None)
+        page = render_viewer_page(url, show_edit=printer is not None, rotate=rotate)
         if not page:
             return False
         identity = ({"targetUuid": printer.get("target_uuid"),
@@ -9830,6 +15732,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 )
         payload = {
             "printers": [public_printer_record(item) for item in printers],
+            "productionGroups": production_groups(load_print_history()),
             "unmatched": unmatched,
             "unassignedOutbox": [
                 {"file": r.get("file"), "name": r.get("name") or r.get("file"),
@@ -10055,17 +15958,154 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                          and (generation is None or generation == self._list_generation))
         return _run_credential_work(guard, self._poll_into_worker, printer, batch, generation)
 
+    def _verify_uploaded_start(self, printer, status):
+        if status.get("online") is not True or _history_state(status) not in _HISTORY_ACTIVE_STATES:
+            return
+        path = status.get("filename")
+        if not isinstance(path, str) or not path:
+            return
+        bambu = status.get("backend") == "bambu"
+        record = next((r for r in print_history_for_printer(printer)
+                       if r.get("remote_operation") and r.get("state") in _HISTORY_ACTIVE_STATES
+                       and (r.get("uploaded_path") == path
+                            or (bambu and _bambu_upload_name(r.get("uploaded_path") or "") ==
+                                _bambu_upload_name(path)))), None)
+        if not record:
+            return
+        journal = None
+        try:
+            journal = _pf_journal.OperationJournal(
+                os.path.join(os.path.realpath(PLUGIN_STORAGE_DIR), "operations.sqlite3"))
+            operation = journal.get(record["remote_operation"])
+            if operation.get("state") == "submitted":
+                journal.report(record["remote_operation"], "verified",
+                               evidence_ref="printer:matching_active_file", actor="transport")
+        except Exception:
+            pass
+        finally:
+            if journal is not None:
+                journal.close()
+
+    def _queue_uploaded_preview(self, printer, backend, uploaded):
+        key = printer_binding_key(printer)
+        with self._status_lock:
+            if key in self._uploaded_preview_inflight or len(self._uploaded_preview_inflight) >= 2:
+                return
+            self._uploaded_preview_inflight.add(key)
+        if not start_thread_if_allowed(threading.Thread(
+                target=self._load_uploaded_preview,
+                args=(dict(printer), backend, uploaded, key, self._credential_page_epoch),
+                name="print-farm-upload-preview", daemon=True)):
+            with self._status_lock:
+                self._uploaded_preview_inflight.discard(key)
+
+    def _load_uploaded_preview(self, printer, backend, uploaded, key, page_epoch):
+        try:
+            if not self._accept_actions or self._credential_page_epoch != page_epoch:
+                return
+            records = {r["id"]: r for r in print_history_for_printer(printer)}
+            with self._status_lock:
+                now = time.monotonic()
+                self._uploaded_preview_retry = {i: expiry for i, expiry in self._uploaded_preview_retry.items()
+                                                if expiry > now}
+                entry = next((entry for entry in uploaded if entry["id"] in records
+                              and not records[entry["id"]].get("production_preview")
+                              and not records[entry["id"]].get("uploaded_plates")
+                              and entry["id"] not in self._uploaded_preview_retry), None)
+                if entry:
+                    self._uploaded_preview_retry[entry["id"]] = now + 600
+            if not entry:
+                return
+            path = entry["path"]
+            hydrated = printer
+            if backend == "bambu":
+                plates, preview, digest = _inspect_bambu_upload(hydrated, path)
+            else:
+                preview = moonraker_thumbnail(normalize_url(hydrated.get("url")), ssl_ctx_for(hydrated),
+                                              path, moonraker_headers(hydrated))
+            preview = _production_preview(preview)
+            if ((not preview and backend != "bambu") or not self._accept_actions
+                    or self._credential_page_epoch != page_epoch):
+                return
+            with _HISTORY_LOCK:
+                current = load_print_history()
+                record = next((r for r in current if r["id"] == entry["id"]
+                               and r.get("uploaded_path") == path), None)
+                if (record is None or record.get("production_preview") or
+                        record.get("uploaded_modified") != records[entry["id"]].get("uploaded_modified")):
+                    return
+                if preview:
+                    record["production_preview"] = preview
+                if backend == "bambu":
+                    record["uploaded_plates"] = plates
+                    record["uploaded_digest"] = digest
+                if not save_print_history(current):
+                    return
+            if self._accept_actions:
+                self._post({"journalPreview": {"id": entry["id"], "preview": preview}})
+        except Exception:
+            pass  # The printer can still be used when it has no readable preview.
+        finally:
+            with self._status_lock:
+                self._uploaded_preview_inflight.discard(key)
+
     def _poll_into_worker(self, printer, batch=None, generation=None):
         try:
             status = self._poll_with_network_permission(printer)
             if status is None or not POLL_WORKERS.current_job_is_active():
                 return
+            key = printer_binding_key(printer)
+            scan_now = time.monotonic()
+            with self._status_lock:
+                previous = self._status_cache.get(key, {})
+                scan = (status.get("online") is True and status.get("backend") in {"moonraker", "bambu"}
+                        and scan_now - self._upload_scan_at.get(key, -60) >= 30)
+                if scan:
+                    self._upload_scan_at[key] = scan_now
+            history_changed = record_print_observation(printer, status)
+            uploaded = previous.get("uploaded_files", [])
+            self._verify_uploaded_start(printer, status)
+            if scan:
+                try:
+                    if status.get("backend") == "bambu":
+                        candidates = _bambu_uploaded_files(printer)
+                        baseline = self._bambu_upload_baselines.get(key)
+                        baseline_path = _bambu_preview_disk_path(_bambu_tls_identity(printer))
+                        baseline_path = baseline_path.removesuffix(".json") + "-uploads.json" if baseline_path else ""
+                        if baseline is None and baseline_path:
+                            try:
+                                with open(baseline_path, encoding="utf-8") as stream:
+                                    baseline = json.load(stream)
+                                if not isinstance(baseline, dict):
+                                    baseline = None
+                            except (OSError, ValueError):
+                                pass
+                        uploaded, imported = _import_printer_uploads(printer, status, candidates, baseline)
+                        if baseline != candidates:
+                            if baseline_path and not _STORAGE_DENIED:
+                                write_bytes_atomic(baseline_path, json.dumps(candidates).encode("utf-8"))
+                            self._bambu_upload_baselines[key] = candidates
+                        elif key not in self._bambu_upload_baselines:
+                            self._bambu_upload_baselines[key] = baseline
+                    else:
+                        uploaded, imported = scan_moonraker_uploads(printer, status)
+                    history_changed = history_changed or imported
+                    if uploaded:
+                        # Hydrate in the authorized poll context before starting the optional reader.
+                        self._queue_uploaded_preview(hydrate_credentials(printer), status["backend"], uploaded)
+                except Exception:
+                    pass  # A file-list failure must not interrupt live printer status.
+            if status.get("online") is True and uploaded:
+                current_path = status.get("filename") or ""
+                active = _history_state(status) in (_HISTORY_ACTIVE_STATES | {"completed"})
+                status["uploaded_files"] = [entry for entry in uploaded if not active or not (
+                    entry["path"] == current_path or (status.get("backend") == "bambu" and
+                    _bambu_upload_name(entry["path"]) == _bambu_upload_name(current_path)))]
             printer["status"] = status
             with self._status_lock:
                 if generation is not None and generation != self._list_generation:
                     return
                 self._status_cache[printer_binding_key(printer)] = dict(status)
-            history_changed = record_print_observation(printer, status)
             payload = {"printerStatus": {
                 "url": printer.get("url"), "targetUuid": printer.get("target_uuid"),
                 "ownerScope": printer.get("owner_scope_uuid"),
@@ -10075,6 +16115,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 "status": public_status(status),
             }}
             if history_changed:
+                payload["historyChanged"] = True
+                payload["productionGroups"] = production_groups(load_print_history())
                 payload["printHistory"] = {
                     "mode": "printer",
                     "printerKey": printer_history_key(printer),
@@ -10113,6 +16155,10 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if permission_pending:
                 return _transport_failure_status(backend, "network_permission_denied")
             status = poll_printer(printer)
+            if (backend == "moonraker"
+                    and status.get("error_code") in {"timeout", "network_error", "server_error"}
+                    and POLL_WORKERS.current_job_is_active()):
+                status = poll_printer(printer)
             if status.get("error_code") == "network_permission_denied":
                 with self._status_lock:
                     self._permission_pending_hosts.add(host)
@@ -10154,7 +16200,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             except Exception:
                 pass
             self._post({
-                "printers": [public_printer_record(item) for item in printers]
+                "printers": [public_printer_record(item) for item in printers],
+                "productionGroups": production_groups(load_print_history()),
             })
         finally:
             if on_complete is not None:
@@ -10254,6 +16301,149 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         finally:
             for _ in range(completed, len(printers)):
                 batch.finish_one()
+
+    def _uploaded_record(self, printer, record_id):
+        key = printer_history_key(printer)
+        return next((record for record in load_print_history()
+                     if record["id"] == record_id and record["printer_key"] == key
+                     and record["state"] == "sent"
+                     and _uploaded_path_valid(record.get("uploaded_path"))), None)
+
+    def _prepare_uploaded_print(self, msg):
+        printer = resolve_printer_target(dashboard_printers(), msg)
+        if printer is None or not self._work_is_active():
+            return
+        record = self._uploaded_record(printer, msg.get("recordId"))
+        if record is None:
+            self._post_status("Uploaded file is no longer available.")
+            return
+        backend = backend_for_type(printer.get("type"))
+        path = record["uploaded_path"]
+        self._post_status("Checking " + _history_filename(path) + "…")
+        try:
+            if backend == "bambu":
+                hydrated = hydrate_credentials(printer)
+                files = _bambu_uploaded_files(hydrated)
+                if files.get(path) != record.get("uploaded_modified"):
+                    raise ValueError("Uploaded file changed")
+                plates = record.get("uploaded_plates")
+                digest = _history_digest(record.get("uploaded_digest"))
+                if not plates or not digest or files[path] == ":":
+                    plates, _, digest = _inspect_bambu_upload(hydrated, path)
+            elif backend == "moonraker":
+                files = _moonraker_uploaded_files(printer)
+                if files.get(path) != record.get("uploaded_modified"):
+                    raise ValueError("Uploaded file changed")
+                plates, digest = [], None
+            else:
+                return
+        except Exception:
+            self._post_status("Could not verify the uploaded file on the printer.")
+            return
+        if not self._work_is_active() or resolve_printer_target(dashboard_printers(), msg) is None:
+            return
+        token = uuid.uuid4().hex
+        with self._status_lock:
+            now = time.monotonic()
+            self._uploaded_reviews = {k: v for k, v in self._uploaded_reviews.items()
+                                      if v["expires"] > now}
+            self._uploaded_reviews[token] = {
+                "key": printer_binding_key(printer), "id": record["id"],
+                "path": path, "version": record["uploaded_modified"], "plates": plates,
+                "digest": digest, "expires": now + 180,
+            }
+        self._post_status("")
+        self._post({"uploadedReview": {
+            "token": token, "recordId": record["id"], "name": _history_filename(path),
+            "printer": printer.get("name") or printer.get("url"), "plates": plates,
+            "bambu": backend == "bambu", "target": {
+                key: msg.get(key) for key in ("targetUuid", "ownerScope", "targetSelector",
+                                             "bindingRevision", "connectionType", "url")
+            },
+        }})
+
+    def _start_uploaded_print(self, msg):
+        printer = resolve_printer_target(dashboard_printers(), msg)
+        if printer is None or not self._work_is_active() or msg.get("confirmed") is not True:
+            return
+        token = msg.get("token")
+        with self._status_lock:
+            review = self._uploaded_reviews.pop(token, None) if isinstance(token, str) else None
+        plate = msg.get("plate")
+        if (not review or review["expires"] < time.monotonic()
+                or review["key"] != printer_binding_key(printer) or review["id"] != msg.get("recordId")
+                or (plate not in review["plates"] if review["plates"] else plate != "")):
+            self._post_status(ui_text("startApprovalExpired"))
+            return
+        path = review["path"]
+        record = self._uploaded_record(printer, review["id"])
+        if not record or record.get("uploaded_modified") != review["version"]:
+            self._post_status("Uploaded file changed. Select it again.")
+            return
+        backend = backend_for_type(printer.get("type"))
+        try:
+            hydrated = hydrate_credentials(printer)
+            files = (_bambu_uploaded_files(hydrated) if backend == "bambu"
+                     else _moonraker_uploaded_files(hydrated))
+            if files.get(path) != review["version"]:
+                raise ValueError("Uploaded file changed")
+            if backend == "bambu" and files[path] == ":":
+                _, _, digest = _inspect_bambu_upload(hydrated, path)
+                if digest != review["digest"]:
+                    raise ValueError("Uploaded file changed")
+        except Exception:
+            self._post_status("Uploaded file could not be rechecked. Select it again.")
+            return
+        live = poll_printer(printer) or {}
+        current = resolve_printer_target(dashboard_printers(), msg)
+        if current is None or not self._work_is_active():
+            return
+        can_start = status_can_start(live, current)
+        if backend == "moonraker" and _history_state(live) in {"completed", "cancelled"}:
+            can_start = status_can_start(dict(live, state="standby", job_state="standby"), current)
+        if not can_start:
+            self._post_status(ui_text("busyNotStarted", printer=current.get("name") or current.get("url"),
+                                      state=ui_state(live.get("state") or "unknown")))
+            return
+        if backend == "bambu" and not _verified_bambu_serial(current):
+            self._post_status(ui_text("errorNeedsBambuCredentials"))
+            return
+        name = _history_filename(path)
+        dispatch = self._journal_begin(
+            current, "start", artifact_sha256=review["digest"], plate_entry=plate or None,
+            artifact_name=name[:255] if ":" not in name and len(name) <= 255 else None,
+            remote_file={"path": path, "version": review["version"]},
+            start_check={"verdict": "unknown", "operator_checked": True, "bed_clear": True},
+        )
+        if dispatch is None:
+            self._post_status(self._journal_failure_text())
+            return
+        result = {"ok": False}
+        try:
+            if backend == "bambu":
+                base = normalize_url(hydrated.get("url"))
+                host = urllib.parse.urlsplit(base).hostname
+                code = hydrated.get("access_code") or hydrated.get("apikey") or ""
+                serial = str(hydrated.get("serial") or "")
+                result["ok"] = not bambu_start_print(
+                    host, code, serial, urllib.parse.quote(path), msg.get("useAms") is True,
+                    plate, printer=hydrated)
+            else:
+                base = normalize_url(hydrated.get("url"))
+                _post_json(base + "/printer/print/start", ssl_ctx_for(hydrated),
+                           moonraker_headers(hydrated), {"filename": path})
+                result["ok"] = True
+        except Exception:
+            pass
+        finally:
+            self._journal_finish(dispatch, result)
+        if result["ok"]:
+            record_print_started(current, path, remote_operation=dispatch[1])
+            self._post_status(ui_text("fileOperationDone", printer=current.get("name") or current.get("url"),
+                                      name=name, result=ui_text("sentToPrint")))
+        else:
+            self._post_status(ui_text("errorOutcomeUnknown"))
+        self._submit_ui_work(self._refresh_worker, None)
 
     def _prepare_outbox_start(self, msg):
         scheduler, generation = self._ensure_action_scheduler()
@@ -10467,6 +16657,75 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             }
         })
 
+    def _clear_journal_history(self, msg):
+        with _HISTORY_LOCK:
+            scope = _history_clear_scope()
+            cleared = False
+            if scope and msg.get("scope") == scope:
+                load_print_history()
+                if not _HISTORY_STORE_DAMAGED:
+                    cleared = save_print_history([])
+        payload = {"journalCleared": cleared}
+        if cleared:
+            payload["productionGroups"] = []
+        self._post(payload)
+
+    def _adjust_production_group(self, msg):
+        name = _production_group_name(msg.get("name"))
+        parts = _production_parts(msg.get("parts"))
+        saved = False
+        if name and parts is not None:
+            with _HISTORY_LOCK:
+                records = load_print_history()
+                members = [record for record in records
+                           if _production_group_name(record.get("production_group")) == name]
+                if members and not _HISTORY_STORE_DAMAGED:
+                    for record in members:
+                        record["production_manual_parts"] = parts
+                    saved = save_print_history(records)
+        payload = {"productionAdjust": saved}
+        if saved:
+            payload["productionGroups"] = production_groups(records)
+        self._post(payload)
+
+    def _assign_production_group(self, msg):
+        ids = msg.get("ids")
+        if not isinstance(ids, list) or not ids or len(ids) > PRINT_HISTORY_MAX:
+            self._post({"productionAssign": False})
+            return
+        selected = {value for value in ids if isinstance(value, str) and 0 < len(value) <= 80}
+        group = _production_group_name(msg.get("name"))
+        parts = _production_parts(msg.get("parts"))
+        if group and parts is None:
+            self._post({"productionAssign": False})
+            return
+        with _HISTORY_LOCK:
+            records = load_print_history()
+            chosen = [record for record in records if record["id"] in selected
+                      and (record["state"] in (_HISTORY_ACTIVE_STATES | {"completed"})
+                           or (record["state"] == "sent" and record.get("uploaded_path")))]
+            if not selected or len(chosen) != len(selected) or _HISTORY_STORE_DAMAGED:
+                self._post({"productionAssign": False})
+                return
+            manual_parts = max((_production_parts(record.get("production_manual_parts")) or 0
+                                for record in records
+                                if _production_group_name(record.get("production_group")) == group),
+                               default=0) if group else 0
+            for record in chosen:
+                if group:
+                    record["production_group"] = group
+                    record["production_parts"] = parts
+                    record["production_manual_parts"] = manual_parts
+                else:
+                    record.pop("production_group", None)
+                    record.pop("production_parts", None)
+                    record.pop("production_manual_parts", None)
+            saved = save_print_history(records)
+        payload = {"productionAssign": saved}
+        if saved:
+            payload["productionGroups"] = production_groups(records)
+        self._post(payload)
+
     def _post_print_history_all(self, msg):
         apply_history_clear_request()
         records = load_print_history()
@@ -10515,6 +16774,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             "mode": "all",
             "requestId": _history_int(msg.get("requestId"), minimum=0),
             "available": available,
+            "clearScope": _history_clear_scope() if available else "",
             "counts": counts,
             "items": items,
             "holds": holds,
@@ -10565,7 +16825,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             msg.get("historyRequestId", msg.get("requestId")), minimum=0)})
 
     def _journal_begin(self, printer, action, *, artifact_sha256=None,
-                       plate_entry=None, artifact_name=None, start_check=None):
+                       plate_entry=None, artifact_name=None, start_check=None, remote_file=None):
         """Durably claim a target mutation before its first network request."""
         journal = None
         try:
@@ -10589,6 +16849,8 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
                 "serial": str(printer.get("serial") or ""),
                 "repetier_slug": str(printer.get("repetier_slug") or ""),
             }
+            if isinstance(remote_file, dict):
+                binding["remote_file"] = remote_file
             if isinstance(start_check, dict):
                 # The compatibility verdict and the operator's confirmations are
                 # part of the immutable operation intent.
