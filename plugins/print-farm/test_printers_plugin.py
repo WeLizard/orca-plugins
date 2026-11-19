@@ -4127,18 +4127,20 @@ class BambuLanStatsTest(unittest.TestCase):
         self.assertEqual(stats["remaining_minutes"], 75)
         self.assertEqual((stats["layer"], stats["total_layers"]), (120, 300))
         self.assertEqual(stats["print_error"], "%08X" % 83935249)
-        self.assertEqual(stats["ams"], [
-            {"type": "PLA", "color": "#FF8800", "remain": 80},
-            {"type": "PETG", "color": None, "remain": None},
-        ])
+        self.assertEqual(stats["spool_source"], "printer")
+        self.assertEqual([(s["slot"], s["material"], s["color"], s["remain"], s["empty"])
+                          for s in stats["spools"]],
+                         [("A1", "PLA", "#FF8800", 80, False), ("A2", "PETG", None, None, False),
+                          ("A4", None, None, None, True)])
 
     def test_partial_report_leaves_missing_fields_none_not_zero(self):
         stats = self.stats({"nozzle_temper": 30}, "idle")
-        self.assertEqual(stats, dict.fromkeys(self.plugin._BAMBU_STAT_KEYS))
+        self.assertEqual(stats, dict(dict.fromkeys(self.plugin._BAMBU_STAT_KEYS),
+                                     spools=None, spool_source=None))
         stats = self.stats({"mc_remaining_time": 5}, "printing")
         self.assertEqual(stats["remaining_minutes"], 5)
         self.assertIsNone(stats["layer"])
-        self.assertIsNone(stats["ams"])
+        self.assertIsNone(stats["spools"])
         self.assertIsNone(stats["print_error"])
 
     def test_job_numbers_are_ignored_while_idle_and_zero_error_is_none(self):
@@ -4147,7 +4149,7 @@ class BambuLanStatsTest(unittest.TestCase):
         self.assertIsNone(stats["remaining_minutes"])
         self.assertIsNone(stats["layer"])
         self.assertIsNone(stats["print_error"])
-        self.assertIsNotNone(stats["ams"])
+        self.assertIsNotNone(stats["spools"])
         self.assertEqual(self.stats({"mc_remaining_time": "30"}, "paused")["remaining_minutes"], 30)
 
     def test_garbage_and_oversized_values_are_dropped(self):
@@ -4158,19 +4160,38 @@ class BambuLanStatsTest(unittest.TestCase):
                               {"tray_type": "ABS", "tray_color": "12345", "remain": 101}]},
                     "junk", {"tray": "x"}]}}
         stats = self.stats(info)
-        self.assertEqual({k: v for k, v in stats.items() if k != "ams"},
+        self.assertEqual({k: v for k, v in stats.items() if k not in ("spools", "spool_source")},
                          {"remaining_minutes": None, "layer": None, "total_layers": None,
                           "print_error": None})
-        self.assertEqual(stats["ams"], [{"type": "ABS", "color": None, "remain": None}])
+        self.assertEqual(stats["spools"], [self.plugin._spool("", "ABS")])
         for bad in (None, [], "x", 5):
-            self.assertEqual(self.stats(bad), dict.fromkeys(self.plugin._BAMBU_STAT_KEYS))
+            self.assertEqual(self.stats(bad), dict(dict.fromkeys(self.plugin._BAMBU_STAT_KEYS),
+                                                   spools=None, spool_source=None))
         self.assertIsNone(self.stats({"layer_num": 5, "total_layer_num": 3})["layer"])
         big = {"ams": {"ams": [{"tray": [{"tray_type": "PLA"}] * 4}] * 30}}
-        self.assertEqual(len(self.stats(big)["ams"]), 16)
+        self.assertEqual(len(self.stats(big)["spools"]), 16)
 
     def test_no_ams_means_no_ams_field(self):
-        self.assertIsNone(self.stats({"gcode_state": "IDLE", "ams": {"ams": []}}, "idle")["ams"])
-        self.assertIsNone(self.stats({"ams": {}}, "idle")["ams"])
+        self.assertIsNone(self.stats({"gcode_state": "IDLE", "ams": {"ams": []}}, "idle")["spools"])
+        self.assertIsNone(self.stats({"ams": {}}, "idle")["spools"])
+
+    def test_external_spool_ams_ht_and_the_loaded_slot(self):
+        # The external holder is a spool too; the AMS HT unit numbers itself from 0x80
+        # and tray_now points at the slot that feeds the nozzle.
+        info = {"ams": {"tray_now": "129", "ams": [
+                    {"id": "0", "tray": [{"id": "0", "tray_type": "PLA", "tray_color": "FFFFFFFF"}]},
+                    {"id": "129", "tray": [{"id": "0", "tray_type": "PA-CF", "remain": 55}]}]},
+                "vt_tray": {"id": "254", "tray_type": "TPU", "tray_color": "000000FF"}}
+        spools = self.stats(info, "printing")["spools"]
+        self.assertEqual([(s["slot"], s["material"], s["active"], s["external"]) for s in spools],
+                         [("A1", "PLA", False, False), ("HT2", "PA-CF", True, False),
+                          ("", "TPU", False, True)])
+        info["ams"]["tray_now"] = "254"
+        self.assertTrue(self.stats(info, "printing")["spools"][2]["active"])
+        # H2D reports two external holders; an empty one is not a chip.
+        two = {"vir_slot": [{"id": "255", "tray_type": "PLA"}, {"id": "254", "tray_type": ""}]}
+        self.assertEqual([(s["slot"], s["material"]) for s in self.stats(two, "idle")["spools"]],
+                         [("1", "PLA")])
 
     def test_public_status_whitelists_and_revalidates(self):
         status = dict(self.stats(_FULL_BAMBU_REPORT["print"]), online=True, secret="x",
@@ -4180,15 +4201,21 @@ class BambuLanStatsTest(unittest.TestCase):
             self.assertIn(key, self.plugin._PUBLIC_STATUS_FIELDS)
         self.assertNotIn("secret", public)
         self.assertNotIn("access_code", public)
-        self.assertEqual(public["ams"][0], {"type": "PLA", "color": "#FF8800", "remain": 80})
+        self.assertEqual(public["spools"][0], self.plugin._spool("A1", "PLA", "#FF8800", 80))
         hostile = self.plugin.public_status({
             "remaining_minutes": "5", "layer": 9, "total_layers": 3, "print_error": "<b>",
-            "ams": [{"type": "PLA\"><img>", "color": "red"},
-                    {"type": "PLA", "color": "red", "remain": 500}, 7]})
+            "ams": [{"type": "PLA"}], "spool_source": "printer",
+            "spools": [{"slot": "<b>", "material": "PLA\"><img>", "color": "red", "name": "x&y"},
+                       {"slot": "A1", "material": "PLA", "color": "#ff8800", "remain": 500,
+                        "active": 1}, 7]})
         self.assertEqual(hostile, {"remaining_minutes": 5, "layer": None,
                                    "total_layers": None, "print_error": None,
-                                   "ams": [{"type": "PLA", "color": None, "remain": None}]})
-        self.assertNotIn("ams", self.plugin.public_status({"online": True}))
+                                   "spool_source": "printer",
+                                   "spools": [self.plugin._spool(),
+                                              self.plugin._spool("A1", "PLA", "#FF8800")]})
+        self.assertIsNone(self.plugin.public_status(
+            {"spools": [{"material": "PLA"}], "spool_source": "guess"})["spools"])
+        self.assertNotIn("spools", self.plugin.public_status({"online": True}))
 
     def test_poll_bambu_returns_stats_from_a_synthetic_report(self):
         topic = b"device/SERIAL/report"
@@ -4210,7 +4237,7 @@ class BambuLanStatsTest(unittest.TestCase):
         self.assertEqual(status["state"], "printing")
         self.assertEqual((status["remaining_minutes"], status["layer"], status["total_layers"]),
                          (75, 120, 300))
-        self.assertEqual(len(status["ams"]), 2)
+        self.assertEqual(len(status["spools"]), 3)
         public = self.plugin.public_status(self.plugin._finalize_status(status, "bambu"))
         self.assertEqual(public["print_error"], "%08X" % 83935249)
 
@@ -4231,32 +4258,76 @@ class BambuLanStatsTest(unittest.TestCase):
     @unittest.skipUnless(__import__("shutil").which("node"), "node is not available")
     def test_card_rows_exist_only_for_data_and_escape_text(self):
         self.assertEqual(self.render({}), "")
-        self.assertEqual(self.render({"ams": [], "remaining_minutes": None, "layer": 0,
+        self.assertEqual(self.render({}, "spoolsHtml"), "")
+        self.assertEqual(self.render({"spools": [], "remaining_minutes": None, "layer": 0,
                                       "total_layers": 0, "print_error": "00000000"}), "")
-        html = self.render(self.plugin.public_status(self.stats(_FULL_BAMBU_REPORT["print"])))
+        public = self.plugin.public_status(self.stats(_FULL_BAMBU_REPORT["print"]))
+        html = self.render(public)
         self.assertNotIn('bambuLeftHM', html)
-        job = self.render(self.plugin.public_status(self.stats(_FULL_BAMBU_REPORT["print"])), "jobStatsHtml")
-        self.assertIn('bambuLeftHM:1/15', job)
-        self.assertIn('bambuLayer:120/300', job)
-        self.assertIn(" · ", job)
-        self.assertIn('<i style="background:#FF8800"></i>PLA 80%', html)
-        self.assertIn("<i></i>PETG</span>", html)
         self.assertIn('bambuError:%08X' % 83935249, html)
-        self.assertIn("bambuLeftM", self.render({"remaining_minutes": 7}, "jobStatsHtml"))
-        hostile = self.render({"ams": [{"type": "<b>", "color": "red\"onload=x"},
-                                       {"type": "PLA", "color": "#12\"><x", "remain": 5}],
-                               "print_error": "<img>"})
+        self.assertEqual(self.render(public, "jobLeftText"), 'bambuLeftHM:1/15')
+        self.assertEqual(self.render(public, "jobLayerText"), 'bambuLayer:120/300')
+        self.assertIn("bambuLeftM", self.render({"remaining_minutes": 7}, "jobLeftText"))
+        spools = self.render(public, "spoolsHtml")
+        # The swatch darkens by the used share: 80 % left -> 20 % dark.
+        self.assertIn('<i class="sw" style="background:#FF8800"><b style="height:20%"></b></i>PLA</span>',
+                      spools)
+        self.assertIn('<span class="spool vacant" title="spoolSlot:A4 · spoolEmpty"><i class="sw"></i></span>',
+                      spools)
+        self.assertNotIn("spools-src", spools)  # the printer's own report needs no source label
+        job = self.render({"spools": [{"slot": "T1", "material": "PETG"}], "spool_source": "job"},
+                          "spoolsHtml")
+        self.assertIn('<span class="spools-src">spoolsFromJob</span>', job)
+        self.assertIn('title="T1 · PETG"', job)
+        hostile = self.render({"spools": [{"slot": "<b>", "material": "<img>", "name": "<script>",
+                                           "color": "red\"onload=x"},
+                                          {"material": "PLA", "color": "#12\"><x", "remain": 5}],
+                               "print_error": "<img>"}, "spoolsHtml")
         self.assertNotIn("<b>", hostile)
         self.assertNotIn("<img", hostile)
+        self.assertNotIn("<script", hostile)
         self.assertNotIn("onload", hostile)
-        self.assertIn("<i></i>PLA 5%", hostile)
+        self.assertIn('<i class="sw"><b style="height:95%"></b></i>PLA</span>', hostile)
+        self.assertNotIn("<img", self.render({"print_error": "<img>"}))
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node is not available")
+    def test_spool_row_hides_the_tail_but_never_the_active_spool(self):
+        page = self.plugin.PAGE
+        # Chips are 40 px, "+N" is 20 px; the row's width is what the layout measures.
+        script = r"""
+function Chip(i, active){ this.hidden = false; this.title = 't' + i; this.w = 40;
+  this.classList = {contains: function(c){ return c === 'active' && active; }}; }
+var chips = [], more = {hidden: true, textContent: '', title: '', w: 20};
+for (var i = 0; i < 8; i++) chips.push(new Chip(i, i === 5));
+var row = {clientWidth: 200,
+  get scrollWidth(){ return chips.concat([more]).reduce(function(sum, c){ return sum + (c.hidden ? 0 : c.w); }, 0); },
+  querySelectorAll: function(){ return chips; }, querySelector: function(){ return more; }};
+function shown(){ return chips.filter(function(c){ return !c.hidden; }).map(function(c){ return c.title; }); }
+var out = {};
+""" + page[page.index("function fitSpools(row){"):page.index("function fitAllSpools(){")] + r"""
+fitSpools(row); out.narrow = [shown(), more.hidden, more.textContent, more.title];
+row.clientWidth = 400; fitSpools(row); out.wide = [shown(), more.hidden, more.textContent, more.title];
+row.clientWidth = 0; fitSpools(row); out.hiddenTile = [shown().length, more.hidden];
+console.log(JSON.stringify(out));"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "case.js"
+            path.write_text(script, encoding="utf-8")
+            done = subprocess.run(["node", str(path)], capture_output=True, text=True,
+                                  encoding="utf-8", timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)
+        self.assertEqual(out["narrow"], [["t0", "t1", "t2", "t5"], False, "+4", "t3\nt4\nt6\nt7"])
+        self.assertEqual(out["wide"], [["t%d" % i for i in range(8)], True, "", ""])
+        self.assertEqual(out["hiddenTile"], [8, True])
 
     def test_card_only_adds_bambu_rows_for_the_bambu_backend(self):
         page = self.plugin.PAGE
         self.assertEqual(page.count("+= bambuStatsHtml(s)"), 1)
-        self.assertEqual(page.count("+= jobStatsHtml(s)"), 1)
-        self.assertIn("(jobKind === 'printing' || jobKind === 'paused')) fname += jobStatsHtml(s);", page)
-        self.assertIn("=== 'bambu') fname += bambuStatsHtml(s);", page)
+        self.assertIn("var jobActive = supported && (jobKind === 'printing' || jobKind === 'paused');", page)
+        self.assertIn("var left = jobActive ? jobLeftText(s) : '';", page)
+        self.assertIn("var layer = jobActive ? jobLayerText(s) : '';", page)
+        self.assertIn("=== 'bambu') notes += bambuStatsHtml(s);", page)
+        self.assertIn("toolRow + (supported ? spoolsHtml(s) : '') + notes", page)
 
 
 class ThumbnailFetchTest(unittest.TestCase):
@@ -4294,7 +4365,8 @@ class SharedJobStatsTest(unittest.TestCase):
 
     def moonraker(self, objects):
         reply = {"result": {"status": objects}}
-        with mock.patch.object(self.plugin, "_moonraker_extruders", return_value=["extruder"]), \
+        with mock.patch.object(self.plugin, "_moonraker_objects", return_value=(["extruder"], False)), \
+             mock.patch.object(self.plugin, "moonraker_spoolman_spool", return_value=None), \
              mock.patch.object(self.plugin, "_get_json", return_value=reply) as get, \
              mock.patch.object(self.plugin, "moonraker_thumbnail", return_value=""):
             status = self.plugin.poll_moonraker("http://192.0.2.1", None, {"X-Api-Key": "k"})
@@ -4380,15 +4452,123 @@ class SharedJobStatsTest(unittest.TestCase):
     def test_one_render_for_every_backend_and_escaping(self):
         render = BambuLanStatsTest("test_no_ams_means_no_ams_field").render
         public = self.plugin.public_status({"remaining_seconds": 4500, "layer": 3, "total_layers": 9})
-        html = render(public, "jobStatsHtml")
-        self.assertIn("bambuLeftHM:1/15", html)
-        self.assertIn("bambuLayer:3/9", html)
-        self.assertEqual(render({"remaining_seconds": 4500}, "jobStatsHtml"), "")
-        self.assertEqual(render({}, "jobStatsHtml"), "")
-        self.assertEqual(render({"layer": 0, "total_layers": 0}, "jobStatsHtml"), "")
-        hostile = render({"remaining_minutes": 5, "layer": "<b>", "total_layers": 9}, "jobStatsHtml")
-        self.assertIn("bambuLeftM:5", hostile)
-        self.assertNotIn("<b>", hostile)
+        self.assertEqual(render(public, "jobLeftText"), "bambuLeftHM:1/15")
+        self.assertEqual(render(public, "jobLayerText"), "bambuLayer:3/9")
+        for fn in ("jobLeftText", "jobLayerText"):
+            self.assertEqual(render({"remaining_seconds": 4500}, fn), "")
+            self.assertEqual(render({}, fn), "")
+            self.assertEqual(render({"layer": 0, "total_layers": 0}, fn), "")
+        hostile = {"remaining_minutes": 5, "layer": "<b>", "total_layers": 9}
+        self.assertEqual(render(hostile, "jobLeftText"), "bambuLeftM:5")
+        self.assertEqual(render(hostile, "jobLayerText"), "")
+
+
+class CardSpoolsTest(unittest.TestCase):
+    """Spools from Happy Hare, Spoolman, the job's G-code and Flashforge."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = _load_plugin()
+
+    def setUp(self):
+        self.plugin._spoolman_cache.clear()
+        self.plugin._job_filament_cache.clear()
+
+    def moonraker(self, status, *, mmu=False, spoolman=None, job=None):
+        reply = {"result": {"status": status}}
+        with mock.patch.object(self.plugin, "_moonraker_objects", return_value=(["extruder"], mmu)), \
+             mock.patch.object(self.plugin, "moonraker_spoolman_spool", return_value=spoolman) as sm, \
+             mock.patch.object(self.plugin, "moonraker_job_filaments", return_value=job), \
+             mock.patch.object(self.plugin, "_get_json", return_value=reply) as get, \
+             mock.patch.object(self.plugin, "moonraker_thumbnail", return_value=""):
+            result = self.plugin.poll_moonraker("http://192.0.2.1", None, {"X-Api-Key": "k"})
+        return result, get.call_args.args[0], sm.call_count
+
+    def test_happy_hare_gates_come_from_the_same_status_query(self):
+        mmu = {"num_gates": 3, "gate_status": [1, 0, 2], "gate_material": ["PLA", "PETG", "ABS"],
+               "gate_color": ["ff0000", "00ff00", "red"], "gate": 2}
+        status, query, spoolman_calls = self.moonraker(
+            {"print_stats": {"state": "printing", "filename": "a.gcode"}, "mmu": mmu}, mmu=True)
+        self.assertIn("mmu=num_gates,gate_status,gate_material,gate_color,gate", query)
+        self.assertEqual(status["spool_source"], "printer")
+        self.assertEqual([(s["slot"], s["material"], s["color"], s["empty"], s["active"])
+                          for s in status["spools"]],
+                         [("0", "PLA", "#FF0000", False, False), ("1", None, None, True, False),
+                          ("2", "ABS", None, False, True)])
+        self.assertEqual(spoolman_calls, 0, "an MMU's own report wins; Spoolman is not asked")
+        plain, query, _ = self.moonraker({"print_stats": {"state": "standby"}})
+        self.assertNotIn("mmu", query)
+        self.assertIsNone(plain["spools"])
+
+    def test_spoolman_then_job_filaments_when_there_is_no_mmu(self):
+        loaded = self.plugin._spool("", "PETG", "#00FF00", 40, active=True)
+        status, _, _ = self.moonraker({"print_stats": {"state": "printing", "filename": "a.gcode"}},
+                                      spoolman=loaded, job=[self.plugin._spool("", "PLA")])
+        self.assertEqual((status["spool_source"], status["spools"]), ("spoolman", [loaded]))
+        job = [self.plugin._spool("T0", "PLA")]
+        status, _, _ = self.moonraker({"print_stats": {"state": "printing", "filename": "a.gcode"}},
+                                      job=job)
+        self.assertEqual((status["spool_source"], status["spools"]), ("job", job))
+        status, _, _ = self.moonraker({"print_stats": {"state": "standby", "filename": ""}}, job=job)
+        self.assertIsNone(status["spool_source"])
+
+    def test_spoolman_reply_and_lookup_budget(self):
+        spool = {"remaining_weight": 250.0, "initial_weight": 1000,
+                 "filament": {"material": "PLA", "color_hex": "FF8800", "name": "Matte",
+                              "weight": 1000, "vendor": {"name": "Acme"}}}
+        parsed = self.plugin._spoolman_spool({"result": spool})
+        self.assertEqual(parsed, self.plugin._spool("", "PLA", "#FF8800", 25, name="Acme Matte",
+                                                    active=True))
+        self.assertEqual(self.plugin._spoolman_spool({"result": {"response": spool, "error": None}}),
+                         parsed)
+        self.assertIsNone(self.plugin._spoolman_spool({"result": {"filament": {}}}))
+        # Without the Spoolman component Moonraker answers 404: ask again only after ten minutes.
+        missing = urllib.error.HTTPError("http://h/server/spoolman/spool_id", 404, "Not Found", {}, None)
+        with mock.patch.object(self.plugin, "_get_bounded_json", side_effect=missing) as get:
+            self.assertIsNone(self.plugin.moonraker_spoolman_spool("http://h", None))
+            self.assertIsNone(self.plugin.moonraker_spoolman_spool("http://h", None))
+        self.assertEqual(get.call_count, 1)
+        self.plugin._spoolman_cache.clear()
+        with mock.patch.object(self.plugin, "_get_bounded_json",
+                               return_value={"result": {"spool_id": 7}}) as get, \
+             mock.patch.object(self.plugin, "_post_bounded_json", return_value={"result": spool}) as post:
+            self.assertEqual(self.plugin.moonraker_spoolman_spool("http://h", None), parsed)
+            self.assertEqual(self.plugin.moonraker_spoolman_spool("http://h", None), parsed)
+        self.assertEqual((get.call_count, post.call_count), (1, 1))
+        self.assertEqual(post.call_args.args[3], {"request_method": "GET", "path": "/v1/spool/7"})
+
+    def test_job_filaments_come_with_the_thumbnail_metadata(self):
+        meta = {"result": {"filament_type": "PLA;PETG;ABS", "filament_name": "Basic;HF;<b>",
+                           "filament_colors": ["#FFFFFF", "#000000", "#FF0000"],
+                           "referenced_tools": [2, 0, 9]}}
+        with mock.patch.object(self.plugin, "_get_json", return_value=meta) as get:
+            self.plugin.moonraker_thumbnail("http://h", None, "a.gcode")
+        self.assertEqual(get.call_count, 1)
+        spools = self.plugin.moonraker_job_filaments("http://h", "a.gcode")
+        self.assertEqual([(s["slot"], s["material"], s["color"], s["name"]) for s in spools],
+                         [("T0", "PLA", "#FFFFFF", "Basic"), ("T2", "ABS", "#FF0000", None)])
+        self.assertIsNone(self.plugin.moonraker_job_filaments("http://h", "a.gcode", {"X-Api-Key": "other"}))
+        single = self.plugin._metadata_filaments({"filament_type": "PETG", "filament_colors": ["#00FF00"]})
+        self.assertEqual(single, [self.plugin._spool("", "PETG", "#00FF00")])
+        self.assertIsNone(self.plugin._metadata_filaments({"thumbnails": []}))
+
+    def test_flashforge_station_and_single_spool(self):
+        adapter = self.plugin._pf_flashforge
+        detail = {"matlStationInfo": {"currentSlot": 2, "slotCnt": 4, "slotInfos": [
+            {"slotId": 1, "hasFilament": True, "materialName": "PLA", "materialColor": "#FFFFFF"},
+            {"slotId": 2, "hasFilament": 1, "materialName": "PETG", "materialColor": "#00FF00FF"},
+            {"slotId": 3, "hasFilament": False, "materialName": "PLA", "materialColor": "#000000"},
+            {"slotId": 99, "hasFilament": True}]}}
+        spools = adapter._spools(detail, "ad5x")
+        self.assertEqual(spools["spool_source"], "printer")
+        self.assertEqual([(s["slot"], s["material"], s["color"], s["active"], s["empty"])
+                          for s in spools["spools"]],
+                         [("1", "PLA", "#FFFFFF", False, False), ("2", "PETG", "#00FF00", True, False),
+                          ("3", None, None, False, True)])
+        self.assertEqual(adapter._spools({"rightFilamentType": "PLA"}, "adventurer_5m")["spools"],
+                         [{"slot": "", "material": "PLA", "active": True}])
+        self.assertEqual(adapter._spools({"rightFilamentType": "?"}, "adventurer_5m"), {})
+        self.assertEqual(adapter._spools({}, "ad5x"), {})
 
 
 class PrinterNetworkPermissionTest(unittest.TestCase):
@@ -4985,6 +5165,7 @@ var CAMERA_TYPES = ['moonraker', 'klipper', 'octoprint', 'bambu'], noCamera = {}
 var current = [], selected = {}, ftpsTrustIssues = {};
 function targetKey(p){ return p.target_uuid; }
 function statusControlReady(p, action){ return true; }
+function fitAllSpools(){}   // spool-row fitting has its own test
 """ + _page_slice("function stateKind(s){", "function statusControlReady(p, action){") \
             + _page_slice("function cardActionsHtml(parts){", "function render(printers){") + r"""
 function build(p, noCam){

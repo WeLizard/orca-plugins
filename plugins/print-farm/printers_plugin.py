@@ -7,7 +7,7 @@
 # name = "Print Farm"
 # description = "Cross-vendor print farm dashboard: live status, temperatures, print progress and thumbnails, one click to each printer's web interface, and G-code delivery to several printers at once."
 # author = "FilamentHub"
-# version = "0.1.2"
+# version = "0.1.3"
 #
 # # Printers live on user-chosen LAN addresses no static allow-list can enumerate,
 # # so this declares intent for a future "local-network" permission class.
@@ -477,7 +477,7 @@ def post_window(window, payload):
 # version from this (dynamic version), and build_package.py validates that the
 # PEP 723 `# version` comment matches it — so the manifest and the wheel can't
 # drift.
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
 
 ORCA_UI_LOCALES = (
     "ca", "cs", "de", "en", "es", "eu", "fr", "hu", "it", "ja", "ko",
@@ -1826,7 +1826,8 @@ _PUBLIC_STATUS_FIELDS = frozenset({
     "upload_reason", "capabilities",
     "model", "model_family", "firmware", "identity_verified", "raw_state",
     "control_reason",
-    "remaining_minutes", "remaining_seconds", "layer", "total_layers", "ams", "print_error",
+    "remaining_minutes", "remaining_seconds", "layer", "total_layers", "print_error",
+    "spools", "spool_source",
 })
 _PUBLIC_TOOL_FIELDS = frozenset({"index", "name", "current", "target", "state", "active"})
 _MAX_PUBLIC_TOOLS = 16
@@ -1973,6 +1974,8 @@ def public_status(status):
         result["identity_verified"] = result["identity_verified"] is True
     if any(key in result for key in _BAMBU_STAT_KEYS):
         result.update(_public_bambu_stats(result))
+    if "spools" in result or "spool_source" in result:
+        result.update(_public_spools(result))
     if "remaining_seconds" in result:
         seconds = _remaining_seconds(result["remaining_seconds"])
         result["remaining_seconds"] = seconds
@@ -2100,19 +2103,59 @@ def _thumb_store(key, value):
         _thumb_cache.pop(next(iter(_thumb_cache)))
 
 
+def _moonraker_file_key(base, filename, headers):
+    # Authenticated file data must not be reused for another account.
+    return (base, filename, hashlib.sha256(
+        (headers or {}).get("X-Api-Key", "").encode("utf-8")
+    ).hexdigest())
+
+
+# Filaments a job's G-code was sliced for, read from the same metadata reply as
+# its thumbnail and kept as long as that thumbnail is.
+_job_filament_cache = {}
+
+
+def _metadata_filaments(meta):
+    """Spools the slicer wrote into the G-code (type, name, colour per tool), or None."""
+    if not isinstance(meta, dict):
+        return None
+    types, names, colors = meta.get("filament_type"), meta.get("filament_name"), meta.get("filament_colors")
+    types = types.split(";") if isinstance(types, str) else []
+    names = names.split(";") if isinstance(names, str) else []
+    colors = colors if isinstance(colors, list) else []
+    count = min(max(len(types), len(colors)), 64)
+    used = meta.get("referenced_tools")
+    if isinstance(used, list) and used:
+        indexes = sorted({i for i in used if type(i) is int and 0 <= i < count})
+    else:
+        indexes = list(range(count))
+    spools = []
+    for i in indexes[:_MAX_SPOOLS]:
+        spools.append(_spool("T%d" % i if count > 1 else "",
+                             _spool_text(types[i] if i < len(types) else None, 16),
+                             _spool_color(colors[i] if i < len(colors) else None),
+                             name=_spool_text(names[i] if i < len(names) else None, 40)))
+    return spools if any(s["material"] or s["color"] for s in spools) else None
+
+
+def moonraker_job_filaments(base, filename, headers=None):
+    """Filaments of the loaded job, from the cached metadata; None if not read yet."""
+    return _job_filament_cache.get(_moonraker_file_key(base, filename, headers)) if filename else None
+
+
 def moonraker_thumbnail(base, ctx, filename, headers=None):
     if not filename:
         return ""
-    # An authenticated thumbnail must not be reused for another account.
-    key = (base, filename, hashlib.sha256(
-        (headers or {}).get("X-Api-Key", "").encode("utf-8")
-    ).hexdigest())
+    key = _moonraker_file_key(base, filename, headers)
     cached = _thumb_lookup(key)
     if cached is not None:
         return cached
     result = ""
     try:
         meta = _get_json(base + "/server/files/metadata?filename=" + urllib.parse.quote(filename), ctx, headers)
+        _job_filament_cache[key] = _metadata_filaments(meta.get("result"))
+        if len(_job_filament_cache) > 64:
+            _job_filament_cache.pop(next(iter(_job_filament_cache)))
         thumbs = meta.get("result", {}).get("thumbnails", [])
         if thumbs:
             best = max(thumbs, key=lambda t: t.get("size", 0))
@@ -2174,13 +2217,13 @@ def _moonraker_job_stats(state, print_stats, sdcard):
     return remaining, layer, total
 
 
-def _moonraker_extruders(base, ctx, headers):
-    """Discover only Klipper extruder objects, with a bounded query inventory."""
+def _moonraker_objects(base, ctx, headers):
+    """Klipper extruder objects and whether a Happy Hare unit exists, from one bounded list."""
     try:
         data = _get_bounded_json(base + "/printer/objects/list", ctx, headers)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            return ["extruder"]  # Older servers without object discovery.
+            return ["extruder"], False  # Older servers without object discovery.
         raise
     result = data.get("result") if isinstance(data, dict) else None
     objects = result.get("objects") if isinstance(result, dict) else None
@@ -2193,12 +2236,112 @@ def _moonraker_extruders(base, ctx, headers):
         if (len(name) <= 32 and re.fullmatch(r"extruder(?:[1-9][0-9]*)?", name)
                 and int(name[8:] or "0") < 2**53):
             names.add(name)
-    return sorted(names, key=lambda name: int(name[8:] or "0"))[:_MAX_PUBLIC_TOOLS]
+    return sorted(names, key=lambda name: int(name[8:] or "0"))[:_MAX_PUBLIC_TOOLS], "mmu" in objects
+
+
+# Happy Hare fields a card needs; gate_status 0 is an empty gate, gate -2 the bypass.
+_HAPPY_HARE_FIELDS = ("num_gates", "gate_status", "gate_material", "gate_color", "gate")
+
+
+def _happy_hare_spools(mmu):
+    """Gates of a Happy Hare unit as card spools, numbered from 0 as Happy Hare does."""
+    if not isinstance(mmu, dict):
+        return None
+    count = mmu.get("num_gates")
+    if type(count) is not int or not 1 <= count <= 256:
+        return None
+    current = mmu.get("gate")
+
+    def at(key, index):
+        values = mmu.get(key)
+        return values[index] if isinstance(values, list) and index < len(values) else None
+
+    spools = []
+    for gate in range(min(count, _MAX_SPOOLS)):
+        empty = at("gate_status", gate) == 0
+        spools.append(_spool(str(gate),
+                             None if empty else _spool_text(at("gate_material", gate), 16),
+                             None if empty else _spool_color(at("gate_color", gate)),
+                             active=type(current) is int and current == gate, empty=empty))
+    return spools
+
+
+# Spoolman through Moonraker: the active spool is read at most once a minute per
+# printer, and a server without the Spoolman component is asked again after ten.
+_SPOOLMAN_TTL_SECONDS = 60
+_SPOOLMAN_ABSENT_SECONDS = 600
+_spoolman_cache = {}
+
+
+def _post_bounded_json(url, ctx, headers=None, payload=None, timeout=HTTP_TIMEOUT,
+                       max_bytes=256 * 1024):
+    hdrs = {"Content-Type": "application/json", "Accept": "application/json"}
+    hdrs.update(headers or {})
+    body = json.dumps(payload if payload is not None else {}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=hdrs, method="POST")
+    with _urlopen_no_redirect(req, timeout=timeout, context=ctx) as response:
+        raw = response.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError("JSON response exceeds limit")
+    return json.loads(raw.decode("utf-8"))
+
+
+def _spoolman_spool(reply):
+    """The active spool from a Spoolman /v1/spool reply, proxied by Moonraker."""
+    result = reply.get("result") if isinstance(reply, dict) else None
+    if isinstance(result, dict) and "filament" not in result and isinstance(result.get("response"), dict):
+        result = result["response"]  # Moonraker's v2 proxy envelope
+    if not isinstance(result, dict):
+        return None
+    filament = result.get("filament") if isinstance(result.get("filament"), dict) else {}
+    vendor = filament.get("vendor") if isinstance(filament.get("vendor"), dict) else {}
+
+    def number(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+
+    remaining = number(result.get("remaining_weight"))
+    total = number(result.get("initial_weight")) or number(filament.get("weight"))
+    remain = (max(0, min(100, int(round(remaining * 100 / total))))
+              if remaining is not None and total else None)
+    name = " ".join(part.strip() for part in (vendor.get("name"), filament.get("name"))
+                    if isinstance(part, str) and part.strip())
+    spool = _spool("", _spool_text(filament.get("material"), 16), _spool_color(filament.get("color_hex")),
+                   remain, name=_spool_text(name, 40), active=True)
+    return spool if spool["material"] or spool["color"] else None
+
+
+def moonraker_spoolman_spool(base, ctx, headers=None):
+    """The spool Spoolman marks as loaded on this printer, or None."""
+    key = _moonraker_file_key(base, "", headers)
+    now = time.monotonic()
+    entry = _spoolman_cache.get(key)
+    if entry is not None and now < entry[0]:
+        return entry[1]
+    spool, ttl = None, _SPOOLMAN_TTL_SECONDS
+    try:
+        data = _get_bounded_json(base + "/server/spoolman/spool_id", ctx, headers, max_bytes=16 * 1024)
+        result = data.get("result") if isinstance(data, dict) else None
+        spool_id = result.get("spool_id") if isinstance(result, dict) else None
+        if type(spool_id) is int and spool_id > 0:
+            spool = _spoolman_spool(_post_bounded_json(
+                base + "/server/spoolman/proxy", ctx, headers,
+                {"request_method": "GET", "path": "/v1/spool/%d" % spool_id}))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 404):
+            ttl = _SPOOLMAN_ABSENT_SECONDS  # Moonraker runs without Spoolman
+    except Exception:
+        pass
+    _spoolman_cache[key] = (now + ttl, spool)
+    if len(_spoolman_cache) > 64:
+        _spoolman_cache.pop(next(iter(_spoolman_cache)))
+    return spool
 
 
 def poll_moonraker(base, ctx, headers=None):
-    names = _moonraker_extruders(base, ctx, headers)
+    names, has_mmu = _moonraker_objects(base, ctx, headers)
     objects = names + ["heater_bed", "print_stats", "display_status", "virtual_sdcard", "toolhead"]
+    if has_mmu:
+        objects.append("mmu=" + ",".join(_HAPPY_HARE_FIELDS))
     query = "/printer/objects/query?" + "&".join(objects)
     data = _get_json(base + query, ctx, headers)
     result = data.get("result") if isinstance(data, dict) else None
@@ -2233,6 +2376,17 @@ def poll_moonraker(base, ctx, headers=None):
     progress = (round(raw_progress * 100)
                 if isinstance(raw_progress, (int, float)) and not isinstance(raw_progress, bool)
                 else None)
+    # Show the loaded file's thumbnail whenever one is loaded (printing,
+    # paused or just finished) — not only while actively printing.
+    thumbnail = moonraker_thumbnail(base, ctx, filename, headers) if filename else ""
+    # Spools: what the MMU reports, else Spoolman's loaded spool, else what the
+    # job was sliced for. Each source is labelled on the card.
+    spools, source = (_happy_hare_spools(status.get("mmu")) if has_mmu else None), "printer"
+    if not spools:
+        spoolman = moonraker_spoolman_spool(base, ctx, headers)
+        spools, source = ([spoolman] if spoolman else None), "spoolman"
+    if not spools and filename:
+        spools, source = moonraker_job_filaments(base, filename, headers), "job"
     return {
         "online": True,
         "state": state,
@@ -2249,9 +2403,9 @@ def poll_moonraker(base, ctx, headers=None):
         "remaining_seconds": remaining_seconds,
         "layer": layer,
         "total_layers": total_layers,
-        # Show the loaded file's thumbnail whenever one is loaded (printing,
-        # paused or just finished) — not only while actively printing.
-        "thumbnail": moonraker_thumbnail(base, ctx, filename, headers) if filename else "",
+        "thumbnail": thumbnail,
+        "spools": spools or None,
+        "spool_source": source if spools else None,
     }
 
 
@@ -2354,10 +2508,9 @@ _BAMBU_STATES = {
 }
 
 
-_BAMBU_STAT_KEYS = ("remaining_minutes", "layer", "total_layers", "ams", "print_error")
+_BAMBU_STAT_KEYS = ("remaining_minutes", "layer", "total_layers", "print_error")
 _BAMBU_MAX_MINUTES = 100000
 _BAMBU_MAX_LAYERS = 100000
-_BAMBU_MAX_TRAYS = 16
 _BAMBU_TYPE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 +\-]{0,15}")
 _BAMBU_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{6}")
 _BAMBU_ERROR_RE = re.compile(r"[0-9A-F]{8}")
@@ -2374,6 +2527,61 @@ def _bambu_int(value, low, high):
     if not isinstance(value, int):
         return None
     return value if low <= value <= high else None
+
+
+# Spools a card shows: one list for every backend. Each entry is a printer
+# slot (or the single spool) with what is known about it; "spool_source" says
+# who knows it: the printer itself, Spoolman, or the G-code of the current job.
+_MAX_SPOOLS = 16
+_SPOOL_SOURCES = frozenset({"printer", "spoolman", "job"})
+_SPOOL_TEXT_RE = re.compile(r"[^\x00-\x1f\x7f<>\"&]+")
+_SPOOL_SLOT_RE = re.compile(r"[A-Za-z0-9]{1,4}")
+
+
+def _spool_text(value, limit):
+    if not isinstance(value, str):
+        return None
+    value = " ".join(value.split())[:limit].strip()
+    return value if value and _SPOOL_TEXT_RE.fullmatch(value) else None
+
+
+def _spool_color(value):
+    """#RRGGBB from RRGGBB / #RRGGBB / RRGGBBAA; alpha 00 marks an unknown colour."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lstrip("#")
+    if len(value) == 8:
+        if value[6:] == "00":
+            return None
+        value = value[:6]
+    return "#" + value.upper() if re.fullmatch(r"[0-9A-Fa-f]{6}", value) else None
+
+
+def _spool(slot="", material=None, color=None, remain=None, *, name=None,
+           active=False, empty=False, external=False):
+    return {"slot": slot, "material": material, "name": name, "color": color,
+            "remain": remain, "active": active is True, "empty": empty is True,
+            "external": external is True}
+
+
+def _public_spools(result):
+    """Re-validate the spools of a status before they reach the page."""
+    spools = []
+    raw = result.get("spools")
+    for item in (raw if isinstance(raw, list) else [])[:_MAX_SPOOLS]:
+        if not isinstance(item, dict):
+            continue
+        slot, remain = item.get("slot"), item.get("remain")
+        spools.append(_spool(
+            slot if isinstance(slot, str) and _SPOOL_SLOT_RE.fullmatch(slot) else "",
+            _spool_text(item.get("material"), 16), _spool_color(item.get("color")),
+            remain if type(remain) is int and 0 <= remain <= 100 else None,
+            name=_spool_text(item.get("name"), 40), active=item.get("active"),
+            empty=item.get("empty"), external=item.get("external")))
+    source = result.get("spool_source")
+    if not spools or source not in _SPOOL_SOURCES:
+        return {"spools": None, "spool_source": None}
+    return {"spools": spools, "spool_source": source}
 
 
 def _bambu_tray(raw):
@@ -2395,9 +2603,64 @@ def _bambu_tray(raw):
     return {"type": kind, "color": color, "remain": _bambu_int(raw.get("remain"), 0, 100)}
 
 
+# Single-slot units (AMS HT) carry their own number from 0x80 instead of unit*4+slot,
+# and tray_now reports them that way as well.
+_BAMBU_WIDE_UNIT_BASE = 128
+
+
+def _bambu_spools(info):
+    """AMS trays and external holders as card spools; None when the report has neither."""
+    feed = info.get("ams")
+    feed = feed if isinstance(feed, dict) else {}
+    units = feed.get("ams")
+    active = _bambu_int(feed.get("tray_now"), 0, 255)
+    spools = []
+    for unit in (units[:8] if isinstance(units, list) else []):
+        if not isinstance(unit, dict):
+            continue
+        unit_id = _bambu_int(unit.get("id"), 0, 255)
+        raw_trays = unit.get("tray")
+        for raw in (raw_trays[:4] if isinstance(raw_trays, list) else []):
+            if (not isinstance(raw, dict) or "tray_slot_placeholder" in raw
+                    or len(spools) >= _MAX_SPOOLS):
+                continue
+            slot_id = _bambu_int(raw.get("id"), 0, 3)
+            if unit_id is not None and unit_id >= _BAMBU_WIDE_UNIT_BASE:
+                label, index = "HT%d" % (unit_id - _BAMBU_WIDE_UNIT_BASE + 1), unit_id
+            elif unit_id is not None and unit_id < 8 and slot_id is not None:
+                label, index = "ABCDEFGH"[unit_id] + str(slot_id + 1), unit_id * 4 + slot_id
+            else:
+                label, index = "", None
+            kind = raw.get("tray_type")
+            if kind is None or (isinstance(kind, str) and not kind.strip()):
+                spools.append(_spool(label, empty=True))
+                continue
+            tray = _bambu_tray(raw)
+            if tray is not None:
+                spools.append(_spool(label, tray["type"], tray["color"], tray["remain"],
+                                     name=_spool_text(raw.get("tray_sub_brands"), 40),
+                                     active=index is not None and index == active))
+    holders = info.get("vir_slot")
+    if not isinstance(holders, list):
+        holder = info.get("vt_tray")
+        holders = [holder] if isinstance(holder, dict) else []
+    holders = [holder for holder in holders[:2] if isinstance(holder, dict)]
+    for number, holder in enumerate(holders):
+        tray = _bambu_tray(holder)
+        if tray is None or len(spools) >= _MAX_SPOOLS:
+            continue  # an empty external holder tells nothing worth a chip
+        holder_id = _bambu_int(holder.get("id"), 0, 255)
+        spools.append(_spool("" if len(holders) == 1 else str(number + 1), tray["type"],
+                             tray["color"], tray["remain"],
+                             name=_spool_text(holder.get("tray_sub_brands"), 40),
+                             active=holder_id is not None and holder_id == active,
+                             external=True))
+    return spools or None
+
+
 def _bambu_stats(info, state):
     """Statistics Bambu already puts in its report. Absent or invalid -> None."""
-    stats = dict.fromkeys(_BAMBU_STAT_KEYS)
+    stats = dict.fromkeys(_BAMBU_STAT_KEYS + ("spools", "spool_source"))
     if not isinstance(info, dict):
         return stats
     if state in ("printing", "paused"):
@@ -2406,16 +2669,9 @@ def _bambu_stats(info, state):
         layer = _bambu_int(info.get("layer_num"), 0, _BAMBU_MAX_LAYERS)
         if total is not None and layer is not None and layer <= total:
             stats["layer"], stats["total_layers"] = layer, total
-    trays = []
-    ams = info.get("ams")
-    units = ams.get("ams") if isinstance(ams, dict) else None
-    for unit in (units[:8] if isinstance(units, list) else []):
-        raw_trays = unit.get("tray") if isinstance(unit, dict) else None
-        for raw in (raw_trays[:4] if isinstance(raw_trays, list) else []):
-            tray = _bambu_tray(raw)
-            if tray and len(trays) < _BAMBU_MAX_TRAYS:
-                trays.append(tray)
-    stats["ams"] = trays or None
+    spools = _bambu_spools(info)
+    stats["spools"] = spools
+    stats["spool_source"] = "printer" if spools else None
     code = _bambu_int(info.get("print_error"), 1, 0xFFFFFFFF)
     stats["print_error"] = "%08X" % code if code else None
     return stats
@@ -2428,22 +2684,8 @@ def _public_bambu_stats(result):
     layer = _bambu_int(result.get("layer"), 0, _BAMBU_MAX_LAYERS)
     if total is None or layer is None or layer > total:
         layer = total = None
-    trays = []
-    raw = result.get("ams")
-    for tray in (raw if isinstance(raw, list) else [])[:_BAMBU_MAX_TRAYS]:
-        if not isinstance(tray, dict):
-            continue
-        kind, color = tray.get("type"), tray.get("color")
-        if not isinstance(kind, str) or not _BAMBU_TYPE_RE.fullmatch(kind):
-            continue
-        trays.append({
-            "type": kind,
-            "color": color.upper() if isinstance(color, str) and _BAMBU_COLOR_RE.fullmatch(color) else None,
-            "remain": _bambu_int(tray.get("remain"), 0, 100),
-        })
     code = result.get("print_error")
     return {"remaining_minutes": minutes, "layer": layer, "total_layers": total,
-            "ams": trays or None,
             "print_error": code if isinstance(code, str) and _BAMBU_ERROR_RE.fullmatch(code)
             and code != "00000000" else None}
 
@@ -5680,7 +5922,10 @@ PAGE = r"""<!DOCTYPE html>
   button:disabled { opacity:.5; cursor:default; }
   #grid { flex:1 1 auto; overflow:auto; padding:12px;
           display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr));
-          gap:12px; align-content:start; align-items:start; }
+          gap:12px; align-content:start; align-items:start;
+          /* Rows follow card content. With a scrolling grid of fixed height, auto rows
+             would stop at the cards' min-height and let taller cards overlap the next row. */
+          grid-auto-rows:max-content; }
   #grid, .queue-scroll, .history-list { scrollbar-width:thin;
           scrollbar-color:var(--orca-border,#555565) transparent; }
   #grid::-webkit-scrollbar, .queue-scroll::-webkit-scrollbar,
@@ -5695,13 +5940,20 @@ PAGE = r"""<!DOCTYPE html>
   .history-list::-webkit-scrollbar-thumb:hover { background:var(--orca-muted,#a0a0a0); }
   .tile { width:100%; max-width:400px; box-sizing:border-box;
           border:1px solid var(--orca-border,#3c3c4c); border-radius:8px; padding:12px;
-          display:flex; flex-direction:column; gap:8px; }
+          display:flex; flex-direction:column; gap:8px;
+          /* One height for ordinary printers of every type, idle or printing; only a
+             card with extra rows (tool heads, queue, an error) grows past it. */
+          min-height:224px; }
+  .tile.done { border-color:rgba(63,191,111,.55); }
   .tile .top { display:flex; align-items:center; gap:8px; }
   .dot { width:9px; height:9px; border-radius:50%; background:#888; flex:0 0 auto; }
   .dot.on { background:#3fbf6f; } .dot.off { background:#c0504d; }
   .name-wrap { flex:1 1 auto; min-width:0; display:flex; align-items:center; gap:4px; }
-  .tile .name { min-width:0; overflow:hidden; text-overflow:ellipsis;
-                white-space:nowrap; font-weight:600; }
+  /* A long name wraps to a second line instead of losing its end; the full name
+     stays in the tooltip. A name does not change, so the card height stays put. */
+  .tile .name { min-width:0; overflow:hidden; overflow-wrap:anywhere; font-weight:600;
+                display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2;
+                line-height:1.25; }
   .tile .remove { flex:0 0 auto; width:26px; height:26px; padding:5px;
                   color:var(--orca-muted,#a0a0a0); border-color:transparent; }
   .tile .remove:hover, .tile .remove:focus-visible {
@@ -5709,15 +5961,30 @@ PAGE = r"""<!DOCTYPE html>
   .tile .remove svg { display:block; width:14px; height:14px; pointer-events:none; }
   .tile .remove.armed { width:auto; min-width:58px; padding:4px 7px;
                         color:#c0504d; border-color:#c0504d; }
-  .src { font-size:10px; padding:1px 5px; border-radius:3px; border:1px solid var(--orca-border,#3c3c4c);
+  .src { flex:0 0 auto; font-size:10px; padding:1px 5px; border-radius:3px; border:1px solid var(--orca-border,#3c3c4c);
          color:var(--orca-muted,#a0a0a0); }
-  .tile .state { max-width:120px; font-size:11px; color:var(--orca-muted,#a0a0a0);
-                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* State gets a full line of its own instead of 120px in the header. */
+  .status-line { display:flex; align-items:baseline; gap:8px; min-width:0;
+                 font-size:12px; font-weight:600; white-space:nowrap; }
+  .status-line .state { min-width:0; overflow:hidden; text-overflow:ellipsis; }
+  .status-line .state::first-letter { text-transform:uppercase; }
+  .status-line .left { margin-left:auto; flex:0 0 auto; font-size:11px; font-weight:400;
+                       color:var(--orca-muted,#a0a0a0); }
+  .status-line.printing .state { color:var(--orca-accent,#009688); }
+  .status-line.paused .state { color:#d9a441; }
+  .status-line.done .state { color:#3fbf6f; }
+  .status-line.attention .state { color:#c0504d; }
+  .tile.done .bar > i { background:#3fbf6f; }
   .body { display:flex; gap:10px; }
   .thumb { width:64px; height:64px; flex:0 0 auto; border:1px solid var(--orca-border,#3c3c4c);
-           border-radius:6px; object-fit:contain; background:rgba(255,255,255,.04); display:none; }
-  .thumb.show { display:block; }
+           border-radius:6px; object-fit:contain; background:rgba(255,255,255,.04); box-sizing:border-box; }
+  .thumb:not(.show) { border-style:dashed; background:transparent; }
   .meta { flex:1 1 auto; display:flex; flex-direction:column; gap:6px; min-width:0; }
+  /* Room for the file line and the progress bar, kept while idle. */
+  .job { display:flex; flex-direction:column; gap:6px; min-height:24px; }
+  .file-line { display:flex; align-items:baseline; gap:8px; min-width:0; }
+  .file-line .fname { flex:1 1 auto; min-width:0; }
+  .file-line .layer { flex:0 0 auto; font-size:11px; color:var(--orca-muted,#a0a0a0); }
   .temps { display:flex; flex-wrap:wrap; gap:4px 14px; font-size:12px; } .temps b { font-weight:600; }
   .toolmark { font-style:normal; font-size:8px; margin-left:2px; vertical-align:middle;
               color:var(--orca-accent,#009688); }
@@ -5730,16 +5997,28 @@ PAGE = r"""<!DOCTYPE html>
   .ctl-note { font-size:11px; color:var(--orca-muted,#a0a0a0); }
   .fname { font-size:11px; color:var(--orca-muted,#a0a0a0); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .fname.tls-needed { white-space:normal; color:#d9a441; }
-  .ams { display:flex; flex-wrap:wrap; gap:3px 10px; font-size:11px; }
-  .ams span { display:inline-flex; align-items:center; gap:4px; }
-  .ams i { width:10px; height:10px; border-radius:2px; border:1px solid var(--orca-border,#3c3c4c); background:transparent; }
+  /* One line of spools; what does not fit goes behind "+N". */
+  .spools { display:flex; align-items:center; gap:4px 9px; min-width:0; overflow:hidden;
+            white-space:nowrap; font-size:11px; }
+  .spools-src, .spool-more { flex:0 0 auto; color:var(--orca-muted,#a0a0a0); }
+  .spool { display:inline-flex; align-items:center; gap:4px; flex:0 0 auto; }
+  .spool[hidden], .spool-more[hidden] { display:none; }
+  .spool .sw { position:relative; display:block; width:9px; height:12px; border-radius:2px;
+               border:1px solid var(--orca-border,#3c3c4c); overflow:hidden; box-sizing:border-box; }
+  .spool .sw b { position:absolute; left:0; right:0; top:0; background:rgba(0,0,0,.6); }
+  .spool.active { font-weight:600; }
+  .spool.active .sw { outline:1px solid var(--orca-accent,#009688); outline-offset:1px; }
+  .spool.vacant .sw { border-style:dashed; }
   .bambu-err { color:#c0504d; }
   .bar { height:6px; border-radius:3px; background:var(--orca-border,#3c3c4c); overflow:hidden; }
   .bar > i { display:block; height:100%; background:var(--orca-accent,#009688); }
   /* Keep print controls and ordinary tile actions on separate rows. Button
      widths follow their localized labels; narrow cards wrap whole actions
      instead of clipping text or overflowing into the next grid column. */
-  .tile-actions { display:flex; flex-direction:column; gap:6px; margin-top:auto; min-width:0; }
+  /* Two rows of actions are reserved, so print controls appearing during a job
+     do not change the card height. */
+  .tile-actions { display:flex; flex-direction:column; justify-content:flex-end; gap:6px;
+                  margin-top:auto; min-width:0; min-height:58px; }
   .ctl-row { display:flex; flex-wrap:wrap; justify-content:space-between;
              align-items:center; gap:6px; min-height:28px; }
   .row { display:flex; flex-wrap:wrap; justify-content:flex-end;
@@ -6146,33 +6425,72 @@ function esc(s){ return String(s == null ? '' : s).replace(/[&<>"]/g, function(c
 function temp(v){ return v == null ? '—' : Math.round(v) + '°'; }
 // <bambu-stats>
 var count = function(v, max){ return typeof v === 'number' && isFinite(v) && v >= 0 && v <= max && Math.floor(v) === v; };
-// Time-left / layer line shared by every backend; exists only when data was sent.
-function jobStatsHtml(s){
-  var parts = [];
-  if (count(s.remaining_minutes, 100000))
-    parts.push(esc(s.remaining_minutes >= 60
-      ? t('bambuLeftHM', {hours:Math.floor(s.remaining_minutes / 60), minutes:s.remaining_minutes % 60})
-      : t('bambuLeftM', {minutes:s.remaining_minutes})));
-  if (count(s.layer, 100000) && count(s.total_layers, 100000) && s.total_layers > 0 && s.layer <= s.total_layers)
-    parts.push(esc(t('bambuLayer', {current:s.layer, total:s.total_layers})));
-  return parts.length ? '<div class="fname">' + parts.join(' · ') + '</div>' : '';
+// Time left and layer of a job, shared by every backend. Plain text, empty unless
+// the printer sent the value; the caller escapes it.
+function jobLeftText(s){
+  if (!count(s.remaining_minutes, 100000)) return '';
+  return s.remaining_minutes >= 60
+    ? t('bambuLeftHM', {hours:Math.floor(s.remaining_minutes / 60), minutes:s.remaining_minutes % 60})
+    : t('bambuLeftM', {minutes:s.remaining_minutes});
+}
+function jobLayerText(s){
+  return count(s.layer, 100000) && count(s.total_layers, 100000) && s.total_layers > 0 && s.layer <= s.total_layers
+    ? t('bambuLayer', {current:s.layer, total:s.total_layers}) : '';
 }
 // Extra rows of a Bambu card; every row exists only when the printer sent it.
 function bambuStatsHtml(s){
   var out = '';
-  var trays = (Array.isArray(s.ams) ? s.ams : []).filter(function(tray){
-    return tray && typeof tray.type === 'string' && /^[A-Za-z0-9][A-Za-z0-9 +\-]{0,15}$/.test(tray.type); }).slice(0, 16);
-  if (trays.length)
-    out += '<div class="ams">' + trays.map(function(tray){
-      var color = /^#[0-9A-Fa-f]{6}$/.test(tray.color || '') ? ' style="background:' + tray.color + '"' : '';
-      var remain = count(tray.remain, 100) ? ' ' + tray.remain + '%' : '';
-      return '<span><i' + color + '></i>' + esc(tray.type + remain) + '</span>';
-    }).join('') + '</div>';
   if (typeof s.print_error === 'string' && /^[0-9A-F]{8}$/.test(s.print_error) && s.print_error !== '00000000')
     out += '<div class="fname bambu-err" role="status">' + esc(t('bambuError', {code:s.print_error})) + '</div>';
   return out;
 }
+// One row of spools for every backend. The colour swatch darkens from the top
+// as the spool is used; the source is named unless the printer reports it itself.
+function spoolsHtml(s){
+  var list = (Array.isArray(s.spools) ? s.spools : []).filter(function(sp){
+    return sp && typeof sp === 'object'; }).slice(0, 16);
+  if (!list.length) return '';
+  var lead = s.spool_source === 'job' ? t('spoolsFromJob') : (s.spool_source === 'spoolman' ? 'Spoolman' : '');
+  return '<div class="spools">' + (lead ? '<span class="spools-src">' + esc(lead) + '</span>' : '') +
+    list.map(function(sp){
+      var material = typeof sp.material === 'string' ? sp.material : '';
+      var remain = count(sp.remain, 100) ? sp.remain : null;
+      var slot = typeof sp.slot === 'string' ? sp.slot : '';
+      var place = sp.external ? t('spoolExternal') + (slot ? ' ' + slot : '')
+        : (!slot ? '' : (s.spool_source === 'job' ? slot : t('spoolSlot', {slot:slot})));
+      var tip = [place, sp.empty ? t('spoolEmpty') : (sp.name || material),
+        remain === null ? '' : remain + '%', sp.active ? t('spoolActive') : ''].filter(Boolean).join(' · ');
+      var color = !sp.empty && /^#[0-9A-F]{6}$/.test(sp.color || '') ? ' style="background:' + sp.color + '"' : '';
+      var used = remain === null || sp.empty ? '' : '<b style="height:' + (100 - remain) + '%"></b>';
+      return '<span class="spool' + (sp.active ? ' active' : '') + (sp.empty ? ' vacant' : '') +
+        '" title="' + esc(tip) + '"><i class="sw"' + color + '>' + used + '</i>' +
+        (sp.empty ? '' : esc(material)) + '</span>';
+    }).join('') + '<span class="spool-more" hidden></span></div>';
+}
 // </bambu-stats>
+// A row that does not fit hides chips from the end (never the active one) behind "+N".
+function fitSpools(row){
+  var chips = row.querySelectorAll('.spool'), more = row.querySelector('.spool-more');
+  if (!more) return;
+  Array.prototype.forEach.call(chips, function(chip){ chip.hidden = false; });
+  more.hidden = true; more.textContent = ''; more.title = '';
+  if (!row.clientWidth || row.scrollWidth <= row.clientWidth) return;
+  more.hidden = false;
+  var hidden = [];
+  for (var i = chips.length - 1; i >= 0 && row.scrollWidth > row.clientWidth; i--) {
+    if (chips[i].classList.contains('active')) continue;
+    chips[i].hidden = true; hidden.unshift(chips[i].title);
+    more.textContent = '+' + hidden.length;
+  }
+  more.title = hidden.join('\n');
+}
+function fitAllSpools(){
+  Array.prototype.forEach.call(grid.querySelectorAll('.tile:not([hidden]) .spools'), fitSpools);
+}
+var spoolFitTimer = null;
+window.addEventListener('resize', function(){
+  clearTimeout(spoolFitTimer); spoolFitTimer = setTimeout(fitAllSpools, 100);
+});
 // Friendly badge for the connection type — the ecosystem we actually detect,
 // not the transport. (OctoPrint can front any firmware, so we don't claim Marlin.)
 function typeLabel(value, status){
@@ -6747,6 +7065,7 @@ function applyFleetFilter(){
     if (status) counts[status]++;
     tile.hidden = !!fleetFilter && fleetFilter !== status;
   });
+  fitAllSpools();
   var labels = {printing:'fleetPrinting', idle:'fleetIdle', attention:'fleetAttention'};
   Array.prototype.forEach.call(fleetSummary.querySelectorAll('button'), function(button){
     var filter = button.dataset.fleetFilter;
@@ -6811,40 +7130,59 @@ function render(printers){
     }
     var nozzleCell = multiTool ? '' : '<span>' + esc(t('nozzle')) + ' <b>' + temp(s.nozzle) + '</b>' + (s.target_nozzle ? '/' + temp(s.target_nozzle) : '') + '</span>';
     var prog = (s.progress == null) ? '' : '<div class="bar"><i style="width:' + s.progress + '%"></i></div>';
-    var thumb = s.thumbnail ? '<img class="thumb show" src="' + s.thumbnail + '">' : '<div class="thumb"></div>';
-    var fname = s.filename ? '<div class="fname" title="' + esc(s.filename) + '">' + esc(s.filename) + '</div>' : '';
+    // The thumbnail box always keeps its place, so text does not shift when a job starts.
+    var thumb = s.thumbnail ? '<img class="thumb show" src="' + s.thumbnail + '">' : '<div class="thumb" aria-hidden="true"></div>';
+    // Rows that describe the printer itself stay above the job block.
+    var notes = '';
     if (supported && String(s.backend || '').toLowerCase() === 'flashforge') {
       if (s.model && s.identity_verified === true)
-        fname = '<div class="fname" title="' + esc([s.model_family, s.firmware].filter(Boolean).join(' / ')) +
-          '">' + esc(s.model) + '</div>' + fname;
+        notes += '<div class="fname" title="' + esc([s.model_family, s.firmware].filter(Boolean).join(' / ')) +
+          '">' + esc(s.model) + '</div>';
       var hintKey = {authorization_denied:'flashforgeErrAuth', lan_mode_disabled:'flashforgeErrLanMode',
         unsupported_model:'flashforgeErrUnsupportedModel', identity_unverified:'flashforgeErrIdentity',
         credentials_required:'flashforgeErrCredentials'}[s.error_code];
-      if (hintKey) fname += '<div class="fname" role="status">' + esc(t(hintKey)) + '</div>';
+      if (hintKey) notes += '<div class="fname" role="status">' + esc(t(hintKey)) + '</div>';
     }
     var tlsProtocol = supported && tlsIssueProtocol(p, s);
-    if (tlsProtocol) fname += '<div class="fname tls-needed" role="status">' +
+    if (tlsProtocol) notes += '<div class="fname tls-needed" role="status">' +
       esc(tlsProtocol === 'mqtt' ? (s.error || t('tlsTrustRequired')) : ftpsTrustIssues[targetKey(p)]) +
       ' — «' + esc(t('tlsTrustButton')) + '»</div>';
     var networkAccessDenied = supported && s.error_code === 'network_permission_denied';
     if (networkAccessDenied)
-      fname += '<div class="ctl-note" role="status">' + esc(s.error) + '</div>';
+      notes += '<div class="ctl-note" role="status">' + esc(s.error) + '</div>';
     if (supported && s.backend === 'repetier' && (s.upload_reason || s.control_reason))
-      fname += '<div class="ctl-note">' + esc(t(s.upload_reason || s.control_reason)) + '</div>';
+      notes += '<div class="ctl-note">' + esc(t(s.upload_reason || s.control_reason)) + '</div>';
+    if (supported && String(s.backend || '').toLowerCase() === 'bambu') notes += bambuStatsHtml(s);
+    // One status line, always present: state and percent on the left, time left on
+    // the right. Its colour follows the state, so it reads at a glance.
     var jobKind = stateKind(s);
-    if (supported && (jobKind === 'printing' || jobKind === 'paused')) fname += jobStatsHtml(s);
-    if (supported && String(s.backend || '').toLowerCase() === 'bambu') fname += bambuStatsHtml(s);
+    var jobActive = supported && (jobKind === 'printing' || jobKind === 'paused');
+    var percent = jobActive && typeof s.progress === 'number' && s.progress >= 0 && s.progress <= 100
+      ? ' ' + Math.round(s.progress) + '%' : '';
+    var done = supported && /^(complete|completed|finished)$/.test(String(rawState).toLowerCase());
+    var tone = !supported ? '' : jobKind === 'printing' ? ' printing' : jobKind === 'paused' ? ' paused'
+      : done ? ' done' : (tile.dataset.fleetStatus === 'attention' ? ' attention' : '');
+    if (done) tile.classList.add('done');
+    var left = jobActive ? jobLeftText(s) : '';
+    var statusLine = '<div class="status-line' + tone + '" title="' + esc(s.error || stateText) + '">' +
+      '<span class="state">' + esc(stateText + percent) + '</span>' +
+      (left ? '<span class="left">' + esc(left) + '</span>' : '') + '</div>';
+    // The job block reserves room for the file line and progress even when idle,
+    // so a card keeps its height when a print starts or ends.
+    var layer = jobActive ? jobLayerText(s) : '';
+    var job = (s.filename || layer) ? '<div class="file-line">' +
+      '<span class="fname" title="' + esc(s.filename || '') + '">' + esc(s.filename || '') + '</span>' +
+      (layer ? '<span class="layer">' + esc(layer) + '</span>' : '') + '</div>' : '';
     tile.innerHTML =
       '<div class="top"><span class="dot ' + dotClass + '"></span>' +
       '<span class="name-wrap"><span class="name" title="' + esc(p.name || p.url) + '">' + esc(p.name || p.url) + '</span>' +
       '<button class="remove ghost" title="' + esc(t('remove')) + '" aria-label="' + esc(t('remove')) + '">' +
       '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 4h10M6 4V2.5h4V4m-6 0 .6 9h6.8l.6-9M6.5 6.5v4M9.5 6.5v4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button></span>' +
-      '<span class="src">' + esc(typeLabel(p.type, s)) + '</span>' +
-      '<span class="state" title="' + esc(s.error || stateText) + '">' + esc(stateText) + '</span></div>' +
-      '<div class="body">' + thumb + '<div class="meta">' +
+      '<span class="src">' + esc(typeLabel(p.type, s)) + '</span></div>' +
+      '<div class="body">' + thumb + '<div class="meta">' + statusLine +
       '<div class="temps">' + nozzleCell +
       '<span>' + esc(t('bed')) + ' <b>' + temp(s.bed) + '</b>' + (s.target_bed ? '/' + temp(s.target_bed) : '') + '</span></div>' +
-      toolRow + fname + prog + '</div></div>';
+      toolRow + (supported ? spoolsHtml(s) : '') + notes + '<div class="job">' + job + prog + '</div></div></div>';
     var kind = stateKind(s);
     var busy = supported && s.online === true && (kind === 'printing' || kind === 'paused');
     var selectable = printerSelectable(p);

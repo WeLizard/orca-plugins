@@ -2,6 +2,14 @@
 
 Newest first. The top entry is the text pasted into the Plugin Hub on release.
 
+## 0.1.3
+- Printer cards keep one height: an idle printer, a running print and a paused print take the same space, so the dashboard no longer jumps when a job starts or ends. The preview box, the file line and two rows of buttons always keep their place. Only a card with extra content (several tool heads, queued files or an error) is taller, and the cards around it keep their size.
+- The printer state has its own coloured line under the name instead of a short label in the header: the state with the print percentage on the left and the time left on the right. Long states are no longer cut off. The layer is shown at the end of the file line.
+- A long printer name wraps onto a second line instead of losing its end; the full name is in the tooltip.
+- A finished print is shown in green, with a green card border, until the printer starts another job.
+- Fixed taller cards overlapping the next row when the list of printers is longer than the window.
+- Every card shows its spools in one row: colour, material and, where the printer reports it, how much is left. The slot in use is outlined; slots that do not fit go behind "+N", with the details in the tooltip. Sources: Bambu AMS, AMS HT and the external spool; Klipper with Happy Hare; the FlashForge AD5X material station and the material set on the Adventurer 5M. A Klipper printer without an MMU shows the spool Spoolman marks as loaded, or else the filaments the current job was sliced for, labelled "In job". The row replaces the separate AMS row on Bambu cards. Spools come from the status the printer already sends; the only new request is the Spoolman lookup on Klipper printers, at most once a minute, or once every ten minutes when Moonraker has no Spoolman.
+
 ## 0.1.2
 - The toolbar shows how many printers are printing, idle, or need attention. Click a count to filter the cards and click it again to show all printers.
 - Bambu cards show Certificates only when the status connection or a file transfer encounters a certificate that needs attention.

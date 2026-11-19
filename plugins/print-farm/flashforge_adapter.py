@@ -132,6 +132,7 @@ def poll(base: str, ssl_context: ssl.SSLContext | None = None, secret: str = "",
             raise _AdapterError("unsupported_model")
         status.update(_normalize(detail))
         status.update(model=MODELS[pid]["model"], model_family=MODELS[pid]["family"], identity_verified=True)
+        status.update(_spools(detail, MODELS[pid]["family"]))
         status["online"] = True
         _apply_write_gate(status, pid)
         return status
@@ -424,6 +425,61 @@ def _clean(value, limit):
     if not isinstance(value, str):
         return ""
     return _CONTROL_CHARS.sub("", value).strip()[:limit]
+
+
+_MAX_STATION_SLOTS = 16
+_COLOR = re.compile(r"#?([0-9A-Fa-f]{6})(?:[0-9A-Fa-f]{2})?")
+
+
+def _field(source, name):
+    """Some firmware capitalizes keys; read either form."""
+    if not isinstance(source, dict):
+        return None
+    value = source.get(name)
+    return value if value is not None else source.get(name[:1].upper() + name[1:])
+
+
+def _flag(value):
+    if isinstance(value, bool):
+        return value
+    return {0: False, 1: True}.get(value) if isinstance(value, int) else None
+
+
+def _material(value):
+    text = _clean(value, 16)
+    return text if text.strip("?-") else None
+
+
+def _spools(detail: dict, family: str) -> dict:
+    """The AD5X material station slots, or the 5M's single set material, as card spools."""
+    station = _field(detail, "matlStationInfo")
+    if family == "ad5x":
+        entries = _field(station, "slotInfos")
+        if not isinstance(entries, list):
+            return {}
+        current = _field(station, "currentSlot")
+        spools = []
+        for entry in entries[:_MAX_STATION_SLOTS]:
+            slot_id = entry.get("slotId") if isinstance(entry, dict) else None
+            if isinstance(slot_id, bool) or not isinstance(slot_id, int) or not 1 <= slot_id <= _MAX_STATION_SLOTS:
+                continue
+            present = _flag(entry.get("hasFilament"))
+            color = entry.get("materialColor")
+            match = _COLOR.fullmatch(color.strip()) if isinstance(color, str) else None
+            spools.append({
+                "slot": str(slot_id),
+                "material": _material(entry.get("materialName")) if present is not False else None,
+                "color": "#" + match.group(1).upper() if match and present is not False else None,
+                "remain": None,
+                "active": present is True and current == slot_id,
+                "empty": present is False,
+            })
+        return {"spools": spools, "spool_source": "printer"} if spools else {}
+    material = _material(detail.get("rightFilamentType"))
+    if family == "adventurer_5m" and material:
+        # One spool on the extruder; the printer knows only the material set for it.
+        return {"spools": [{"slot": "", "material": material, "active": True}], "spool_source": "printer"}
+    return {}
 
 
 def _read_pid(detail: dict):
