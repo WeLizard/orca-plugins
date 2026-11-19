@@ -6368,7 +6368,7 @@ def dashboard_printers():
 _PUBLIC_PRINTER_FIELDS = frozenset({
     "id", "target_uuid", "owner_scope_uuid", "server_uuid", "target_selector",
     "binding_revision", "name", "url", "type", "serial", "source", "discovery_ref", "repetier_slug",
-    "status", "queued", "outbox_count", "outbox_bytes", "webui_url", "camera_mode", "camera_url", "camera_external", "camera_wall_snapshot", "camera_rotate_180",
+    "status", "queued", "outbox_count", "outbox_bytes", "webui_url", "camera_mode", "camera_url", "camera_external", "camera_wall_snapshot", "camera_rotate_180", "camera_fit_image",
 })
 _PUBLIC_STATUS_FIELDS = frozenset({
     "supported", "online", "state", "backend", "job_state", "error",
@@ -11202,6 +11202,7 @@ __TYPE_OPTIONS__
         <button id="cam-mode-save" class="ghost" type="button"></button></label>
       <label id="cam-external-wrap" style="margin:4px 14px"><input id="cam-external" type="checkbox"> Open saved camera URL in browser</label>
       <label style="margin:4px 14px"><input id="cam-wall-snapshot" type="checkbox"> Snapshot every 5 seconds in camera grid</label>
+    <label style="margin:4px 14px"><input id="cam-fit-image" type="checkbox"> Fit to window (direct JPEG / MJPEG URL)</label>
     <label style="margin:4px 14px"><input id="cam-rotate" type="checkbox"> Rotate image 180°</label>
     <div class="cam-actions"><button id="cam-window" class="ghost" type="button" style="display:none"></button></div>
     </section>
@@ -12888,6 +12889,7 @@ function openCamera(printer, opener, settingsOnly){
   camEl('cam-address').value = printer.camera_url || '';
   camEl('cam-external').checked = printer.camera_external === true;
   camEl('cam-wall-snapshot').checked = printer.camera_wall_snapshot === true;
+  camEl('cam-fit-image').checked = printer.camera_fit_image === true;
   camEl('cam-rotate').checked = printer.camera_rotate_180 === true;
   camEl('cam-img').style.transform = printer.camera_rotate_180 === true ? 'rotate(180deg)' : '';
   camEl('cam-mode').style.display = klipper ? '' : 'none';
@@ -12999,6 +13001,7 @@ camEl('cam-mode-save').addEventListener('click', function(){
     camera_url:camEl('cam-address').value.trim(),
     camera_external:camEl('cam-external').checked,
     camera_wall_snapshot:camEl('cam-wall-snapshot').checked,
+    camera_fit_image:camEl('cam-fit-image').checked,
     camera_rotate_180:camEl('cam-rotate').checked,
     camera_mode:camEl('cam-mode').style.display === 'none' ? 'auto' : camEl('cam-mode').value}));
 });
@@ -13012,7 +13015,7 @@ document.addEventListener('keydown', function(event){
     var focusable = [camEl('cam-close')];
     if (camEl('cam-mode-wrap').style.display !== 'none')
       focusable.push.apply(focusable, (camEl('cam-mode').style.display === 'none' ? [] : [camEl('cam-mode')]).concat([camEl('cam-address'), camEl('cam-mode-save')]));
-    focusable.push(camEl('cam-external'), camEl('cam-wall-snapshot'), camEl('cam-rotate'));
+    focusable.push(camEl('cam-external'), camEl('cam-wall-snapshot'), camEl('cam-fit-image'), camEl('cam-rotate'));
     if (camEl('cam-window').style.display !== 'none') focusable.push(camEl('cam-window'));
     var index = focusable.indexOf(document.activeElement);
     event.stopImmediatePropagation();
@@ -13735,16 +13738,18 @@ def render_page():
 # only the selected printer origin, and the iframe cannot open popups or replace
 # Orca's top-level page.
 VIEWER_PAGE = """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-src __ORIGIN__">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-src __ORIGIN__; img-src __ORIGIN__">
 <style>html,body{margin:0;height:100%;font:12px sans-serif}body{display:flex;flex-direction:column}
 header{padding:5px;display:flex;align-items:center;gap:6px}input{width:min(48ch,55vw);min-width:8ch;box-sizing:border-box}button{white-space:nowrap}
-#note{font-size:11px}details{padding:0 6px 5px}summary{cursor:pointer}p{margin:5px 0}iframe{border:0;width:100%;flex:1;min-height:0;display:block}</style>
+#note{font-size:11px}details{padding:0 6px 5px}summary{cursor:pointer}p{margin:5px 0}iframe,#camera-image{border:0;width:100%;flex:1;min-height:0;display:block}#camera-image{height:0;object-fit:contain;background:#101215}</style>
 </head><body><header><input id="url" readonly aria-label="URL" value="__URL__"><button id="copy" type="button">__COPY__</button><button id="edit" type="button" __EDIT_ATTR__>__EDIT__</button><span id="note" role="status"></span></header>
 <details id="help"><summary>__HELP_LABEL__</summary><p>__HELP__</p></details>
-<iframe style="__ROTATION__" src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
+__VIEW__
 <script>var u=document.getElementById('url'),n=document.getElementById('note');function failed(){document.getElementById('help').open=true;u.focus();u.select();}
 document.getElementById('copy').addEventListener('click',function(){u.focus();u.select();var ok=false;try{ok=document.execCommand('copy');}catch(e){}if(ok){n.textContent=__COPIED__;return;}if(navigator.clipboard){navigator.clipboard.writeText(u.value).then(function(){n.textContent=__COPIED__;},failed);}else failed();});
-document.getElementById('edit').addEventListener('click',function(){orca.postMessage({type:'viewer-edit-address'});});</script></body></html>"""
+document.getElementById('edit').addEventListener('click',function(){orca.postMessage({type:'viewer-edit-address'});});
+var image=document.getElementById('camera-image');
+if(image){image.addEventListener('error',function(){n.textContent='Use a direct JPEG or MJPEG URL.';document.getElementById('help').open=true;});image.src=u.value;}</script></body></html>"""
 
 
 def validated_printer_web_url(value):
@@ -13790,7 +13795,7 @@ def validated_printer_web_url(value):
     ))
 
 
-def render_viewer_page(url, show_edit=True, *, rotate=False):
+def render_viewer_page(url, show_edit=True, *, rotate=False, fit_image=False):
     safe_url = validated_printer_web_url(url)
     if not safe_url:
         return ""
@@ -13814,7 +13819,10 @@ def render_viewer_page(url, show_edit=True, *, rotate=False):
         "__COPIED__": json.dumps(ui_text("feedbackCopied"), ensure_ascii=True).replace("<", "\\u003c"),
         "__HELP_LABEL__": html.escape(ui_text("webuiHelp")),
     }
-    return re.sub(r"__[A-Z_]+__", lambda match: replacements[match.group(0)], VIEWER_PAGE)
+    view = ('<img id="camera-image" alt="Camera" style="__ROTATION__">' if fit_image else
+            '<iframe style="__ROTATION__" src="__URL__" sandbox="allow-same-origin allow-scripts allow-forms allow-downloads allow-modals allow-pointer-lock" allow="fullscreen" referrerpolicy="no-referrer"></iframe>')
+    page = VIEWER_PAGE.replace("__VIEW__", view)
+    return re.sub(r"__[A-Z_]+__", lambda match: replacements[match.group(0)], page)
 
 
 def validated_webui_url(value, api_url):
@@ -13895,6 +13903,43 @@ def validated_camera_url(value, printer_url, webui_url=None):
     return safe if same_host else ""
 
 
+_LOCAL_CAMERA_NETWORKS = tuple(ipaddress.ip_network(network) for network in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"
+))
+
+
+def validated_manual_camera_url(value, printer_url, webui_url=None):
+    """Allow a user-entered camera on a separate LAN IP."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if not value or len(value) > _CAMERA_URL_MAX:
+        return ""
+    # Recognize bare IPs with an optional port/path without changing relative paths.
+    bare = re.match(r"^(?:\d{1,3}\.){3}\d{1,3}(?=[:/?#]|$)", value)
+    if bare:
+        try:
+            ipaddress.IPv4Address(bare[0])
+        except ValueError:
+            return ""
+        value = "http://" + value
+    same_host = validated_camera_url(value, printer_url, webui_url)
+    if same_host:
+        return same_host
+    if not value.lower().startswith(("http://", "https://")) or any(c.isspace() for c in value):
+        return ""
+    safe = validated_printer_web_url(value)
+    if not safe:
+        return ""
+    try:
+        host = ipaddress.ip_address(urllib.parse.urlsplit(safe).hostname or "")
+    except ValueError:
+        return ""
+    if not any(host in network for network in _LOCAL_CAMERA_NETWORKS):
+        return ""
+    return safe + "/" if value.endswith("/") and not safe.endswith("/") else safe
+
+
 def _camera_result(stream="", snapshot="", code=None, *, viewer=""):
     if code:
         return {"ok": False, "code": code, "stream": "", "snapshot": ""}
@@ -13970,9 +14015,10 @@ def camera_lookup(printer):
         backend = backend_for_type((printer or {}).get("type"))
         if not base or not validated_printer_web_url(base):
             return _camera_result(code="unavailable")
-        manual = validated_camera_url(printer.get("camera_url"), base, printer.get("webui_url"))
+        manual = validated_manual_camera_url(printer.get("camera_url"), base, printer.get("webui_url"))
         if manual:
-            return _camera_result(viewer=manual)
+            return _camera_result(stream=manual if printer.get("camera_fit_image") is True else "",
+                                  viewer=manual)
         if backend == "moonraker":
             return _moonraker_camera(printer, base)
         if backend == "octoprint":
@@ -14126,6 +14172,11 @@ def render_camera_wall(printers):
             if ":" in host:
                 host = "[" + host + "]"
             origins.update(f"{scheme}://{host}:*" for scheme in ("http", "https"))
+        manual = validated_manual_camera_url(
+            printer.get("camera_url"), printer.get("url"), printer.get("webui_url"))
+        if manual:
+            parsed = urllib.parse.urlsplit(manual)
+            origins.add(f"{parsed.scheme}://{parsed.netloc}")
     def js(value):
         return json.dumps(value, ensure_ascii=True).replace("<", "\\u003c")
     return (_CAMERA_WALL_PAGE.replace("__FRAMES__", " ".join(sorted(origins)) or "'none'")
@@ -15216,13 +15267,16 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
         elif kind == "camera-open":
             printer = resolve_printer_target(dashboard_printers(), msg)
             cached = self._camera_urls.get(printer.get("target_uuid")) if printer else None
-            url = validated_camera_url(cached, printer.get("url")) if cached else ""
+            manual = (validated_manual_camera_url(printer.get("camera_url"), printer.get("url"),
+                                                  printer.get("webui_url")) if printer else "")
+            url = manual or (validated_camera_url(cached, printer.get("url")) if cached else "")
             if url:
                 if printer.get("camera_external") and self._open_camera_browser(url):
                     return
                 self._open_viewer(url, "%s — %s" % (
                     printer.get("name") or printer.get("url"), ui_text("cameraButton")),
-                    rotate=printer.get("camera_rotate_180") is True)
+                    rotate=printer.get("camera_rotate_180") is True,
+                    fit_image=bool(manual) and printer.get("camera_fit_image") is True)
         elif kind == "mass-print":
             self._submit_mass_print(msg)
         elif kind == "mass-start-prepare":
@@ -15290,7 +15344,7 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if not isinstance(raw_camera, str) or len(raw_camera) > _CAMERA_URL_MAX:
                 self._connection_options_result(msg, False)
                 return
-            camera_url = validated_camera_url(raw_camera, card.get("url"), webui) if raw_camera else ""
+            camera_url = validated_manual_camera_url(raw_camera, card.get("url"), webui) if raw_camera else ""
             if raw_camera and not camera_url:
                 self._connection_options_result(msg, False)
                 return
@@ -15301,19 +15355,22 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             external = external and bool(camera_url)
             wall_snapshot = msg.get("camera_wall_snapshot", card.get("camera_wall_snapshot", False))
             rotate = msg.get("camera_rotate_180", card.get("camera_rotate_180", False))
-            if type(wall_snapshot) is not bool or type(rotate) is not bool:
+            fit_image = msg.get("camera_fit_image", card.get("camera_fit_image", False))
+            if any(type(flag) is not bool for flag in (wall_snapshot, rotate, fit_image)):
                 self._connection_options_result(msg, False)
                 return
             if (webui != card.get("webui_url", "") or mode != card.get("camera_mode", "auto")
                     or camera_url != card.get("camera_url", "")
                     or external != card.get("camera_external", False)
                     or wall_snapshot != card.get("camera_wall_snapshot", False)
-                    or rotate != card.get("camera_rotate_180", False)):
+                    or rotate != card.get("camera_rotate_180", False)
+                    or fit_image != card.get("camera_fit_image", False)):
                 card["webui_url"], card["camera_mode"] = webui, mode
                 card["camera_url"] = camera_url
                 card["camera_external"] = external
                 card["camera_wall_snapshot"] = wall_snapshot
                 card["camera_rotate_180"] = rotate
+                card["camera_fit_image"] = fit_image
                 card["binding_revision"] += 1
                 if not save_manual_printers(cards):
                     self._connection_options_result(msg, False)
@@ -15636,10 +15693,10 @@ class PrintersDashboard(_PluginRuntimeLifecycleMixin, _DASHBOARD_CAPABILITY_BASE
             if window is not None:
                 window.close()
 
-    def _open_viewer(self, url, name, printer=None, *, rotate=False):
+    def _open_viewer(self, url, name, printer=None, *, rotate=False, fit_image=False):
         # Printer web UI in its own host window — inside Orca, no external browser
         # and without hijacking the dashboard tab. Keep a reference so it lives on.
-        page = render_viewer_page(url, show_edit=printer is not None, rotate=rotate)
+        page = render_viewer_page(url, show_edit=printer is not None, rotate=rotate, fit_image=fit_image)
         if not page:
             return False
         identity = ({"targetUuid": printer.get("target_uuid"),
