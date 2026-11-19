@@ -1,4 +1,5 @@
 import ast
+import base64
 import importlib.util
 import csv
 import hashlib
@@ -4461,6 +4462,178 @@ class SharedJobStatsTest(unittest.TestCase):
         hostile = {"remaining_minutes": 5, "layer": "<b>", "total_layers": 9}
         self.assertEqual(render(hostile, "jobLeftText"), "bambuLeftM:5")
         self.assertEqual(render(hostile, "jobLayerText"), "")
+
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"synthetic picture" * 8
+
+
+def _project_3mf(pictures, filler=0):
+    """A 3MF-shaped zip: `filler` incompressible bytes first, then plate pictures."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        if filler:
+            archive.writestr("Metadata/plate_1.gcode", os.urandom(filler))
+        for name, data in pictures.items():
+            archive.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
+    return out.getvalue()
+
+
+class _FakeBambuFtp:
+    """Serves one file over a fake FTPS session and counts what it sends."""
+
+    def __init__(self, files):
+        self.files, self.sizes, self.sent, self.closed = files, [], 0, False
+
+    def __call__(self, context=None):
+        return self
+
+    def connect(self, host, port, timeout=None):
+        return "220"
+
+    def login(self, user, code):
+        return "230"
+
+    def prot_p(self):
+        return "200"
+
+    def voidcmd(self, cmd):
+        return "200"
+
+    def size(self, path):
+        import ftplib
+        self.sizes.append(path)
+        if path not in self.files:
+            raise ftplib.error_perm("550 not found")
+        return len(self.files[path])
+
+    def transfercmd(self, cmd, rest=None):
+        data = self.files[cmd[len("RETR "):]][rest or 0:]
+        fake = self
+
+        class Conn:
+            def settimeout(self, value):
+                pass
+
+            def recv(self, n):
+                nonlocal data
+                piece, data = data[:n], data[n:]
+                fake.sent += len(piece)
+                return piece
+
+            def close(self):
+                pass
+        return Conn()
+
+    def getresp(self):
+        return "226"
+
+    def quit(self):
+        self.closed = True
+
+    def close(self):
+        self.closed = True
+
+
+class BambuThumbnailTest(unittest.TestCase):
+    """Bambu job pictures: local file for our uploads, ranged FTPS reads otherwise."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.plugin = _load_plugin()
+
+    def setUp(self):
+        self.plugin._bambu_sent_jobs.clear()
+        self.plugin._bambu_job_thumbs.clear()
+        self.printer = {"url": "http://192.0.2.5", "access_code": "x", "serial": "SERIAL"}
+
+    def serve(self, files):
+        fake = _FakeBambuFtp(files)
+        for name, value in (("_implicit_ftps_class", lambda: fake),
+                            ("_bambu_tls_context", lambda printer, protocol: object())):
+            patcher = mock.patch.object(self.plugin, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return fake
+
+    def picture(self, data):
+        return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+
+    def test_reported_job_names_become_stems_and_a_plate(self):
+        source = self.plugin._bambu_job_source
+        self.assertEqual(source({"subtask_name": "pf-abc.3mf", "gcode_file": "Metadata/plate_2.gcode"}),
+                         (("pf-abc",), 2))
+        self.assertEqual(source({"subtask_name": "Bracket", "gcode_file": "/cache/Bracket_plate_3.gcode"}),
+                         (("Bracket",), 3))
+        self.assertEqual(source({"gcode_file": "/sdcard/../Part.gcode.3mf"}), (("Part",), None))
+        self.assertEqual(source({"subtask_name": "evil\r\nDELE x", "gcode_file": ".."}), ((), None))
+
+    def test_a_large_project_is_read_in_ranges_not_downloaded(self):
+        small = _PNG + b"small"
+        archive = _project_3mf({"Metadata/plate_1.png": _PNG, "Metadata/plate_1_small.png": small},
+                               filler=3 * 1024 * 1024)
+        fake = self.serve({"/cache/Bracket.gcode.3mf": archive})
+        thumbnail = self.plugin._bambu_read_job_thumbnail(self.printer, ("Bracket",), 1)
+        self.assertEqual(thumbnail, self.picture(small))
+        self.assertLessEqual(fake.sent, 2 * 64 * 1024)  # the directory block and the picture block
+        self.assertEqual(fake.sizes, ["/cache/Bracket.gcode.3mf"])
+        self.assertTrue(fake.closed)
+
+    def test_unknown_plate_uses_only_a_single_plate_project(self):
+        single = self.serve({"/Job.3mf": _project_3mf({"Metadata/plate_4.png": _PNG})})
+        self.assertEqual(self.plugin._bambu_read_job_thumbnail(self.printer, ("Job",), None),
+                         self.picture(_PNG))
+        self.assertIn("/cache/Job.3mf", single.sizes)
+        both = _project_3mf({"Metadata/plate_1.png": _PNG, "Metadata/plate_2.png": _PNG})
+        self.serve({"/Job.3mf": both})
+        self.assertEqual(self.plugin._bambu_read_job_thumbnail(self.printer, ("Job",), None), "")
+
+    def test_gcode_header_gives_its_largest_png(self):
+        def block(size, data):
+            text = base64.b64encode(data).decode("ascii")
+            return ("; thumbnail begin %s %d\n" % (size, len(text)) +
+                    "".join("; %s\n" % text[i:i + 76] for i in range(0, len(text), 76)) +
+                    "; thumbnail end\n").encode("ascii")
+        big = _PNG + b"big"
+        head = b"; HEADER\n" + block("48x48", _PNG) + block("300x300", big) + b"G28\n"
+        self.assertEqual(self.plugin._gcode_thumbnail(head), self.picture(big))
+        self.assertEqual(self.plugin._gcode_thumbnail(b"; thumbnail begin 9x9 4\n; !!!!\n; thumbnail end\n"), "")
+
+    def test_our_upload_shows_its_local_picture_and_real_name_without_asking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "upload.3mf"
+            path.write_bytes(_project_3mf({"Metadata/plate_1.png": b"other",
+                                           "Metadata/plate_2.png": _PNG}))
+            self.plugin.remember_bambu_sent_job(self.printer, "pf-0a1b.3mf", "Benchy.3mf",
+                                                str(path), "Metadata/plate_2.gcode")
+        result = {"state": "printing", "filename": "pf-0a1b.3mf", "thumbnail": ""}
+        with mock.patch.object(self.plugin, "_bambu_read_job_thumbnail",
+                               side_effect=AssertionError("no printer request")):
+            self.plugin._attach_bambu_job(self.printer, result, ("pf-0a1b",), 2)
+        self.assertEqual((result["thumbnail"], result["filename"]), (self.picture(_PNG), "Benchy.3mf"))
+
+    def test_other_jobs_are_read_once_and_failures_wait(self):
+        reads = []
+
+        def read(printer, stems, plate):
+            reads.append(stems)
+            if stems == ("Broken",):
+                raise OSError("connection reset")
+            return "data:image/png;base64,AAAA"
+        with mock.patch.object(self.plugin, "_bambu_read_job_thumbnail", side_effect=read):
+            for _ in range(3):
+                result = {"state": "printing", "thumbnail": ""}
+                self.plugin._attach_bambu_job(self.printer, result, ("Bracket",), 1)
+                self.assertEqual(result["thumbnail"], "data:image/png;base64,AAAA")
+                self.plugin._attach_bambu_job(self.printer, {"state": "printing"}, ("Broken",), 1)
+            self.plugin._attach_bambu_job(self.printer, {"state": "idle"}, ("Idle",), None)
+        self.assertEqual(reads, [("Bracket",), ("Broken",)])
+
+    def test_public_status_keeps_only_image_data_urls(self):
+        public = self.plugin.public_status
+        self.assertEqual(public({"thumbnail": "javascript:alert(1)"})["thumbnail"], "")
+        self.assertEqual(public({"thumbnail": "data:image/png;base64,AA\"onerror=x"})["thumbnail"], "")
+        self.assertEqual(public({"thumbnail": "data:image/png;base64,AAAA"})["thumbnail"],
+                         "data:image/png;base64,AAAA")
 
 
 class CardSpoolsTest(unittest.TestCase):

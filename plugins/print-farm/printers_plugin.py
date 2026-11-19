@@ -1972,6 +1972,9 @@ def public_status(status):
             result[key] = result[key][:64] if isinstance(result[key], str) else None
     if "identity_verified" in result:
         result["identity_verified"] = result["identity_verified"] is True
+    if "thumbnail" in result and not (isinstance(result["thumbnail"], str)
+                                      and _THUMBNAIL_RE.fullmatch(result["thumbnail"])):
+        result["thumbnail"] = ""
     if any(key in result for key in _BAMBU_STAT_KEYS):
         result.update(_public_bambu_stats(result))
     if "spools" in result or "spool_source" in result:
@@ -2816,6 +2819,277 @@ def _copy_bambu_observations(source, target):
             target[key] = source[key]
 
 
+# Bambu job thumbnails. A job sent from Print Farm takes its plate picture from
+# the local file when it is sent, so the printer is never asked. Any other job
+# is read once over FTPS without downloading the archive: a .3mf is a zip, so
+# only its directory at the end and one picture are fetched, in 64 KB ranges.
+_BAMBU_THUMB_LIMIT = 1024 * 1024
+_BAMBU_RANGE_BLOCK = 64 * 1024
+_BAMBU_RANGE_BUDGET = 2 * 1024 * 1024
+_BAMBU_GCODE_HEAD = 512 * 1024
+_BAMBU_THUMB_SECONDS = 15
+_BAMBU_THUMB_RETRY_SECONDS = 600
+# Where Bambu firmware keeps jobs: LAN uploads, the SD card root, MakerWorld models.
+_BAMBU_JOB_FOLDERS = ("/cache/", "/", "/model/", "/data/")
+_BAMBU_JOB_SUFFIXES = (".gcode.3mf", ".3mf", ".gcode")
+_BAMBU_THUMB_STATES = frozenset({"printing", "paused", "preparing", "finished", "failed"})
+_BAMBU_PLATE_RE = re.compile(r"(?:(.+)_)?plate_([1-9][0-9]{0,3})\.gcode", re.I)
+_GCODE_THUMB_RE = re.compile(rb"; thumbnail begin (\d{1,4})x(\d{1,4}) \d{1,8}\r?\n(.*?); thumbnail end", re.S)
+_THUMBNAIL_RE = re.compile(r"data:image/(?:png|jpeg);base64,[A-Za-z0-9+/]+={0,2}")
+_BAMBU_THUMB_LOCK = threading.Lock()
+_bambu_sent_jobs = {}   # (endpoint, remote stem) -> {"thumbnail", "filename"}
+_bambu_job_thumbs = {}  # (endpoint, serial, stems, plate) -> (thumbnail, retry_at)
+
+
+def _png_data_url(data):
+    if (isinstance(data, bytes) and 8 < len(data) <= _BAMBU_THUMB_LIMIT
+            and data.startswith(b"\x89PNG\r\n\x1a\n")):
+        return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
+    return ""
+
+
+def _zip_plate_thumbnail(archive, plate):
+    """The plate's picture from an open 3MF, or "". Without a plate number only
+    a single-plate project is used: a wrong picture is worse than none."""
+    if plate is None:
+        plates = {int(match.group(1)) for name in archive.namelist()
+                  if (match := re.fullmatch(r"Metadata/plate_([1-9][0-9]{0,3})\.png", name))}
+        if len(plates) != 1:
+            return ""
+        plate = plates.pop()
+    for suffix in ("_small.png", ".png"):
+        try:
+            member = archive.getinfo("Metadata/plate_%d%s" % (plate, suffix))
+        except KeyError:
+            continue
+        if not 8 < member.file_size <= _BAMBU_THUMB_LIMIT or member.compress_size > _BAMBU_THUMB_LIMIT:
+            continue
+        with archive.open(member) as stream:
+            picture = _png_data_url(stream.read(_BAMBU_THUMB_LIMIT + 1))
+        if picture:
+            return picture
+    return ""
+
+
+def _gcode_thumbnail(head):
+    """The largest PNG thumbnail in a G-code header, or ""."""
+    best, best_area = "", -1
+    for match in _GCODE_THUMB_RE.finditer(head or b""):
+        area = int(match.group(1)) * int(match.group(2))
+        if area <= best_area:
+            continue
+        try:
+            picture = _png_data_url(base64.b64decode(re.sub(rb"[;\s]", b"", match.group(3)), validate=True))
+        except ValueError:
+            continue
+        if picture:
+            best, best_area = picture, area
+    return best
+
+
+def _bambu_local_thumbnail(file_path, plate_entry):
+    import zipfile
+
+    match = re.fullmatch(r"Metadata/plate_([1-9][0-9]{0,3})\.gcode", plate_entry or "") \
+        if isinstance(plate_entry, str) else None
+    try:
+        if zipfile.is_zipfile(file_path):
+            with zipfile.ZipFile(file_path) as archive:
+                return _zip_plate_thumbnail(archive, int(match.group(1)) if match else None)
+        with open(file_path, "rb") as stream:
+            return _gcode_thumbnail(stream.read(_BAMBU_GCODE_HEAD))
+    except Exception:
+        return ""
+
+
+def _bambu_job_stem(name):
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    for suffix in _BAMBU_JOB_SUFFIXES:
+        if name[-len(suffix):].lower() == suffix:
+            return name[:-len(suffix)]
+    return name
+
+
+def _bambu_job_source(info):
+    """(name stems, plate number) of the reported job; stems never hold a path."""
+    stems, plate = [], None
+    for field in ("subtask_name", "gcode_file"):
+        value = info.get(field)
+        if (not isinstance(value, str) or not 0 < len(value) <= 255
+                or any(unicodedata.category(char)[0] == "C" for char in value)):
+            continue
+        name = value.replace("\\", "/").rsplit("/", 1)[-1]
+        match = _BAMBU_PLATE_RE.fullmatch(name)
+        if match:
+            plate = int(match.group(2))
+            if not match.group(1):
+                continue
+            name = match.group(1)
+        stem = _bambu_job_stem(name)
+        if stem.strip(" ."):
+            stems.append(stem)
+    return tuple(dict.fromkeys(stems))[:2], plate
+
+
+def _bound(cache):
+    while len(cache) > 64:
+        cache.pop(next(iter(cache)))
+
+
+def remember_bambu_sent_job(printer, remote_name, filename, file_path, plate_entry):
+    """Keep the picture and the real name of a job Print Farm just uploaded."""
+    thumbnail = _bambu_local_thumbnail(file_path, plate_entry)
+    name = filename if isinstance(filename, str) and 0 < len(filename) <= 255 else ""
+    with _BAMBU_THUMB_LOCK:
+        _bambu_sent_jobs[(_endpoint_key(printer.get("url")), _bambu_job_stem(remote_name))] = {
+            "thumbnail": thumbnail, "filename": name}
+        _bound(_bambu_sent_jobs)
+
+
+class _FtpsRangeFile:
+    """Read-only, seekable view of one file on the printer: blocks come over
+    FTPS with REST, each at most once, within a byte budget and a deadline."""
+
+    def __init__(self, ftp, path, size, deadline):
+        self._ftp, self._path, self._size, self._deadline = ftp, path, size, deadline
+        self._pos = 0
+        self._blocks = {}
+        self.fetched = 0
+
+    def seekable(self):
+        return True
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=0):
+        self._pos = max(0, (0, self._pos, self._size)[whence] + offset)
+        return self._pos
+
+    def read(self, size=-1):
+        end = self._size if size is None or size < 0 else min(self._size, self._pos + size)
+        out = bytearray()
+        while self._pos < end:
+            index = self._pos // _BAMBU_RANGE_BLOCK
+            if index not in self._blocks:
+                self._blocks[index] = self._fetch(index * _BAMBU_RANGE_BLOCK)
+            start = self._pos - index * _BAMBU_RANGE_BLOCK
+            piece = self._blocks[index][start:start + end - self._pos]
+            if not piece:
+                break
+            out += piece
+            self._pos += len(piece)
+        return bytes(out)
+
+    def _fetch(self, offset):
+        length = min(_BAMBU_RANGE_BLOCK, self._size - offset)
+        left = self._deadline - time.monotonic()
+        if self.fetched + length > _BAMBU_RANGE_BUDGET or left <= 0:
+            raise OSError("thumbnail read limit reached")
+        self.fetched += length
+        conn = self._ftp.transfercmd("RETR " + self._path, rest=offset)
+        data = bytearray()
+        try:
+            conn.settimeout(left)
+            while len(data) < length:
+                chunk = conn.recv(min(64 * 1024, length - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            conn.close()
+        try:
+            self._ftp.getresp()  # 226 after a whole read, 426 after stopping early
+        except Exception:
+            pass
+        if len(data) != length:
+            raise OSError("short thumbnail read")
+        return bytes(data)
+
+
+def _bambu_read_job_thumbnail(printer, stems, plate):
+    """One FTPS session: find the job on the printer and read only its picture."""
+    import ftplib
+    import zipfile
+
+    host = urllib.parse.urlparse(normalize_url(printer.get("url"))).hostname or ""
+    code = printer.get("access_code") or printer.get("apikey") or ""
+    if not host or not code or not stems:
+        return ""
+    context = _bambu_tls_context(printer, "ftps")
+    if context is _SSL_BAMBU_CA and not (printer.get("serial") or "").strip():
+        return ""
+    deadline = time.monotonic() + _BAMBU_THUMB_SECONDS
+    ftp = _implicit_ftps_class()(context=context)
+    ftp._bambu_printer = printer
+    control_trusted = False
+    try:
+        ftp.connect(host, 990, timeout=5)
+        control_trusted = True
+        ftp.login("bblp", code)
+        ftp.prot_p()
+        ftp.voidcmd("TYPE I")
+        for folder in _BAMBU_JOB_FOLDERS:
+            for stem in stems:
+                for suffix in _BAMBU_JOB_SUFFIXES:
+                    if time.monotonic() > deadline:
+                        raise OSError("thumbnail lookup timed out")
+                    path = folder + stem + suffix
+                    try:
+                        size = ftp.size(path)
+                    except ftplib.error_perm:
+                        continue
+                    if not size:
+                        continue
+                    remote = _FtpsRangeFile(ftp, path, size, deadline)
+                    if suffix == ".gcode":
+                        return _gcode_thumbnail(remote.read(min(size, _BAMBU_GCODE_HEAD)))
+                    with zipfile.ZipFile(remote) as archive:
+                        return _zip_plate_thumbnail(archive, plate)
+        return ""
+    finally:
+        try:
+            if control_trusted:
+                ftp.quit()
+            else:
+                ftp.close()
+        except Exception:
+            ftp.close()
+
+
+def _attach_bambu_job(printer, result, stems, plate):
+    """Thumbnail (and, for our own uploads, the real file name) of the reported job."""
+    if not stems:
+        return
+    endpoint = _endpoint_key(printer.get("url"))
+    with _BAMBU_THUMB_LOCK:
+        sent = next((_bambu_sent_jobs[(endpoint, stem)] for stem in stems
+                     if (endpoint, stem) in _bambu_sent_jobs), None)
+        key = (endpoint, str(printer.get("serial") or "").strip().casefold(), stems, plate)
+        cached = _bambu_job_thumbs.get(key)
+    if sent:
+        result["thumbnail"] = sent["thumbnail"]
+        if sent["filename"]:
+            result["filename"] = sent["filename"]
+        return
+    if cached and (cached[0] or time.monotonic() < cached[1]):
+        result["thumbnail"] = cached[0]
+        return
+    if result.get("state") not in _BAMBU_THUMB_STATES:
+        return
+    try:
+        thumbnail, retry_at = _bambu_read_job_thumbnail(printer, stems, plate), math.inf
+    except Exception:
+        thumbnail, retry_at = "", time.monotonic() + _BAMBU_THUMB_RETRY_SECONDS
+    with _BAMBU_THUMB_LOCK:
+        _bambu_job_thumbs[key] = (thumbnail, retry_at)
+        _bound(_bambu_job_thumbs)
+    result["thumbnail"] = thumbnail
+
+
 def poll_bambu(printer, timeout=8):
     try:
         hydrated = hydrate_credentials(printer)
@@ -2826,6 +3100,9 @@ def poll_bambu(printer, timeout=8):
     with _bambu_target_lock(printer):
         result = _poll_bambu_connection(hydrated, timeout)
         _copy_bambu_observations(hydrated, printer)
+        source = result.pop("_job_source", None)
+        if source:
+            _attach_bambu_job(hydrated, result, *source)
         return result
 
 
@@ -2933,6 +3210,7 @@ def _poll_bambu_connection(printer, timeout):
                 "progress": pct if pct is not None else None,
                 "filename": info.get("subtask_name") or info.get("gcode_file") or "",
                 "thumbnail": "",
+                "_job_source": _bambu_job_source(info),
             }
         return {"online": True, "state": "connected", "nozzle": None, "target_nozzle": None,
                 "bed": None, "target_bed": None, "progress": None, "filename": "", "thumbnail": ""}
@@ -5635,6 +5913,7 @@ def _bambu_send_file_locked(printer, filename, file_path, start, use_ams, plate_
         with open(file_path, "rb") as stream:
             store_attempted = True
             ftp.storbinary("STOR " + remote, stream, blocksize=64 * 1024)
+        remember_bambu_sent_job(printer, remote, filename, file_path, plate_entry)
     except BambuTlsError as exc:
         result = {"ok": False, "error_key": _BAMBU_TLS_ERRORS[exc.code],
                   "error_values": {}, "error_code": (
