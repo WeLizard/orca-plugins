@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filamenthub-surface-textiles-materials"
+version = "1.0.2"
+description = "Textiles & Materials height maps for OrcaSlicer"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[tool.setuptools]
+packages = ["fhslt"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+fhslt = ["t/*.png"]
+
+[tool.fhsl]
+plugin-id = "filamenthub_surface_textiles_materials"
+import-name = "fhslt"
+texture-count = 48

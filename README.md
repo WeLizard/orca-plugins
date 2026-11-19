@@ -17,6 +17,12 @@ Each plugin lives in its own directory under `plugins/`:
     through the Plugin Pages API. It keeps a manual release kit pending CNC
     Kitchen's decision about taking over the integration.
 
+*   **FHSL texture libraries** — three independent texture packs with checked image inventories and deterministic builds.
+    * [Hard Surface](plugins/fhsl-hard-surface/) — 53 height maps.
+    * [Nature & Organics](plugins/fhsl-nature-organics/) — 38 height maps.
+    * [Textiles & Materials](plugins/fhsl-textiles-materials/) — 48 height maps.
+    Their prefixed GitHub tags build one pack per draft release.
+
 Every plugin directory owns its runtime source, version, `README.md`,
 `description.md`, `CHANGELOG.md`, package builder, tests and publishing notes.
 Plugins are built and released independently; a release never takes notes or
@@ -41,9 +47,46 @@ beta maturity in the listing text instead of the version field.
 
 Orca Cloud release tags must use the exact `vX.Y.Z` form. Because Git tags are
 repository-wide, a version used for a release must not be ambiguous between
-plugin directories. Automated trusted publishing is currently configured only
+plugin directories. FHSL releases use `fhsl-hard-surface-vX.Y.Z`, `fhsl-nature-organics-vX.Y.Z`,
+and `fhsl-textiles-materials-vX.Y.Z`. These prefixes leave Print Farm releases
+independent. Automated trusted publishing is currently configured only
 for Print Farm. BumpMesh keeps its own manual publishing kit and instructions
 until CNC Kitchen decides whether to take over the integration.
+
+## FHSL builds and diagnostics
+
+The release builder needs Python 3.12+ and Pillow 11.3.0. From this checkout:
+
+```powershell
+python tools/fhsl_package.py --plugin fhsl-hard-surface
+python -m unittest discover -s tests -p 'test_fhsl*.py' -v
+```
+
+Each build writes `wheels/`, `SHA256SUMS` and `RELEASE_NOTES.md` under the
+selected plugin's `dist/release-X.Y.Z/`. The builder checks the full image
+contents and exact texture manifest before auditing the wheel. The internal
+import modules are short (`fhslh`, `fhsln`, `fhslt`, maps in `t/`) to keep installed
+Windows paths well below 260 characters. Distribution identities and existing library capability
+names are preserved. PNG L8 format
+alone does not establish that every OrcaSlicer installation loads the full pack.
+
+For missing-texture reports, run the read-only inspector with the data directory
+shown by OrcaSlicer's configuration-folder command:
+
+```powershell
+python tools/inspect_fhsl.py --data-dir '<OrcaSlicer data directory>' > fhsl-report.json
+```
+
+The report lists installed copies, their enabled state and versions, texture
+counts and wheel/extracted-file integrity. Account IDs are redacted and paths
+are relative. PNG pixel decoding and the running host's capability registry
+are outside the inspector's scope. A failed Windows native open probe is
+reported separately from OrcaSlicer's own behavior.
+
+Orca Cloud currently permits one connected repository per plugin. FHSL GitHub
+release preparation is available here. Automatic delivery of these three
+independent listings from this monorepo awaits upstream routing support.
+After testing the exact candidate, the owner can upload its wheel manually.
 
 ## License
 

@@ -1,0 +1,42 @@
+name: Check FHSL texture packs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/fhsl-*/**'
+      - 'tools/fhsl_package.py'
+      - 'tools/inspect_fhsl.py'
+      - 'tests/test_fhsl*.py'
+      - '.github/workflows/*fhsl.yml'
+  pull_request:
+    paths:
+      - 'plugins/fhsl-*/**'
+      - 'tools/fhsl_package.py'
+      - 'tools/inspect_fhsl.py'
+      - 'tests/test_fhsl*.py'
+      - '.github/workflows/*fhsl.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install image validator
+        run: python -m pip install Pillow==11.3.0
+      - name: Test sources, package builds and read-only diagnostics
+        run: python -m unittest discover -s tests -p 'test_fhsl*.py' -v

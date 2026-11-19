@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filamenthub-surface-nature-organics"
+version = "1.0.2"
+description = "Nature & Organics height maps for OrcaSlicer"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[tool.setuptools]
+packages = ["fhsln"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+fhsln = ["t/*.png"]
+
+[tool.fhsl]
+plugin-id = "filamenthub_surface_nature_organics"
+import-name = "fhsln"
+texture-count = 38

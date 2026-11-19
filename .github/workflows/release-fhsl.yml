@@ -1,0 +1,117 @@
+name: Release FHSL texture pack
+
+on:
+  push:
+    tags:
+      - 'fhsl-hard-surface-v*'
+      - 'fhsl-nature-organics-v*'
+      - 'fhsl-textiles-materials-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing pack tag, for example fhsl-hard-surface-v1.0.2'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-fhsl-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Validate the tag before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^fhsl-(hard-surface|nature-organics|textiles-materials)-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "An existing FHSL version tag is required." >&2
+            exit 1
+          fi
+          IFS='.' read -r major minor patch <<< "${BASH_REMATCH[2]}"
+          for segment in "$major" "$minor" "$patch"; do
+            if (( 10#$segment > 10 )); then
+              echo "Version segments must not exceed 10." >&2
+              exit 1
+            fi
+          done
+
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install image validator
+        run: python -m pip install Pillow==11.3.0
+
+      - name: Resolve the selected pack and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ['RELEASE_TAG']
+          match = re.fullmatch(
+              r'(fhsl-(?:hard-surface|nature-organics|textiles-materials))-v(\d+\.\d+\.\d+)',
+              tag,
+          )
+          if not match:
+              raise SystemExit('Invalid FHSL release tag')
+          plugin, version = match.groups()
+          if any(int(segment) > 10 for segment in version.split('.')):
+              raise SystemExit('Version segments must not exceed 10')
+          project = tomllib.loads(Path('plugins', plugin, 'pyproject.toml').read_text(encoding='utf-8'))
+          if project['project']['version'] != version:
+              raise SystemExit('Release tag and source version differ')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as output:
+              output.write(f'FHSL_PLUGIN={plugin}\nFHSL_VERSION={version}\n')
+          PY
+
+      - name: Test FHSL package contracts
+        run: python -m unittest discover -s tests -p 'test_fhsl*.py' -v
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+
+      - name: Build the selected pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/fhsl_package.py --plugin "$FHSL_PLUGIN" --output "$RUNNER_TEMP/fhsl-release"
+          cd "$RUNNER_TEMP/fhsl-release"
+          sha256sum --check SHA256SUMS
+          test "$(find wheels -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+
+      - name: Create a new draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists. Its artifacts will not be replaced." >&2
+            exit 1
+          fi
+          # Flatten assets for GitHub so SHA256SUMS uses the downloadable filenames.
+          mkdir "$RUNNER_TEMP/fhsl-assets"
+          cp "$RUNNER_TEMP"/fhsl-release/wheels/*.whl "$RUNNER_TEMP/fhsl-assets/"
+          cd "$RUNNER_TEMP/fhsl-assets"
+          sha256sum ./*.whl > SHA256SUMS
+          gh release create "$RELEASE_TAG" ./*.whl SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$FHSL_PLUGIN $FHSL_VERSION" \
+            --notes-file "$RUNNER_TEMP/fhsl-release/RELEASE_NOTES.md" \
+            --draft
