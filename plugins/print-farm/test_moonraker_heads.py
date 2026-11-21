@@ -59,8 +59,11 @@ def test_four_heads_use_the_actual_active_extruder_without_commands(plugin, serv
     assert [tool["index"] for tool in value["tools"]] == [0, 1, 2, 3]
     assert value["active_tool"] == 2 and value["nozzle"] == 215.5 and value["target_nozzle"] == 220
     assert [t["active"] for t in value["tools"]] == [False, False, True, False]
-    assert len(server.requests) == 2
+    # Discovery, telemetry and, for a Klipper printer without an MMU, the
+    # Spoolman lookup of the loaded spool: three reads, no commands.
+    assert len(server.requests) == 3
     assert "toolhead" in server.requests[1][0] and "extruder3" in server.requests[1][0]
+    assert server.requests[2][0].endswith("/server/spoolman/spool_id")
     assert all(headers["X-Api-Key"] == "synthetic-key" and "synthetic-key" not in path
                for path, headers in server.requests)
 
